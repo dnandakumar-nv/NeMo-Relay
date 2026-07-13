@@ -63,6 +63,16 @@ component_management:
           threshold: 0.5%
           base: auto
           if_ci_failed: error
+    - component_id: router
+      name: Router
+      paths:
+        - "crates/router/src"
+      statuses:
+        - type: project
+          target: auto
+          threshold: 0.5%
+          base: auto
+          if_ci_failed: error
     - component_id: cli
       name: CLI
       paths:

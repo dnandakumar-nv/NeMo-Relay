@@ -24,7 +24,7 @@ use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 use crate::Json;
-use crate::api::llm::LlmAttributes;
+use crate::api::llm::{LlmAttributes, LlmCallRole};
 use crate::api::scope::{HandleAttributes, ScopeAttributes, ScopeType};
 use crate::api::tool::ToolAttributes;
 use crate::codec::request::AnnotatedLlmRequest;
@@ -255,6 +255,32 @@ pub struct CategoryProfile {
 }
 
 impl CategoryProfile {
+    /// Return the explicitly encoded LLM call role, if it is valid.
+    ///
+    /// An absent value is left unresolved here because only [`Event`] knows
+    /// whether the profile belongs to an LLM event. A present malformed value
+    /// returns `None` and is never interpreted as a Primary call.
+    pub fn llm_call_role(&self) -> Option<LlmCallRole> {
+        match self.extra.get("call_role")? {
+            Json::String(value) if value == LlmCallRole::Primary.as_str() => {
+                Some(LlmCallRole::Primary)
+            }
+            Json::String(value) if value == LlmCallRole::Shadow.as_str() => {
+                Some(LlmCallRole::Shadow)
+            }
+            Json::String(value) if value == LlmCallRole::Judge.as_str() => Some(LlmCallRole::Judge),
+            _ => None,
+        }
+    }
+
+    /// Encode an LLM call role into the additive ATOF category profile.
+    pub fn set_llm_call_role(&mut self, role: LlmCallRole) {
+        self.extra.insert(
+            "call_role".to_string(),
+            Json::String(role.as_str().to_string()),
+        );
+    }
+
     /// Return true when the profile has no wire-serialized fields.
     ///
     /// # Returns
@@ -511,6 +537,23 @@ impl Event {
             Self::Scope(event) => event.category_profile.as_mut(),
             Self::Mark(event) => event.category_profile.as_mut(),
         }
+    }
+
+    /// Return the typed execution role for an LLM event.
+    ///
+    /// Legacy LLM events without `category_profile.call_role` are Primary.
+    /// A malformed present value and every non-LLM event return `None`.
+    pub fn llm_call_role(&self) -> Option<LlmCallRole> {
+        if self.category().map(EventCategory::as_str) != Some("llm") {
+            return None;
+        }
+        let Some(profile) = self.category_profile() else {
+            return Some(LlmCallRole::Primary);
+        };
+        if !profile.extra.contains_key("call_role") {
+            return Some(LlmCallRole::Primary);
+        }
+        profile.llm_call_role()
     }
 
     /// Return the parent scope UUID, if the event is nested under a scope.

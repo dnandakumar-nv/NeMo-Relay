@@ -1,0 +1,399 @@
+---
+title: "Router Ledger Migrations and Recovery"
+description: "Maintain the private SQLite ledger, migrations, vector recovery, retention, and lifecycle boundaries."
+position: 11
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+This page describes the internal persistence contract for maintainers of
+Router. The SQLite database is a private Router implementation boundary. Do not
+treat its tables as a supported inspection API or build user workflows around
+direct queries. Use the stable Rust service, CLI, or optional HTTP adapter
+documented in [Inspect and Control Router](/router/inspection-and-control).
+
+The CLI, Python, and Node.js packages register Router automatically. A custom
+Rust host must link `nemo-relay-router` and call
+`register_router_component()` before plugin validation or initialization.
+
+## Activation Boundary
+
+`off` mode validates the complete supplied configuration but does not open the
+database path, create a directory, start a thread, register middleware, or spawn
+a Router worker.
+
+`shadow`, `recommend`, and `active` activation establish persistence before
+Router can observe or intercept a Primary call. Activation performs the following
+sequence:
+
+1. It registers the statically linked sqlite-vec extension before opening any
+   Router SQLite connection. This SQLite auto-extension registration is
+   process-global.
+2. It securely opens or creates the configured database and verifies the SQLite
+   runtime, `vec_version()` on vector-capable connections, and required
+   connection settings.
+3. It applies ordered migrations in an exclusive transaction and verifies the
+   resulting schema and integrity.
+4. It initializes or verifies the immutable project, configuration, policy,
+   cohort, learning-generation, embedder-profile, canonicalizer, vector-space,
+   pool-mapping, outcome-policy, control, and Active experiment identities.
+5. It creates the current process instance and reconciles work owned by expired
+   or terminal processes in one immediate transaction.
+6. It transfers the activation connection into the sole domain writer and
+   starts bounded readers, scheduler, embedding/index supervisor, heartbeat,
+   retention ownership, and, for Active mode, the bounded outcome actor.
+7. It registers lifecycle ownership, the event subscriber, and the execution
+   intercept in that order.
+
+A filesystem, migration, identity, project mismatch, schema, or reconciliation
+failure aborts activation before the subscriber, intercept, background replay,
+or paid internal call can start. Primary calls therefore remain anchor-only
+when Router activation fails.
+
+Missing or mismatched sqlite-vec support is isolated differently: Router keeps
+relational Shadow collection active, records bounded vector health, and makes
+vector search and index writes unavailable until recovery.
+
+## Database Location and File Security
+
+The default database path is `.nemo-relay/router/router.db`. A relative path is
+resolved against the host process's current working directory. Use an absolute
+path when the host can start with different working directories.
+
+Router enforces a local lexical file path. It rejects URI forms, traversal
+components, root-only and trailing-directory forms, control characters,
+symlinked path components, database or sidecar symlinks, and nonregular database
+files. On macOS, Router normalizes the operating system's fixed `/var` and
+`/tmp` aliases to `/private/var` and `/private/tmp` before secure descriptor
+traversal. It still rejects arbitrary symlinks.
+
+On Unix, Router creates or tightens the immediate database directory to mode
+`0700` and the database, WAL, shared-memory, and journal files to mode `0600`.
+Supported non-Unix hosts apply and verify equivalent owner-only access controls.
+Router checks the database identity and sidecar permissions throughout writer
+operations so a path replacement does not silently redirect durable writes.
+
+The runtime uses the following SQLite settings:
+
+| Setting | Version-1 Contract |
+|---|---|
+| Journal mode | WAL |
+| Foreign keys | Enabled on every connection |
+| Busy timeout | 5 seconds |
+| Synchronous mode | `FULL` for the writer |
+| Domain writers | Exactly one writer connection and thread per Router process |
+| Readers | Bounded, query-only connections with interruption support |
+
+The ledger can be shared by multiple Router processes. WAL does not remove the
+need for process leases, bounded busy handling, and stale-owner checks.
+
+## Durable Identity
+
+The first activation creates an immutable UUIDv7 `project_uuid`. When
+`project_id` is omitted, Router uses the project UUID string as the resolved
+project ID. When configuration supplies a project ID, every later activation of
+that database must supply the exact stored value. Router does not rewrite the
+database identity to make a mismatch succeed.
+
+Each validated activation also records the following identities:
+
+- Canonical configuration JSON and its generation hash.
+- One deterministic policy version per pool, including candidate, horizon,
+  Judge, codec, and sanitizer policy.
+- One current UUIDv7 learning generation per configured pool.
+- One protected cohort-salt generation and its non-secret fingerprint.
+- One process instance tied to the current configuration and SQLite runtime.
+
+Evidence carries its project, configuration, policy, and learning-generation
+identities. A later reset appends a new learning generation instead of rewriting
+old evidence. Cohort salt bytes remain protected inside the owner-only database
+and are not copied into evidence, events, logs, exports, or errors.
+
+## Migration Contract
+
+Router migrations are embedded, ordered by positive schema version, and applied
+transactionally. Each applied migration records its stable name, exact
+source-controlled checksum, application time, and SQLite version. The migration
+manifest and the checked database history must form one contiguous sequence.
+
+Activation refuses to continue when it detects any of the following states:
+
+- A database application identifier owned by another schema.
+- User tables in a database that has no Router application identity.
+- A schema version newer than the current Router binary understands.
+- A missing, reordered, renamed, duplicated, or checksum-mismatched migration.
+- A required table, column, index, foreign key, constraint, or trigger that does
+  not match the expected schema.
+- A failed SQLite integrity or foreign-key check.
+- Required WAL, foreign-key, synchronous, or busy-timeout settings that cannot
+  be established.
+
+Downgrade is unsupported. An older binary leaves a newer database unchanged and
+refuses Router activation. Maintainers must add a new migration for schema
+changes; they must not repurpose an existing column, edit an applied migration,
+or rewrite immutable evidence in place.
+
+Migration `0004_spec06_embedding_vectors.sql` replaces the empty Spec 05
+placeholder vector family with the complete relational source schema. It
+refuses a nonempty placeholder family atomically and preserves the two
+placeholder AUTOINCREMENT sequence values. The migration itself uses only
+regular SQLite; dynamic vec0 generations are authorized and verified through
+integrity-hashed manifests after migration.
+
+Migration `0005_spec07_recommend_decisions.sql` adds immutable decision
+parents, candidate summaries, neighbors, retiring-source markers, and decision
+retention receipts. Decision children cascade only from their parent. A
+neighbor's reference to its source evidence is restrictive, so source deletion
+cannot fragment a retained decision. The migration uses regular SQLite and
+does not alter migrations `0001` through `0004`.
+
+Migration `0006_spec08_active_canary.sql` first proves that pre-v6 reserved
+tables are empty, then adds outcome policies, control history and checkpoints,
+Active experiments, fixed looks and tranches, authorization state, protected
+roots and signals, randomized assignments, dispatch terminals, neighborhood
+invalidation, and marker-first retention receipts and checkpoints. It rebuilds
+the Recommend decision graph with explicit Active ownership while preserving
+verified v5 decision data. Every Active writer must record the v6 writer
+capability before it can mutate this graph.
+
+## Writer and Idempotency
+
+All domain writes pass through one bounded Tokio MPSC command channel and the
+sole writer thread. Pre-accept work reserves writer capacity without waiting.
+Commands for already accepted work can wait for bounded capacity while also
+observing writer liveness and the shared shutdown deadline. Saturation stops new
+sampling instead of discarding accepted evidence.
+
+Domain entities and their state transitions are append-only. Idempotent commands
+use a stable identity and canonical payload hash. An exact retry returns the
+existing acknowledgement. The same identity with different canonical bytes is
+an integrity conflict, appends a health fact when it is safe to do so, and
+degrades Router health. Router does not use broad ignore-on-conflict or
+last-write-wins behavior for domain facts.
+
+Mutable fields are limited to explicit lease state, such as owner, token,
+expiry, generation, attempt count, and next eligibility, plus the process
+heartbeat lease. Status changes remain append-only state events.
+
+Recommend decision writes are boxed sole-writer commands. One transaction
+revalidates the live originating process, exact configuration and pool policy,
+learning generation, frozen vector mapping, canonical query, full partitions,
+candidate membership, and every referenced evidence fact. It inserts the
+parent, all summaries, and all neighbors atomically. Exact stored replay returns
+`AlreadyApplied`; a byte, hash, identity, or evidence mismatch returns a
+conflict and commits no partial decision.
+
+Active foreground admission is also one sole-writer transaction. It revalidates
+the live process, exact policy and learning generation, outcome look,
+authorization, control generation, canary cap, tranche, neighborhood, root,
+and candidate facts before inserting the decision, protected root, randomized
+assignment, propensity, and optional dispatch. Candidate handoff requires an
+`Applied` or fully verified `AlreadyApplied` acknowledgement. Outcome
+terminalization writes attribution and any query-local invalidation atomically.
+
+## Process Heartbeat
+
+Each active Router process records a durable start state. A heartbeat runs every
+5 seconds and renews a 30-second process lease. Renewal updates the bounded lease
+field instead of appending an unbounded heartbeat event stream.
+
+A process is considered live only when its identity, start state, and lease are
+valid at the transaction's observation time. Reconciliation never takes work
+from a process whose verified lease is live. An expired process is first fenced
+with an append-only reconciliation state before another process closes its
+non-resumable work.
+
+Graceful shutdown writes one stable process-stop command after scheduler,
+retention, and heartbeat work has drained. An exact lost-ack retry returns the
+same terminal acknowledgement. Synchronous abort does not claim a process stop;
+the next activation handles its expired durable state.
+
+## Startup Reconciliation
+
+Startup reconciliation runs transactionally after the new process instance is
+live and before Router registration. For each expired or terminal prior process,
+it performs the following actions:
+
+- It fences an expired process so another reconciler cannot claim the same live
+  ownership.
+- It marks accepted pending anchors `orphaned_non_resumable`.
+- It reconstructs a missing reserved sample batch and candidate attempt set for
+  a durably closed but undelivered window.
+- It marks reserved or running Shadow attempts `orphaned_in_flight`.
+- It marks initial or repair Judge attempts that were in flight as orphaned.
+- It terminalizes admitted dependency operations without turning them into a
+  provider quality failure.
+- It creates any required terminal vector-source identity and closes the sample
+  batch after all candidate attempts are terminal.
+- It marks an Active dispatch missing its terminal fact as
+  `unknown_after_crash` and never treats it as eligible treatment evidence.
+- It closes open protected roots as orphaned and reclaims expired outcome-look
+  claims without inventing a success, failure, provider receipt, or arm result.
+
+Reconciliation preserves the original configuration, policy, learning
+generation, and sanitized content. It does not reconstruct the memory-only
+request envelope, start replay, rerun a Judge, or invent a `Pass` or `Fail`
+label. Repeating reconciliation produces no additional domain transition after
+the exact terminal facts exist.
+
+Embedding, materialization, and index-rebuild work is durable and resumable. An
+embedding claim uses an owner, fresh UUIDv7 token, attempt generation, expiry,
+and content hash. Completion must match every fence, including after the same
+process reclaims an expired job. Startup and periodic reconciliation recover
+expired leases, committed vectors awaiting attachment, pending index writes,
+terminal-failure fanout, interrupted generation builds, and retired-generation
+cleanup without reconstructing replay or re-embedding an existing vector.
+
+Queued embedding, materialization, and rebuild claims also carry a monotonic
+transaction-start deadline. The writer checks lifecycle and deadline before and
+after opening the transaction. If the deadline expires while a command waits in
+the writer queue, no attempt, lease, or state transition is committed. Live
+embedding uses its provider/caller deadline for this fence and reserves lease
+expiry for cleanup of work that was actually acknowledged.
+
+Materialization discovery and claim wait for a verified active index, so an
+index outage does not consume attempts. Claims are capped at 64. At the
+ceiling, an eligible job atomically clears its lease and records matching
+`failed_index` link and job terminals with stable class
+`router.vector.materialization_attempt_limit`; an expired owner is recorded as
+orphaned first, and a live owner is not displaced. The handled terminal does not
+latch global runtime health. Verified history is bounded to 130 materialization
+events and 66 link events per job.
+
+Version 1 retains the source required for later backfill and does not expose a
+source-expiry or hash-only mode. If a selected retained attempt is missing that
+source, Router treats the ledger as corrupt and commits no partial backfill
+writes. The migration schema reserves `source_expired` for a future explicit
+retention mode; version 1 cannot author that outcome.
+
+## Retention
+
+Retention runs periodically every hour and can also run in response to evidence
+capacity pressure. It uses the activation-time `retention_days` and
+`max_evidence_records` values for the running process.
+
+A retention transaction selects only anchors whose complete evidence graph is
+fully terminal. It takes the deterministic ordered union of:
+
+- Anchors whose close time is at or before the inclusive age cutoff.
+- The oldest count-excess anchors needed to move below the configured hard
+  evidence limit and leave one admission slot.
+
+Selection is ordered by close time and anchor UUID and is limited to `1000`
+anchors per transaction. Pending anchors, open batches, in-flight candidate or
+Judge work, and incomplete terminal graphs are never selected.
+
+For each selected anchor, retention performs the following actions:
+
+1. It verifies the complete terminal graph before deletion.
+2. If deletion would remove the latest anchor-linked dependency state, it
+   appends an unlinked carry-forward state with the same cool-off facts.
+3. With a healthy active index, it deletes each selected derived row and its
+   relational evidence graph atomically. An index fault rolls the transaction
+   back before a follow-up command marks the space unavailable.
+4. With an already unavailable generation, it retires the active pointer before
+   deleting relational evidence, leaving stale derived objects unsearchable
+   until bounded generation cleanup.
+5. It deletes captured embeddings only when no retained evidence still
+   references them.
+6. It verifies dependency continuity and foreign-key integrity.
+7. It appends one immutable retention summary with the selected count, reason
+   flags, bounds, timestamp, and a canonical hash.
+
+An empty selection still creates a durable summary, and an exact request retry
+returns the existing result. Any selection, carry-forward, deletion, integrity,
+or summary failure rolls back the entire transaction. A failed retention pass
+removes no evidence.
+
+If nonterminal work prevents Router from freeing the hard evidence target,
+pre-accept work receives the temporary `EvidenceCapacity` refusal. Sampling for
+that reason resumes only after a later retention observation proves capacity is
+below the configured maximum.
+
+Retention does not delete the project identity, migration history,
+configuration or policy versions, learning and cohort generations, controls,
+global health history, process history, or retention summaries. Anchor-linked
+health rows are part of the selected evidence graph and are deleted with their
+anchor.
+
+Canonical query documents, shared embeddings and jobs, profiles, mappings, and
+spaces remain while retained evidence, decision audits, unfinished work, or a
+verified live process/configuration references them. Pending materialization is
+canceled at the retention boundary. Existing `failed_index` materialization is
+deleted as terminal evidence without a synthetic `canceled_retention`
+transition. Bounded orphan cleanup removes unreferenced vector authority across
+later passes.
+
+Decision parents use an independent age and count policy with the same
+`retention_days` and `max_evidence_records` configuration. Candidates are
+ordered by `(created_at_unix_ms, decision_id)`, with decisions that block a
+retiring source prioritized first. A pass deletes only complete verified
+aggregates and has cumulative limits of 1,000 parents, 4,159
+summary-plus-neighbor rows, and 32 MiB of aggregate accounting. The immutable
+decision receipt records marker creation, whole-aggregate progress, blocked and
+deleted anchors, selection hashes, and `more_cleanup`.
+
+When anchor retention reaches a source referenced by a decision, the writer
+first deindexes that source and records a retiring-anchor marker. Search and new
+decision writes reject the marker. Later passes delete dependent decisions
+before deleting the source anchor, preventing a concurrent process from
+reintroducing the retiring source.
+
+Ordinary decision retention selects only Recommend decisions that have no
+Active experiment, authorization, root, assignment, dispatch, outcome, or
+neighborhood facts. Active retention selects only terminal experiments with no
+open roots, no unterminated dispatch, no unexpired passed authorization, and a
+complete latest state for every tranche.
+
+Active cleanup writes a retiring-experiment marker before deleting any graph
+row. Later Active writes reject that marker. Bounded transactions remove
+decision facts, neighborhood history, look and authorization state, then root
+and outcome parents in batches of at most 1,000 parents, 4,095 child rows, and
+32 MiB. Chained receipts record the exact cursor and row and byte totals.
+Receipt histories above 8,192 entries compact the oldest 512-entry completed
+prefix into a checkpoint; checkpoint histories above 1,024 recursively compact
+the oldest 512 contiguous checkpoints. The final transaction deletes the
+experiment and marker while leaving the verified receipt chain.
+
+## Graceful Drain and Synchronous Abort
+
+Both shutdown paths close Primary, live-embedding, background-claim, replay,
+and provider admission. Recommend closes audit-delivery admission first, and
+Active closes foreground admission. No new Shadow, Judge, recommendation,
+Active treatment, or embedding provider call can start after the corresponding
+gate closes.
+
+Graceful drain uses the one Core deadline and orders ownership as follows:
+
+1. It closes foreground admission and waits for every tracked Active foreground
+   permit, then flushes queued subscriber delivery a second time.
+2. It asks the ordered coordinator to terminalize unresolved Active roots,
+   joins the coordinator and outcome actor, and then joins the scheduler,
+   including terminal evidence for already-started evaluator calls.
+3. It drains admitted recommendation computation and exact pending decision
+   delivery. A retained audit can retry under bounded writer slices until the
+   shared deadline.
+4. It finishes or cancels currently owned live embedding, background embedding,
+   materialization, and rebuild work. It does not drain the durable backlog or
+   wait through unrelated retry delays.
+5. It stops and joins retention and heartbeat ownership.
+6. It appends the stable process-stop state as the final domain write, flushes
+   the writer, closes active readers, and drains the writer thread.
+
+Queued provider work that has not started becomes an operational shutdown
+cancellation. A provider call or SQLite transaction that linearized before the
+gate can finish under the shared deadline.
+
+Synchronous abort is intentionally nonblocking. It closes admission, provider,
+and writer-start authority. It fences writer acceptance before canceling
+pending recommendation delivery, invokes registered replay and HTTP
+cancellation, requests task abort, interrupts active readers and the writer,
+and releases retained owners without joining them. It makes no terminal-write
+or process-stop completion claim. Incomplete durable work remains for startup
+reconciliation.
+
+If graceful drain fails or reaches its deadline, Core invokes the same
+nonblocking abort path. Database or lifecycle uncertainty before durable Active
+admission keeps production routing anchor-only. After an authorized candidate
+handoff, the provider result or error is returned exactly and is never retried
+against the anchor.

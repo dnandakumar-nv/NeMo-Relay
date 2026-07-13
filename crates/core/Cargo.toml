@@ -85,6 +85,7 @@ strum = { version = "0.27", features = ["derive"] }
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 typed-builder = "0.23.2"
+unicode-normalization.workspace = true
 futures-util = { version = "0.3", optional = true }
 opentelemetry = { workspace = true, features = ["trace"], optional = true }
 opentelemetry_sdk = { workspace = true, features = ["trace"], optional = true }
@@ -149,6 +150,10 @@ path = "tests/integration/subscriber_dispatcher_tests.rs"
 [[test]]
 name = "api_surface_integration"
 path = "tests/integration/api_surface_tests.rs"
+
+[[test]]
+name = "replay_v2_integration"
+path = "tests/integration/replay_v2_tests.rs"
 
 [[test]]
 name = "atif_storage_integration"

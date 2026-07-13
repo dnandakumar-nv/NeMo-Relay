@@ -9,6 +9,7 @@ members = [
     "crates/worker-proto",
     "crates/worker",
     "crates/adaptive",
+    "crates/router",
     "crates/pii-redaction",
     "crates/cli",
     # Language Bindings
@@ -32,11 +33,13 @@ nemo-relay-plugin = { version = "0.6.0", path = "crates/plugin" }
 nemo-relay-worker-proto = { version = "0.6.0", path = "crates/worker-proto" }
 nemo-relay-worker = { version = "0.6.0", path = "crates/worker" }
 nemo-relay-adaptive = { version = "0.6.0", path = "crates/adaptive" }
+nemo-relay-router = { version = "0.6.0", path = "crates/router" }
 nemo-relay-pii-redaction = { version = "0.6.0", path = "crates/pii-redaction" }
 nemo-relay-ffi = { version = "0.6.0", path = "crates/ffi" }
 nemo-relay-cli = { version = "0.6.0", path = "crates/cli" }
 opentelemetry = { version = "0.31", default-features = false }
 opentelemetry_sdk = { version = "0.31", default-features = false }
+unicode-normalization = "0.1"
 uuid = "=1.18.1"
 
 [workspace.lints.rust]

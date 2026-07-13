@@ -211,6 +211,72 @@ impl Plugin for HeaderPlugin {
 
 </Tabs>
 
+## Own Background Resources in Rust
+
+Use `PluginRegistration::new` when a registration needs only synchronous
+deregistration. If an embedded Rust component owns background tasks, bounded
+queues, replay transports, or durable work, add one resource registration with
+`PluginRegistration::with_shutdown`.
+
+Add the resource registration before the component's middleware and subscriber
+registrations. Reverse deregistration then removes callbacks before the resource
+registration runs its final deregistration closure. The following pattern
+assumes the component-owned `BackgroundRuntime` implements the named lifecycle
+methods:
+
+```rust
+use nemo_relay::plugin::{
+    PluginRegistration, PluginRegistrationContext, Result as PluginResult,
+};
+use std::{sync::Arc, time::Instant};
+
+fn register_background_runtime(
+    ctx: &mut PluginRegistrationContext,
+    runtime: Arc<BackgroundRuntime>,
+) -> PluginResult<()> {
+    let deregister_runtime = Arc::clone(&runtime);
+    let stop_runtime = Arc::clone(&runtime);
+    let drain_runtime = Arc::clone(&runtime);
+    let abort_runtime = Arc::clone(&runtime);
+
+    ctx.add_registration(PluginRegistration::with_shutdown(
+        "background-index",
+        ctx.qualify_name("runtime"),
+        Box::new(move || deregister_runtime.deregister()),
+        Box::new(move || stop_runtime.stop_intake()),
+        Box::new(move |deadline: Instant| {
+            let runtime = Arc::clone(&drain_runtime);
+            Box::pin(async move { runtime.drain(deadline).await })
+        }),
+        Box::new(move || abort_runtime.abort()),
+    ));
+
+    // Register component middleware and subscribers after the resource entry.
+    Ok(())
+}
+```
+
+Implement each hook for one responsibility:
+
+- `stop_intake` must be idempotent, synchronous, and nonblocking. Close every
+  producer before returning, including when reporting a secondary error.
+- `drain` must close queues, finish or durably mark accepted work, and release
+  drained resources by the supplied absolute deadline.
+- `abort` must be idempotent, synchronous, and nonblocking. Cancel tasks and
+  replay calls without waiting for graceful completion, including when
+  reporting a secondary error.
+- The deregistration closure must release remaining registration bookkeeping.
+  It runs after drain or abort and must leave behavior inert before returning
+  an error.
+
+Check the closed-intake state at every scheduling site. Check it again inside a
+`Shadow` or `Judge` provider callback immediately before calling
+`LlmReplayTransport::start`. These checks prevent a queued subscriber callback
+or already-scheduled task from starting internal work after clear returns.
+
+Shutdown hooks are an embedded Rust plugin API. Native plugin ABI v1 and worker
+`grpc-v1` registrations continue to use their existing lifecycle contracts.
+
 ## Activation APIs
 
 After you register the plugin kind, use the plugin APIs in this order. Refer to
@@ -351,6 +417,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 </Tabs>
 
+## Choose Immediate or Graceful Clear
+
+Use synchronous clear when the host must cancel component work immediately:
+
+```rust
+use nemo_relay::plugin::clear_plugin_configuration;
+
+clear_plugin_configuration()?;
+```
+
+Synchronous clear stops intake, flushes subscribers, invokes component abort
+hooks, and deregisters in reverse order. It does not invoke drain. A durable
+component must reconcile interrupted accepted work during its next activation.
+
+Use asynchronous clear when accepted work should drain by one shared deadline:
+
+```rust
+use nemo_relay::plugin::clear_plugin_configuration_async;
+use std::time::Duration;
+
+clear_plugin_configuration_async(Duration::from_secs(30)).await?;
+```
+
+If a drain fails, panics, or reaches the deadline, Core aborts unfinished
+registrations before it deregisters them. Cleanup continues and errors are
+aggregated, so the active configuration remains empty even when clear returns
+an error. A failed deregistration callback is retained for retry. Later
+activation is blocked until that cleanup succeeds. A later clear does not
+re-enter the retained callback and still tears down its current active
+configuration.
+
+Configuration replacement drains the previous config with a 30-second default.
+Override the replacement deadline when the component's durable-work policy
+requires a different bound:
+
+```rust
+use nemo_relay::plugin::{
+    initialize_plugins_with_options, PluginConfig, PluginInitializationOptions,
+};
+use std::time::Duration;
+
+let report = initialize_plugins_with_options(
+    PluginConfig::default(),
+    PluginInitializationOptions {
+        shutdown_timeout: Duration::from_secs(10),
+    },
+)
+.await?;
+```
+
+Do not clear or replace config from a subscriber callback. Core returns a
+conflict because the subscriber dispatcher cannot block on its own flush
+barrier.
+
 ## Registration Checklist
 
 Before publishing or sharing a plugin:
@@ -359,7 +479,9 @@ Before publishing or sharing a plugin:
 2. Validate an intentionally invalid config and confirm diagnostics are actionable.
 3. Initialize the plugin and verify the expected subscribers or middleware run.
 4. Force one registration failure and confirm partial setup is rolled back.
-5. Call `clear()` to remove active component registrations during teardown.
+5. If the component owns background resources, test stop, successful drain,
+   timeout abort, immediate abort, and durable reconciliation.
+6. Call `clear()` to remove active component registrations during teardown.
    Call `deregister()` too only when a test or embedded runtime must register
    the same custom kind again.
 
@@ -371,6 +493,10 @@ Check these symptoms first when the workflow does not behave as expected.
 - **Partial registrations remain after failure**: Register through `PluginContext` so rollback can clean up.
 - **Registration does validation work**: Move deterministic checks into the validation hook.
 - **Global state leaks across component instances**: Create instance-local state during registration or key shared state by component identity.
+- **Work starts after clear**: Close intake before queue submission and check it
+  again immediately before internal managed calls or replay starts.
+- **Graceful clear hangs**: Bound every internal wait by the supplied absolute
+  deadline and make abort release all unfinished resources.
 
 ## Next Steps
 

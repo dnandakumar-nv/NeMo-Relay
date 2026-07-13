@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
+const lib = require('../index.js');
 const plugin = require('../plugin.js');
 const adaptive = require('../adaptive.js');
 
@@ -165,6 +166,36 @@ describe('core plugins', () => {
       plugin.clear();
       plugin.deregister(pluginKind);
     }
+  });
+
+  it('drains plugin configuration through the async clear helper', async () => {
+    const pluginKind = `node.test.async_clear.${Date.now()}`;
+    plugin.register(pluginKind, { register() {} });
+    try {
+      await plugin.initialize({
+        version: 1,
+        components: [plugin.ComponentSpec(pluginKind, {})],
+      });
+      assert.notEqual(plugin.report(), null);
+      await plugin.clearAsync(1_000);
+      assert.equal(plugin.report(), null);
+    } finally {
+      plugin.clear();
+      plugin.deregister(pluginKind);
+    }
+  });
+
+  it('rejects invalid async clear timeouts at wrapper and native boundaries', async () => {
+    const invalidTimeouts = [-1, -0.5, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 0x1_0000_0000];
+    const expected = /timeoutMillis must be a finite non-negative integer/;
+
+    for (const timeoutMillis of invalidTimeouts) {
+      await assert.rejects(() => plugin.clearAsync(timeoutMillis), expected);
+      await assert.rejects(() => lib.clearPluginConfigurationAsync(timeoutMillis), expected);
+    }
+
+    await plugin.clearAsync(0);
+    await lib.clearPluginConfigurationAsync(0xffffffff);
   });
 });
 

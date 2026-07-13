@@ -17,6 +17,7 @@ The main entry points are:
 - ``nemo_relay.adaptive`` for adaptive component configuration helpers
 - ``nemo_relay.observability`` for observability component configuration helpers
 - ``nemo_relay.pii_redaction`` for PII redaction component configuration helpers
+- ``nemo_relay.router`` for Shadow Router component configuration helpers
 - ``nemo_relay.model_pricing`` for model pricing component configuration helpers
 
 Top-level exports also include:
@@ -209,6 +210,7 @@ from nemo_relay import (  # noqa: E402
     observability,
     pii_redaction,
     plugin,
+    router,
     scope,
     scope_local,
     subscribers,
@@ -452,6 +454,7 @@ __all__ = [
     "adaptive",
     "observability",
     "pii_redaction",
+    "router",
     "model_pricing",
     # Scope stack isolation
     "ScopeStack",

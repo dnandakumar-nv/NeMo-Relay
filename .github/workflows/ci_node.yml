@@ -207,6 +207,13 @@ jobs:
             --set ref_name "${NEMO_RELAY_PACKAGE_VERSION}" \
             package-node
 
+      - name: Probe clean-installed Node Router activation and native vector support
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          packages=("${NEMO_RELAY_CI_WORKSPACE_TMP}"/npm/*.tgz)
+          node scripts/test-support/router_node_package_smoke.mjs "${packages[0]}"
+
       - name: Upload npm package artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: ${{ inputs.run_package }}

@@ -59,6 +59,12 @@ _LlmStreamExecutionIntercept: TypeAlias = Callable[
     ["LLMRequest", Callable[["LLMRequest"], Awaitable[AsyncIterator[_Json]]]],
     AsyncIterator[_Json] | Awaitable[AsyncIterator[_Json]],
 ]
+_LlmApiFamily: TypeAlias = Literal[
+    "openai_chat_completions",
+    "openai_responses",
+    "anthropic_messages",
+]
+_LlmCallRole: TypeAlias = Literal["primary", "shadow", "judge"]
 
 class ScopeAttributes:
     """Bitflags describing scope properties.
@@ -467,6 +473,7 @@ class AnnotatedLLMRequest:
         params: Optional[Mapping[str, _JsonValue]] = None,
         tools: Optional[Sequence[Mapping[str, _JsonValue]]] = None,
         tool_choice: Optional[str | Mapping[str, _JsonValue]] = None,
+        response_format: Optional[Mapping[str, _JsonValue]] = None,
         extra: Optional[Mapping[str, _JsonValue]] = None,
     ) -> None:
         """Create a normalized LLM request view.
@@ -477,6 +484,7 @@ class AnnotatedLLMRequest:
             params: Optional provider parameters.
             tools: Optional tool declarations.
             tool_choice: Optional tool-selection directive.
+            response_format: Optional normalized structured response format.
             extra: Optional provider-specific fields.
 
         Returns:
@@ -526,6 +534,14 @@ class AnnotatedLLMRequest:
     @tool_choice.setter
     def tool_choice(self, value: Optional[str | Mapping[str, _JsonValue]]) -> None:
         """Set or clear the normalized tool-choice directive."""
+        ...
+    @property
+    def response_format(self) -> Optional[_JsonObject]:
+        """Return the normalized structured response format, if present."""
+        ...
+    @response_format.setter
+    def response_format(self, value: Optional[Mapping[str, _JsonValue]]) -> None:
+        """Set or clear the normalized structured response format."""
         ...
     @property
     def extra(self) -> _JsonObject:
@@ -1543,6 +1559,33 @@ def llm_call_execute(
     """
     ...
 
+def llm_call_execute_v2(
+    name: str,
+    request: LLMRequest,
+    func: Callable[[LLMRequest], _Json | Awaitable[_Json]],
+    *,
+    api_family: _LlmApiFamily,
+    call_role: _LlmCallRole,
+    sanitized_metadata: Mapping[str, _Json],
+    tenant_id: Optional[str] = ...,
+    agent_id: Optional[str] = ...,
+    replay_factory: object = ...,
+    handle: Optional[ScopeHandle] = ...,
+    attributes: Optional[LLMAttributes] = ...,
+    data: object = ...,
+    metadata: object = ...,
+    model_name: Optional[str] = ...,
+    codec: object = ...,
+    response_codec: object = ...,
+) -> Awaitable[_Json]:
+    """Execute a V2 LLM call with explicit routing and optional replay.
+
+    Factory construction errors follow Core's replay-ineligible fail-open path.
+    Invalid family, role, routing identities, or metadata fail before provider
+    execution.
+    """
+    ...
+
 def llm_stream_call_execute(
     name: str,
     request: LLMRequest,
@@ -2275,6 +2318,10 @@ def clear_plugin_configuration() -> None:
     """
     ...
 
+def clear_plugin_configuration_async(timeout: float = 30.0) -> Awaitable[None]:
+    """Drain and clear active plugin configuration by one shared deadline."""
+    ...
+
 def active_plugin_report() -> Optional[_JsonObject]:
     """Return the active plugin report.
 
@@ -2358,6 +2405,10 @@ def set_latency_sensitivity(level: int) -> None:
     Exceptional flow:
         Native validation errors propagate when ``level`` is unsupported.
     """
+    ...
+
+def _router_native_vector_probe() -> tuple[str, str]:
+    """Return linked SQLite and sqlite-vec versions after a native vector probe."""
     ...
 
 def __getattr__(name: str) -> object:

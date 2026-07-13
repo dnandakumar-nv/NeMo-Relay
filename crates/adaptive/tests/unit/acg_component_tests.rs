@@ -65,7 +65,7 @@ fn sample_openai_chat_request() -> LlmRequest {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Hello"},
-                        {"type": "tool_result", "data": {"z": 1, "a": 2}}
+                        {"type": "text", "text": "Use the available search tool."}
                     ]
                 }
             ],
@@ -98,6 +98,7 @@ fn sample_annotated_request(model: &str) -> AnnotatedLlmRequest {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -126,7 +127,7 @@ fn sample_openai_responses_request() -> LlmRequest {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "Hello"},
-                        {"type": "tool_result", "data": {"z": 1, "a": 2}}
+                        {"type": "text", "text": "Use the available search tool."}
                     ]
                 }
             ],

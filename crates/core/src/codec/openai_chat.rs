@@ -12,7 +12,10 @@ use crate::api::llm::LlmRequest;
 use crate::error::{FlowError, Result};
 use crate::json::Json;
 
-use super::request::{AnnotatedLlmRequest, GenerationParams, Message, ToolChoice, ToolDefinition};
+use super::request::{
+    AnnotatedLlmRequest, GenerationParams, Message, StructuredResponseFormat,
+    StructuredResponseFormatKind, ToolChoice, ToolDefinition,
+};
 use super::resolve::{ProviderSurface, ProviderSurfaceDescriptor};
 use super::response::{
     AnnotatedLlmResponse, ApiSpecificResponse, FinishReason, RawUsageCost, ResponseToolCall, Usage,
@@ -129,6 +132,7 @@ const MODELED_REQUEST_KEYS: &[&str] = &[
     "stop",
     "tools",
     "tool_choice",
+    "response_format",
     "store",
     "user",
     "metadata",
@@ -137,6 +141,215 @@ const MODELED_REQUEST_KEYS: &[&str] = &[
     "top_logprobs",
     "stream",
 ];
+
+const NATIVE_WRAPPER_KEY: &str = "native_wrapper";
+const NATIVE_FORMAT_KEY: &str = "native_format";
+
+fn response_format_error(message: impl Into<String>) -> FlowError {
+    FlowError::Internal(format!(
+        "OpenAI Chat response_format decode: {}",
+        message.into()
+    ))
+}
+
+fn structured_extra(
+    native_wrapper: serde_json::Map<String, Json>,
+    native_format: serde_json::Map<String, Json>,
+) -> serde_json::Map<String, Json> {
+    let mut extra = serde_json::Map::new();
+    if !native_wrapper.is_empty() {
+        extra.insert(NATIVE_WRAPPER_KEY.into(), Json::Object(native_wrapper));
+    }
+    if !native_format.is_empty() {
+        extra.insert(NATIVE_FORMAT_KEY.into(), Json::Object(native_format));
+    }
+    extra
+}
+
+fn decode_chat_response_format(value: Option<&Json>) -> Result<Option<StructuredResponseFormat>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(wrapper) = value.as_object() else {
+        return Ok(None);
+    };
+    let Some(kind) = wrapper.get("type").and_then(Json::as_str) else {
+        return Ok(None);
+    };
+
+    match kind {
+        "json_object" => {
+            if wrapper
+                .keys()
+                .any(|key| matches!(key.as_str(), "json_schema" | "name" | "schema" | "strict"))
+            {
+                return Err(response_format_error(
+                    "json_object contains json_schema-only fields",
+                ));
+            }
+            let native_format = wrapper
+                .iter()
+                .filter(|(key, _)| key.as_str() != "type")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            Ok(Some(StructuredResponseFormat {
+                kind: StructuredResponseFormatKind::JsonObject,
+                name: None,
+                schema: None,
+                strict: None,
+                extra: structured_extra(serde_json::Map::new(), native_format),
+            }))
+        }
+        "json_schema" => {
+            if wrapper
+                .keys()
+                .any(|key| matches!(key.as_str(), "name" | "schema" | "strict"))
+            {
+                return Err(response_format_error(
+                    "json_schema fields must be nested under json_schema",
+                ));
+            }
+            let descriptor = wrapper
+                .get("json_schema")
+                .and_then(Json::as_object)
+                .ok_or_else(|| response_format_error("json_schema must be an object"))?;
+            let name = descriptor
+                .get("name")
+                .and_then(Json::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| response_format_error("json_schema.name must be a nonempty string"))?
+                .to_string();
+            let schema = descriptor
+                .get("schema")
+                .filter(|schema| !schema.is_null())
+                .cloned()
+                .ok_or_else(|| response_format_error("json_schema.schema is required"))?;
+            let strict = descriptor
+                .get("strict")
+                .map(|value| {
+                    value.as_bool().ok_or_else(|| {
+                        response_format_error("json_schema.strict must be a boolean")
+                    })
+                })
+                .transpose()?;
+            let native_wrapper = wrapper
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "type" | "json_schema"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let native_format = descriptor
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "name" | "schema" | "strict"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            Ok(Some(StructuredResponseFormat {
+                kind: StructuredResponseFormatKind::JsonSchema,
+                name: Some(name),
+                schema: Some(schema),
+                strict,
+                extra: structured_extra(native_wrapper, native_format),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_extra_map(
+    format: &StructuredResponseFormat,
+    key: &str,
+) -> Result<serde_json::Map<String, Json>> {
+    match format.extra.get(key) {
+        Some(Json::Object(extra)) => Ok(extra.clone()),
+        Some(_) => Err(FlowError::Internal(format!(
+            "OpenAI Chat response_format encode: {key} must be an object"
+        ))),
+        None => Ok(serde_json::Map::new()),
+    }
+}
+
+fn validate_native_extra_keys(format: &StructuredResponseFormat) -> Result<()> {
+    if let Some(key) = format
+        .extra
+        .keys()
+        .find(|key| !matches!(key.as_str(), NATIVE_WRAPPER_KEY | NATIVE_FORMAT_KEY))
+    {
+        return Err(FlowError::Internal(format!(
+            "OpenAI Chat response_format encode: unsupported extra key {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_without_conflict(
+    obj: &mut serde_json::Map<String, Json>,
+    key: &str,
+    value: Json,
+) -> Result<()> {
+    if obj.insert(key.into(), value).is_some() {
+        return Err(FlowError::Internal(format!(
+            "OpenAI Chat response_format encode: native extra conflicts with {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn encode_chat_response_format(format: &StructuredResponseFormat) -> Result<Json> {
+    validate_native_extra_keys(format)?;
+    let mut wrapper = native_extra_map(format, NATIVE_WRAPPER_KEY)?;
+    let native_format = native_extra_map(format, NATIVE_FORMAT_KEY)?;
+
+    match format.kind {
+        StructuredResponseFormatKind::JsonObject => {
+            if format.name.is_some() || format.schema.is_some() || format.strict.is_some() {
+                return Err(FlowError::Internal(
+                    "OpenAI Chat response_format encode: json_object cannot include name, schema, or strict"
+                        .into(),
+                ));
+            }
+            for (key, value) in native_format {
+                insert_without_conflict(&mut wrapper, &key, value)?;
+            }
+            insert_without_conflict(&mut wrapper, "type", Json::String("json_object".into()))?;
+        }
+        StructuredResponseFormatKind::JsonSchema => {
+            let name = format
+                .name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    FlowError::Internal(
+                        "OpenAI Chat response_format encode: json_schema.name is required".into(),
+                    )
+                })?;
+            let schema = format
+                .schema
+                .as_ref()
+                .filter(|schema| !schema.is_null())
+                .ok_or_else(|| {
+                    FlowError::Internal(
+                        "OpenAI Chat response_format encode: json_schema.schema is required".into(),
+                    )
+                })?;
+            let mut descriptor = native_format;
+            insert_without_conflict(&mut descriptor, "name", Json::String(name.into()))?;
+            insert_without_conflict(&mut descriptor, "schema", schema.clone())?;
+            if let Some(strict) = format.strict {
+                insert_without_conflict(&mut descriptor, "strict", Json::Bool(strict))?;
+            }
+            insert_without_conflict(&mut wrapper, "type", Json::String("json_schema".into()))?;
+            insert_without_conflict(&mut wrapper, "json_schema", Json::Object(descriptor))?;
+        }
+    }
+    Ok(Json::Object(wrapper))
+}
+
+fn original_messages_match(obj: &serde_json::Map<String, Json>, messages: &[Message]) -> bool {
+    match obj.get("messages") {
+        Some(original) => serde_json::from_value::<Vec<Message>>(original.clone())
+            .is_ok_and(|decoded| decoded == messages),
+        None => messages.is_empty(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LlmResponseCodec implementation
@@ -241,8 +454,12 @@ impl LlmCodec for OpenAIChatCodec {
         // Extract messages (default to empty vec if absent).
         let messages: Vec<Message> = obj
             .get("messages")
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| FlowError::Internal(format!("OpenAI Chat messages decode: {error}")))?
             .unwrap_or_default();
+
+        let response_format = decode_chat_response_format(obj.get("response_format"))?;
 
         // Extract model.
         let model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
@@ -289,7 +506,10 @@ impl LlmCodec for OpenAIChatCodec {
         // Collect extra fields (keys not in MODELED_REQUEST_KEYS).
         let extra: serde_json::Map<String, Json> = obj
             .iter()
-            .filter(|(k, _)| !MODELED_REQUEST_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| {
+                !MODELED_REQUEST_KEYS.contains(&k.as_str())
+                    || (k.as_str() == "response_format" && response_format.is_none())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -299,6 +519,7 @@ impl LlmCodec for OpenAIChatCodec {
             params,
             tools,
             tool_choice,
+            response_format,
             store: obj.get("store").and_then(|v| v.as_bool()),
             previous_response_id: None,
             truncation: None,
@@ -325,7 +546,9 @@ impl LlmCodec for OpenAIChatCodec {
             .as_object_mut()
             .ok_or_else(|| FlowError::Internal("original content is not an object".into()))?;
 
-        insert_serialized(obj, "messages", &annotated.messages, "messages")?;
+        if !original_messages_match(obj, &annotated.messages) {
+            insert_serialized(obj, "messages", &annotated.messages, "messages")?;
+        }
 
         if let Some(ref model) = annotated.model {
             obj.insert("model".into(), Json::String(model.clone()));
@@ -341,6 +564,21 @@ impl LlmCodec for OpenAIChatCodec {
 
         if let Some(ref tool_choice) = annotated.tool_choice {
             insert_serialized(obj, "tool_choice", tool_choice, "tool_choice")?;
+        }
+
+        if annotated.response_format.is_some() && annotated.extra.contains_key("response_format") {
+            return Err(FlowError::Internal(
+                "OpenAI Chat response_format encode: typed and generic representations conflict"
+                    .into(),
+            ));
+        }
+        if let Some(response_format) = &annotated.response_format {
+            obj.insert(
+                "response_format".into(),
+                encode_chat_response_format(response_format)?,
+            );
+        } else if !annotated.extra.contains_key("response_format") {
+            obj.remove("response_format");
         }
 
         if let Some(store) = annotated.store {

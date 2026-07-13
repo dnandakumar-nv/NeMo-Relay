@@ -269,6 +269,14 @@ jobs:
             --set ref_name "${NEMO_RELAY_PACKAGE_VERSION}" \
             package-python
 
+      - name: Probe clean-installed wheel Router activation and native vector support
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          python_exe="$(uv python find)"
+          wheels=("${NEMO_RELAY_CI_WORKSPACE_TMP}"/wheels/*.whl)
+          "$python_exe" scripts/test-support/router_python_package_smoke.py "${wheels[0]}"
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:

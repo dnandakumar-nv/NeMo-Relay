@@ -19,6 +19,9 @@ mod model_pricing;
 mod plugin_install;
 mod plugin_shim;
 mod plugins;
+mod principal;
+mod router;
+mod router_dashboard;
 mod server;
 mod session;
 mod setup;
@@ -83,10 +86,27 @@ async fn run_command(command: Command, server: &ServerArgs) -> Result<ExitCode, 
         Command::Config(command) => run_config(command).await,
         Command::Plugins(command) => run_plugins(command, server),
         Command::ModelPricing(command) => run_pricing(command),
-        Command::Doctor(command) => run_doctor(command).await,
+        Command::Doctor(command) => run_doctor(command, server).await,
+        Command::Router(command) => router::run(command, server).await,
         Command::Agents(command) => doctor::run_agents(command.json).await,
         Command::Completions(command) => run_completions(command),
+        Command::RouterPackageProbe => run_router_package_probe(server).await,
     }
+}
+
+async fn run_router_package_probe(server_args: &ServerArgs) -> Result<ExitCode, error::CliError> {
+    let resolved = config::resolve_server_config(server_args)?;
+    let plugin_config = resolved.gateway.plugin_config.ok_or_else(|| {
+        error::CliError::Config("Router package probe requires plugin configuration".into())
+    })?;
+    server::probe_router_package_activation(plugin_config).await?;
+    nemo_relay_router::probe_native_vector_capability().map_err(|error| {
+        error::CliError::Config(format!(
+            "Router native package probe failed: {}",
+            error.code()
+        ))
+    })?;
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_config(command: ConfigCommand) -> Result<ExitCode, error::CliError> {
@@ -145,11 +165,14 @@ fn run_pricing(command: PricingCommand) -> Result<ExitCode, error::CliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn run_doctor(command: DoctorCommand) -> Result<ExitCode, error::CliError> {
+async fn run_doctor(
+    command: DoctorCommand,
+    server_args: &ServerArgs,
+) -> Result<ExitCode, error::CliError> {
     if let Some(plugin) = command.plugin {
         plugin_install::doctor(plugin, command.install_dir, command.json)
     } else {
-        doctor::run_doctor(command.agent, command.json).await
+        doctor::run_doctor(command.agent, command.json, server_args).await
     }
 }
 
@@ -201,7 +224,7 @@ async fn run_default(server_args: &ServerArgs) -> Result<ExitCode, error::CliErr
         server::serve_with_dynamic(resolved.gateway, dynamic_plugins).await?;
         Ok(ExitCode::SUCCESS)
     } else if config::any_config_file_exists() {
-        doctor::run_doctor(None, false).await
+        doctor::run_doctor(None, false, server_args).await
     } else {
         setup::run(None).await?;
         Ok(ExitCode::SUCCESS)

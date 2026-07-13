@@ -449,11 +449,9 @@ fn test_decode_request_with_input_array() {
     });
     request_json["tools"] = json!([{
         "type": "function",
-        "function": {
-            "name": "calculate",
-            "description": "Calculate math",
-            "parameters": {"type": "object"}
-        }
+        "name": "calculate",
+        "description": "Calculate math",
+        "parameters": {"type": "object"}
     }]);
     let request = make_request(request_json);
     let annotated = codec.decode(&request).unwrap();
@@ -471,6 +469,143 @@ fn test_decode_request_with_input_array() {
     let tools = annotated.tools.unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].function.name, "calculate");
+}
+
+#[test]
+fn test_native_tool_strictness_round_trips() {
+    let codec = OpenAIResponsesCodec;
+
+    for strict in [Some(true), Some(false), None] {
+        let mut native_tool = json!({
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up data",
+            "parameters": {"type": "object"}
+        });
+        if let Some(strict) = strict {
+            native_tool["strict"] = json!(strict);
+        }
+        let native_tools = json!([native_tool]);
+        let request = make_request(json!({
+            "input": "hello",
+            "tools": native_tools.clone()
+        }));
+
+        let annotated = codec.decode(&request).unwrap();
+        assert_eq!(annotated.tools.as_ref().unwrap()[0].function.strict, strict);
+
+        let encoded = codec.encode(&annotated, &request).unwrap();
+        assert_eq!(encoded.content["tools"], native_tools);
+    }
+
+    for tool in [
+        json!({"type": "function", "name": "lookup", "strict": null}),
+        json!({
+            "type": "function",
+            "function": {"name": "lookup", "strict": null}
+        }),
+    ] {
+        assert!(
+            codec
+                .decode(&make_request(json!({"input": "hello", "tools": [tool]})))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn test_legacy_nested_tool_decodes_and_encodes_flat() {
+    let codec = OpenAIResponsesCodec;
+    let request = make_request(json!({
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up data",
+                "parameters": {"type": "object"},
+                "strict": false
+            }
+        }]
+    }));
+
+    let annotated = codec.decode(&request).unwrap();
+    assert_eq!(
+        annotated.tools.as_ref().unwrap()[0].function.strict,
+        Some(false)
+    );
+
+    let encoded = codec.encode(&annotated, &request).unwrap();
+    assert_eq!(
+        encoded.content["tools"],
+        json!([{
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up data",
+            "parameters": {"type": "object"},
+            "strict": false
+        }])
+    );
+}
+
+#[test]
+fn test_non_function_tools_are_rejected_without_lossy_normalization() {
+    let codec = OpenAIResponsesCodec;
+    for tool in [
+        json!({
+            "type": "custom",
+            "name": "shell",
+            "format": {"type": "text"}
+        }),
+        json!({
+            "type": "custom",
+            "function": {"name": "legacy-custom"}
+        }),
+    ] {
+        match codec.decode(&make_request(json!({"input": "hello", "tools": [tool]}))) {
+            Err(FlowError::Internal(message)) => {
+                assert!(message.contains("only function tools are supported"));
+            }
+            other => panic!("unexpected custom-tool decode result: {other:?}"),
+        }
+    }
+
+    let request = make_request(json!({
+        "input": "hello",
+        "tools": [{"type": "function", "name": "lookup"}]
+    }));
+    let mut annotated = codec.decode(&request).unwrap();
+    annotated.tools.as_mut().unwrap()[0].tool_type = "custom".to_string();
+    match codec.encode(&annotated, &request) {
+        Err(FlowError::Internal(message)) => {
+            assert!(message.contains("only function tools are supported"));
+        }
+        other => panic!("unexpected custom-tool encode result: {other:?}"),
+    }
+}
+
+#[test]
+fn test_function_tool_shapes_reject_mixed_or_unmodeled_fields() {
+    let codec = OpenAIResponsesCodec;
+    for tool in [
+        json!({
+            "type": "function",
+            "name": "lookup",
+            "strict": true,
+            "function": {"name": "legacy"}
+        }),
+        json!({"type": "function", "name": "lookup", "vendor": true}),
+        json!({
+            "type": "function",
+            "function": {"name": "lookup", "vendor": true}
+        }),
+    ] {
+        assert!(
+            codec
+                .decode(&make_request(json!({"input": "hello", "tools": [tool]})))
+                .is_err()
+        );
+    }
 }
 
 #[test]
@@ -577,6 +712,35 @@ fn test_decode_request_input_array_preserves_unparsed_items_in_extra() {
 }
 
 #[test]
+fn test_responses_preserves_noncanonical_input_values_losslessly() {
+    let codec = OpenAIResponsesCodec;
+    for input in [
+        json!({"type": "message", "role": "user", "content": "hello"}),
+        json!([{
+            "type": "message",
+            "role": "user",
+            "content": "hello",
+            "provider_extension": true
+        }]),
+        Json::Null,
+    ] {
+        let original = make_request(json!({
+            "model": "gpt-4.1",
+            "instructions": "family instruction",
+            "input": input,
+        }));
+        let annotated = codec.decode(&original).unwrap();
+        assert_eq!(
+            annotated
+                .extra
+                .get("_openai_responses_unparsed_input_items"),
+            original.content.get("input")
+        );
+        assert_eq!(codec.encode(&annotated, &original).unwrap(), original);
+    }
+}
+
+#[test]
 fn test_decode_request_accepts_anthropic_hint_tool_choice() {
     let codec = OpenAIResponsesCodec;
     let request = make_request(json!({
@@ -677,6 +841,168 @@ fn test_decode_request_sglang_extensions_preserved_in_extra() {
         annotated.extra.get("repetition_penalty"),
         Some(&json!(1.02))
     );
+}
+
+#[test]
+fn test_responses_instructions_input_roles_and_json_schema_round_trip_losslessly() {
+    let codec = OpenAIResponsesCodec;
+    let original = make_request(json!({
+        "model": "gpt-4.1",
+        "instructions": "family instruction",
+        "input": [
+            {"role": "system", "content": "input system"},
+            {"role": "developer", "content": "input developer", "name": "policy"},
+            {"role": "user", "content": "hello"}
+        ],
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                "strict": true,
+                "description": "future descriptor field"
+            }
+        },
+        "future_request_field": 9
+    }));
+
+    let annotated = codec.decode(&original).unwrap();
+    assert_eq!(annotated.messages.len(), 4);
+    assert!(matches!(annotated.messages[0], Message::System { .. }));
+    assert!(matches!(annotated.messages[1], Message::System { .. }));
+    assert!(matches!(annotated.messages[2], Message::Developer { .. }));
+    assert!(matches!(annotated.messages[3], Message::User { .. }));
+    let format = annotated.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, StructuredResponseFormatKind::JsonSchema);
+    assert_eq!(format.name.as_deref(), Some("answer"));
+    assert_eq!(format.strict, Some(true));
+    assert_eq!(
+        format.extra.get("native_wrapper"),
+        Some(&json!({"verbosity": "low"}))
+    );
+    assert_eq!(
+        format.extra.get("native_format"),
+        Some(&json!({"description": "future descriptor field"}))
+    );
+    assert!(!annotated.extra.contains_key("text"));
+
+    let encoded = codec.encode(&annotated, &original).unwrap();
+    assert_eq!(encoded, original);
+}
+
+#[test]
+fn test_responses_string_input_model_rewrite_preserves_wire_shape() {
+    let codec = OpenAIResponsesCodec;
+    let original = make_request(json!({
+        "model": "gpt-4.1",
+        "instructions": "family instruction",
+        "input": "hello",
+        "reasoning": {"effort": "low"}
+    }));
+    let mut annotated = codec.decode(&original).unwrap();
+    annotated.model = Some("gpt-4.1-mini".into());
+    let encoded = codec.encode(&annotated, &original).unwrap();
+    let mut expected = original.clone();
+    expected.content["model"] = json!("gpt-4.1-mini");
+    assert_eq!(encoded, expected);
+    assert!(encoded.content["input"].is_string());
+}
+
+#[test]
+fn test_responses_input_system_without_family_instructions_stays_in_input() {
+    let codec = OpenAIResponsesCodec;
+    let original = make_request(json!({
+        "model": "gpt-4.1",
+        "input": [
+            {"role": "system", "content": "input system"},
+            {"role": "developer", "content": "input developer"},
+            {"role": "user", "content": "hello"}
+        ]
+    }));
+    let annotated = codec.decode(&original).unwrap();
+    let encoded = codec.encode(&annotated, &original).unwrap();
+    assert_eq!(encoded, original);
+    assert!(encoded.content.get("instructions").is_none());
+}
+
+#[test]
+fn test_responses_json_object_and_unknown_format_round_trip() {
+    let codec = OpenAIResponsesCodec;
+    let json_object = make_request(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "text": {
+            "verbosity": "medium",
+            "format": {"type": "json_object", "future": true}
+        }
+    }));
+    let annotated = codec.decode(&json_object).unwrap();
+    let format = annotated.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, StructuredResponseFormatKind::JsonObject);
+    assert_eq!(
+        format.extra.get("native_wrapper"),
+        Some(&json!({"verbosity": "medium"}))
+    );
+    assert_eq!(
+        format.extra.get("native_format"),
+        Some(&json!({"future": true}))
+    );
+    assert_eq!(codec.encode(&annotated, &json_object).unwrap(), json_object);
+
+    let unknown = make_request(json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "text": {"verbosity": "low", "format": {"type": "grammar", "grammar": "root"}}
+    }));
+    let annotated = codec.decode(&unknown).unwrap();
+    assert!(annotated.response_format.is_none());
+    assert_eq!(annotated.extra.get("text"), unknown.content.get("text"));
+    assert_eq!(codec.encode(&annotated, &unknown).unwrap(), unknown);
+}
+
+#[test]
+fn test_responses_rejects_malformed_instructions_and_supported_format() {
+    let codec = OpenAIResponsesCodec;
+    let error = codec
+        .decode(&make_request(
+            json!({"model": "gpt-4.1", "instructions": ["bad"], "input": "hi"}),
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("instructions decode"));
+
+    let error = codec
+        .decode(&make_request(json!({
+            "model": "gpt-4.1",
+            "input": "hi",
+            "text": {"format": {"type": "json_schema", "name": "answer"}}
+        })))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("schema is required"));
+
+    let error = codec
+        .decode(&make_request(json!({
+            "model": "gpt-4.1",
+            "input": "hi",
+            "text": {"format": {"type": "json_object", "schema": {"type": "object"}}}
+        })))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("json_object contains json_schema-only fields"));
+
+    let original = make_request(json!({"model": "gpt-4.1", "input": "hi"}));
+    let mut annotated = codec.decode(&original).unwrap();
+    annotated.response_format = Some(StructuredResponseFormat {
+        kind: StructuredResponseFormatKind::JsonObject,
+        name: Some("not-valid-for-json-object".into()),
+        schema: None,
+        strict: None,
+        extra: serde_json::Map::new(),
+    });
+    let error = codec.encode(&annotated, &original).unwrap_err().to_string();
+    assert!(error.contains("json_object cannot include name, schema, or strict"));
 }
 
 // ===================================================================
@@ -860,9 +1186,11 @@ fn test_helper_and_error_paths_cover_remaining_responses_branches() {
                 name: "lookup".into(),
                 description: Some("Look up data".into()),
                 parameters: Some(json!({"type": "object"})),
+                strict: None,
             },
         }]),
         tool_choice: Some(ToolChoice::Auto),
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -894,7 +1222,15 @@ fn test_helper_and_error_paths_cover_remaining_responses_branches() {
     assert_eq!(obj.get("temperature"), Some(&json!(0.1)));
     assert_eq!(obj.get("top_p"), Some(&json!(0.95)));
     assert_eq!(obj.get("max_output_tokens"), Some(&json!(32)));
-    assert!(obj.get("tools").unwrap().is_array());
+    assert_eq!(
+        obj.get("tools"),
+        Some(&json!([{
+            "type": "function",
+            "name": "lookup",
+            "description": "Look up data",
+            "parameters": {"type": "object"}
+        }]))
+    );
     assert_eq!(obj.get("tool_choice"), Some(&json!("auto")));
 
     match codec.encode(&annotated, &make_request(json!("still-not-an-object"))) {

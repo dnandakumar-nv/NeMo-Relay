@@ -50,6 +50,10 @@ Do not build a plugin when a narrower NeMo Relay surface is enough:
   execution intercepts, or stream execution intercepts.
 - `PluginContext` gives the plugin system enough ownership to qualify runtime
   names and roll back partial setup when activation fails.
+- Embedded Rust components that own background tasks, queues, replay
+  transports, or durable work add one `PluginRegistration::with_shutdown`
+  resource entry. Keep `stop_intake` and `abort` synchronous and nonblocking;
+  make `drain` honor its absolute deadline.
 - Disabled components should still validate when possible so operators can find
   config problems before rollout.
 
@@ -70,9 +74,12 @@ Do not build a plugin when a narrower NeMo Relay surface is enough:
    global behavior inside application startup.
 7. Test activation, disabled components, validation failures, and registration
    failure rollback.
-8. Document how to enable the plugin, what config fields are supported, and how
+8. If the component owns background work, test immediate abort, successful
+   drain, timeout abort, reverse deregistration, and reconciliation after an
+   interrupted durable job.
+9. Document how to enable the plugin, what config fields are supported, and how
    to roll back the component.
-9. For a dynamic plugin that should provide structured fields in
+10. For a dynamic plugin that should provide structured fields in
    `nemo-relay plugins edit`, declare the `config_schema` capability and
    reference a local Draft 7 or Draft 2020-12 JSON Schema file from
    `[config_schema].path` in `relay-plugin.toml`. Schema-less plugins remain
@@ -132,6 +139,15 @@ helper functions can be `camelCase`, but plugin config objects remain
   before data leaves the process.
 - Do not ignore partial activation failures. Roll back or surface a clear
   diagnostic.
+- Do not schedule background work after intake closes. Check before queue
+  submission and again immediately before an internal managed call or replay
+  transport start.
+- Do not treat synchronous clear as a graceful drain. Durable components must
+  reconcile accepted work after immediate abort or process restart.
+- Do not return from stop, abort, or deregistration with owned behavior still
+  active. Establish the inert boundary first, then report secondary cleanup or
+  persistence errors. Core retains failed deregistration callbacks and blocks
+  later activation until cleanup succeeds.
 
 ## Validation Checklist
 
@@ -143,6 +159,14 @@ helper functions can be `camelCase`, but plugin config objects remain
 - [ ] Initialization installs behavior through `PluginContext`.
 - [ ] A forced registration failure does not leave partial runtime behavior
       active.
+- [ ] Resource-owning Rust components use idempotent stop, drain, and abort
+      hooks and honor the shared drain deadline.
+- [ ] Stop, abort, and deregistration callbacks establish inertness before
+      reporting errors.
+- [ ] Shutdown tests cover queued subscriber callbacks, reverse drain and
+      deregistration, timeout abort, and no starts after clear.
+- [ ] Durable work has an activation-time reconciliation path after immediate
+      abort or process failure.
 - [ ] Docs or examples show how to enable and roll back the plugin.
 - [ ] Dynamic plugins that need structured CLI editing package a valid local
       JSON Schema and declare `config_schema` in `relay-plugin.toml`.

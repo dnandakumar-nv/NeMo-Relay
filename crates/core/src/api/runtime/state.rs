@@ -10,6 +10,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,13 +19,15 @@ use crate::api::event::{
     llm_attributes_to_strings, scope_attributes_to_strings, tool_attributes_to_strings,
 };
 use crate::api::llm::{CreateLlmHandleParams, EndLlmHandleParams};
-use crate::api::llm::{LlmHandle, LlmRequest};
+use crate::api::llm::{LlmCallRole, LlmHandle, LlmRequest};
 use crate::api::registry::{ExecutionIntercept, Guardrail, Intercept};
+use crate::api::runtime::LlmReplayTransport;
 use crate::api::runtime::callbacks::{
-    EventSanitizeFn, EventSubscriberFn, LlmConditionalFn, LlmExecutionFn, LlmExecutionNextFn,
-    LlmRequestInterceptFn, LlmSanitizeRequestFn, LlmSanitizeResponseFn, LlmStreamExecutionFn,
-    LlmStreamExecutionNextFn, LlmStreamExecutionRegistryRefs, ToolConditionalFn, ToolExecutionFn,
-    ToolExecutionNextFn, ToolExecutionOutcomeNextFn, ToolInterceptFn, ToolSanitizeFn,
+    EventSanitizeFn, EventSubscriberFn, LlmConditionalFn, LlmExecutionInterceptFn,
+    LlmExecutionNextFn, LlmRequestInterceptFn, LlmSanitizeRequestFn, LlmSanitizeResponseFn,
+    LlmStreamExecutionFn, LlmStreamExecutionNextFn, LlmStreamExecutionRegistryRefs,
+    ToolConditionalFn, ToolExecutionFn, ToolExecutionNextFn, ToolExecutionOutcomeNextFn,
+    ToolInterceptFn, ToolSanitizeFn,
 };
 use crate::api::runtime::subscriber_dispatcher;
 use crate::api::scope::{CreateScopeHandleParams, EndScopeHandleParams, ScopeHandle, ScopeType};
@@ -36,7 +39,8 @@ use crate::api::tool::{
 use crate::codec::request::AnnotatedLlmRequest;
 use crate::codec::response::AnnotatedLlmResponse;
 use crate::context::registries::{
-    merge_execution_intercept_callables, merge_guardrail_entries, merge_intercept_entries,
+    merge_execution_intercept_callables, merge_execution_intercept_callables_by_name,
+    merge_guardrail_entries, merge_intercept_entries,
 };
 use crate::json::{Json, merge_json};
 use crate::registry::SortedRegistry;
@@ -75,7 +79,8 @@ pub struct NemoRelayContextState {
     /// Global LLM request intercepts that can rewrite or annotate requests.
     pub(crate) llm_request_intercepts: SortedRegistry<Intercept<LlmRequestInterceptFn>>,
     /// Global non-streaming LLM execution intercepts that wrap callback execution.
-    pub(crate) llm_execution_intercepts: SortedRegistry<ExecutionIntercept<LlmExecutionFn>>,
+    pub(crate) llm_execution_intercepts:
+        SortedRegistry<ExecutionIntercept<LlmExecutionInterceptFn>>,
     /// Global streaming LLM execution intercepts that wrap stream-producing callbacks.
     pub(crate) llm_stream_execution_intercepts:
         SortedRegistry<ExecutionIntercept<LlmStreamExecutionFn>>,
@@ -83,6 +88,21 @@ pub struct NemoRelayContextState {
     pub(crate) event_subscribers: HashMap<String, EventSubscriberFn>,
     /// Arbitrary binding- or integration-specific runtime extensions.
     pub(crate) extensions: HashMap<String, Box<dyn Any + Send + Sync>>,
+}
+
+fn llm_category_profile(
+    handle: &LlmHandle,
+    call_role: LlmCallRole,
+    annotated_request: Option<Arc<AnnotatedLlmRequest>>,
+    annotated_response: Option<Arc<AnnotatedLlmResponse>>,
+) -> CategoryProfile {
+    let mut profile = CategoryProfile::builder()
+        .model_name_opt(handle.model_name.clone())
+        .annotated_request_opt(annotated_request)
+        .annotated_response_opt(annotated_response)
+        .build();
+    profile.set_llm_call_role(call_role);
+    profile
 }
 
 impl NemoRelayContextState {
@@ -478,6 +498,16 @@ impl NemoRelayContextState {
         data: Option<Json>,
         annotated_request: Option<Arc<AnnotatedLlmRequest>>,
     ) -> Event {
+        self.build_llm_start_event_with_role(handle, data, annotated_request, LlmCallRole::Primary)
+    }
+
+    pub(crate) fn build_llm_start_event_with_role(
+        &self,
+        handle: &LlmHandle,
+        data: Option<Json>,
+        annotated_request: Option<Arc<AnnotatedLlmRequest>>,
+        call_role: LlmCallRole,
+    ) -> Event {
         Event::Scope(ScopeEvent::new(
             BaseEvent::builder()
                 .parent_uuid_opt(handle.parent_uuid)
@@ -490,12 +520,12 @@ impl NemoRelayContextState {
             ScopeCategory::Start,
             llm_attributes_to_strings(handle.attributes),
             EventCategory::llm(),
-            Some(
-                CategoryProfile::builder()
-                    .model_name_opt(handle.model_name.clone())
-                    .annotated_request_opt(annotated_request)
-                    .build(),
-            ),
+            Some(llm_category_profile(
+                handle,
+                call_role,
+                annotated_request,
+                None,
+            )),
         ))
     }
 
@@ -537,6 +567,14 @@ impl NemoRelayContextState {
     /// # Returns
     /// An LLM-end [`Event`] derived from the provided parameters.
     pub fn build_llm_end_event(&self, params: EndLlmHandleParams<'_>) -> Event {
+        self.build_llm_end_event_with_role(params, LlmCallRole::Primary)
+    }
+
+    pub(crate) fn build_llm_end_event_with_role(
+        &self,
+        params: EndLlmHandleParams<'_>,
+        call_role: LlmCallRole,
+    ) -> Event {
         let handle = params.handle;
         Event::Scope(ScopeEvent::new(
             BaseEvent::builder()
@@ -554,12 +592,12 @@ impl NemoRelayContextState {
             ScopeCategory::End,
             llm_attributes_to_strings(handle.attributes),
             EventCategory::llm(),
-            Some(
-                CategoryProfile::builder()
-                    .model_name_opt(handle.model_name.clone())
-                    .annotated_response_opt(params.annotated_response)
-                    .build(),
-            ),
+            Some(llm_category_profile(
+                handle,
+                call_role,
+                None,
+                params.annotated_response,
+            )),
         ))
     }
 
@@ -1219,16 +1257,78 @@ impl NemoRelayContextState {
         &self,
         name: &str,
         default_fn: LlmExecutionNextFn,
-        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmExecutionFn>>],
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmExecutionInterceptFn>>],
     ) -> LlmExecutionNextFn {
         let matching =
             merge_execution_intercept_callables(&self.llm_execution_intercepts, scope_locals);
         let mut next = default_fn;
         let name = name.to_string();
         for (callable, _) in matching.into_iter().rev() {
+            let LlmExecutionInterceptFn::V1(callable) = callable else {
+                continue;
+            };
             let current_next = next.clone();
             let current_name = name.clone();
             next = Arc::new(move |request| callable(&current_name, request, current_next.clone()));
+        }
+        next
+    }
+
+    /// Build the mixed V1/V2 non-streaming execution chain for a V2 call.
+    pub(crate) fn llm_build_execution_chain_v2(
+        &self,
+        name: &str,
+        context: Arc<crate::api::llm::LlmExecutionContextSnapshot>,
+        replay: Option<Arc<dyn LlmReplayTransport>>,
+        default_fn: LlmExecutionNextFn,
+        scope_locals: &[&SortedRegistry<ExecutionIntercept<LlmExecutionInterceptFn>>],
+    ) -> LlmExecutionNextFn {
+        let matching = merge_execution_intercept_callables_by_name(
+            &self.llm_execution_intercepts,
+            scope_locals,
+        );
+        let mut next = default_fn;
+        let name = name.to_string();
+        for (callable, _) in matching.into_iter().rev() {
+            let current_next = next.clone();
+            let current_name = name.clone();
+            let current_context = context.clone();
+            let current_replay = replay.clone();
+            next = match callable {
+                LlmExecutionInterceptFn::V1(callable) => Arc::new(move |request| {
+                    let callable = callable.clone();
+                    let current_name = current_name.clone();
+                    let (active, _) = tokio::sync::watch::channel(true);
+                    let downstream = Arc::new(Mutex::new(Some(current_next.clone())));
+                    let leased_next = active_llm_next(downstream.clone(), active.clone());
+                    Box::pin(async move {
+                        let _lease = LlmNextLease { active, downstream };
+                        callable(&current_name, request, leased_next).await
+                    })
+                }),
+                LlmExecutionInterceptFn::V2(callable) => Arc::new(move |request| {
+                    let callable = callable.clone();
+                    let current_name = current_name.clone();
+                    let current_context = current_context.clone();
+                    let current_replay = current_replay.clone();
+                    let (active, _) = tokio::sync::watch::channel(true);
+                    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let downstream = Arc::new(Mutex::new(Some(current_next.clone())));
+                    let leased_next =
+                        single_use_llm_next(downstream.clone(), active.clone(), called);
+                    Box::pin(async move {
+                        let _lease = LlmNextLease { active, downstream };
+                        callable(
+                            &current_name,
+                            current_context,
+                            request,
+                            current_replay,
+                            leased_next,
+                        )
+                        .await
+                    })
+                }),
+            };
         }
         next
     }
@@ -1265,6 +1365,107 @@ impl NemoRelayContextState {
         }
         next
     }
+}
+
+struct LlmNextLease {
+    active: tokio::sync::watch::Sender<bool>,
+    downstream: Arc<Mutex<Option<LlmExecutionNextFn>>>,
+}
+
+impl Drop for LlmNextLease {
+    fn drop(&mut self) {
+        let mut downstream = self
+            .downstream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.active.send_replace(false);
+        downstream.take();
+    }
+}
+
+fn active_llm_next(
+    downstream: Arc<Mutex<Option<LlmExecutionNextFn>>>,
+    active: tokio::sync::watch::Sender<bool>,
+) -> LlmExecutionNextFn {
+    Arc::new(move |request| {
+        if !*active.borrow() {
+            return inactive_llm_next_result();
+        }
+        let downstream = downstream.clone();
+        let mut active = active.subscribe();
+        Box::pin(async move {
+            if !*active.borrow() {
+                return inactive_llm_next_error();
+            }
+            let downstream_future = {
+                let guard = downstream.lock().unwrap_or_else(|error| error.into_inner());
+                if !*active.borrow() {
+                    return inactive_llm_next_error();
+                }
+                let Some(next) = guard.as_ref() else {
+                    return inactive_llm_next_error();
+                };
+                next(request)
+            };
+            tokio::select! {
+                biased;
+                _ = active.changed() => inactive_llm_next_error(),
+                result = downstream_future => result,
+            }
+        })
+    })
+}
+
+fn single_use_llm_next(
+    downstream: Arc<Mutex<Option<LlmExecutionNextFn>>>,
+    active: tokio::sync::watch::Sender<bool>,
+    called: Arc<std::sync::atomic::AtomicBool>,
+) -> LlmExecutionNextFn {
+    Arc::new(move |request| {
+        if !*active.borrow() {
+            return inactive_llm_next_result();
+        }
+        if called.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Box::pin(async {
+                Err(crate::error::FlowError::InvalidArgument(
+                    "V2 LLM continuation may be called only once".to_string(),
+                ))
+            });
+        }
+        let downstream = downstream.clone();
+        let mut active = active.subscribe();
+        Box::pin(async move {
+            if !*active.borrow() {
+                return inactive_llm_next_error();
+            }
+            let downstream_future = {
+                let guard = downstream.lock().unwrap_or_else(|error| error.into_inner());
+                if !*active.borrow() {
+                    return inactive_llm_next_error();
+                }
+                let Some(next) = guard.as_ref() else {
+                    return inactive_llm_next_error();
+                };
+                next(request)
+            };
+            tokio::select! {
+                biased;
+                _ = active.changed() => inactive_llm_next_error(),
+                result = downstream_future => result,
+            }
+        })
+    })
+}
+
+fn inactive_llm_next_result()
+-> Pin<Box<dyn std::future::Future<Output = crate::error::Result<Json>> + Send>> {
+    Box::pin(async { inactive_llm_next_error() })
+}
+
+fn inactive_llm_next_error() -> crate::error::Result<Json> {
+    Err(crate::error::FlowError::InvalidArgument(
+        "V2 LLM continuation is no longer active".to_string(),
+    ))
 }
 
 fn end_timestamp_after(started_at: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {

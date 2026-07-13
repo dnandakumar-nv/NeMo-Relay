@@ -1797,8 +1797,15 @@ async fn codex_stop_snapshots_atif_without_session_end() {
 
     start_codex_prompt_turn(&manager, &headers, "codex-atif-stop").await;
     run_codex_responses_tool_activity(&manager, &headers, "codex-atif-stop").await;
+    let has_session_snapshot = std::fs::read_dir(&atif_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            serde_json::from_slice::<Value>(&std::fs::read(entry.path()).ok()?).ok()
+        })
+        .any(|trajectory| atif_matches_session(&trajectory, "codex-atif-stop"));
     assert!(
-        std::fs::read_dir(&atif_dir).unwrap().next().is_none(),
+        !has_session_snapshot,
         "Codex ATIF should wait for Stop before writing a per-turn snapshot"
     );
 
@@ -1899,8 +1906,23 @@ async fn codex_openinference_spans_match_shared_contract() {
     assert!(subscriber.deregister(subscriber_name).unwrap());
 
     let spans = exporter.get_finished_spans().unwrap();
+    let turn_trace_id = spans
+        .iter()
+        .find_map(|span| {
+            if span.name.as_ref() != "codex-turn" {
+                return None;
+            }
+            let attributes = attr_map(&span.attributes);
+            let is_test_session = attributes
+                .get("metadata")
+                .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+                .is_some_and(|metadata| metadata["session_id"] == json!("codex-openinference"));
+            is_test_session.then(|| span.span_context.trace_id())
+        })
+        .expect("Codex turn should export an OpenInference trace");
     let attributes_by_span = spans
         .iter()
+        .filter(|span| span.span_context.trace_id() == turn_trace_id)
         .map(|span| (span.name.as_ref(), attr_map(&span.attributes)))
         .collect::<HashMap<_, _>>();
     let turn_attributes = attributes_by_span

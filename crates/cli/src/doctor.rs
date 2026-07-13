@@ -5,12 +5,14 @@
 //!
 //! Split into three layers so the data path can be unit-tested without real I/O:
 //!
-//! - `collect_report()` does the I/O (env probes, $PATH scans, network checks, fs writability).
+//! - `collect_report_with_server()` does the I/O (env probes, $PATH scans, network checks, fs
+//!   writability).
 //! - `DoctorReport` is the resulting pure data shape.
 //! - `format_human(&report)` / `format_json(&report)` render the report.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use futures_util::SinkExt;
@@ -20,6 +22,10 @@ use nemo_relay::observability::plugin_component::OBSERVABILITY_PLUGIN_KIND;
 use nemo_relay::plugin::{DiagnosticLevel, PluginConfig, validate_plugin_config};
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_router::{
+    RouterConfig, RouterDatabaseSchemaState, RouterMode, inspect_router_database,
+    probe_native_vector_capability, register_router_component,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -28,12 +34,14 @@ use uuid::Uuid;
 
 use crate::config::{
     AgentConfigs, CodingAgent, DynamicPluginHostConfigStatus, GatewayConfig, ResolvedConfig,
-    ServerArgs, default_plugin_config_paths, effective_plugin_toml_sources, resolve_server_config,
+    ServerArgs, default_plugin_config_paths, effective_plugin_toml_sources_for,
+    resolve_server_config,
 };
 use crate::error::CliError;
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(2);
 const PRICING_PLUGIN_KIND: &str = "pricing";
+const ROUTER_PLUGIN_KIND: &str = "router";
 
 /// Outcome of one check inside the doctor report. The `details` field carries human-readable
 /// supplementary text; the `status` is the bottom-line signal callers (and CI) use to decide
@@ -128,10 +136,11 @@ pub(crate) struct AgentInfo {
 /// Drives all checks and produces a single `DoctorReport`. Network probes are bounded by a
 /// short timeout so the command always returns quickly. Filesystem checks short-circuit on
 /// the first missing directory.
-pub(crate) async fn collect_report(
+pub(crate) async fn collect_report_with_server(
     target_agent: Option<CodingAgent>,
+    server_args: &ServerArgs,
 ) -> Result<DoctorReport, CliError> {
-    let (resolved, resolution) = match resolve_server_config(&ServerArgs::default()) {
+    let (resolved, resolution) = match resolve_server_config(server_args) {
         Ok(resolved) => (
             resolved,
             Check {
@@ -152,7 +161,7 @@ pub(crate) async fn collect_report(
     let cwd = std::env::current_dir().ok();
     let home = home_dir();
     let configured_agents = configured_agent_names(&resolved.agents);
-    let (plugin_sources, plugin_error) = match effective_plugin_toml_sources() {
+    let (plugin_sources, plugin_error) = match effective_plugin_toml_sources_for(server_args) {
         Ok(sources) => (sources, None),
         Err(error) => (Vec::new(), Some(error.to_string())),
     };
@@ -230,16 +239,22 @@ fn collect_configuration(
         workspace: layer_status(&workspace_path),
         global: layer_status(&global_path),
         system: layer_status(&system_path),
-        plugin_configs: default_plugin_config_paths()
-            .iter()
-            .map(|path| {
-                plugin_layer_status(
-                    path,
-                    &plugin_diagnostics.sources,
-                    plugin_diagnostics.error.as_deref(),
-                )
-            })
-            .collect(),
+        plugin_configs: {
+            let mut paths = default_plugin_config_paths();
+            paths.extend(plugin_diagnostics.sources.iter().cloned());
+            paths.sort();
+            paths.dedup();
+            paths
+        }
+        .iter()
+        .map(|path| {
+            plugin_layer_status(
+                path,
+                &plugin_diagnostics.sources,
+                plugin_diagnostics.error.as_deref(),
+            )
+        })
+        .collect(),
         plugin_resolution: plugin_diagnostics.resolution.clone(),
         resolution,
         // `default_agent` is reserved in the design for Phase 2 dispatch; not currently parsed
@@ -641,6 +656,7 @@ async fn probe_version(binary: &Path) -> Option<String> {
 
 async fn collect_observability(gateway: &GatewayConfig) -> Vec<Check> {
     let mut checks = Vec::new();
+    let router_registration = register_router_component();
 
     let Some(plugin_value) = &gateway.plugin_config else {
         checks.push(Check {
@@ -648,6 +664,7 @@ async fn collect_observability(gateway: &GatewayConfig) -> Vec<Check> {
             status: Status::Info,
             details: "plugins.toml not configured".into(),
         });
+        collect_router_component_checks(&mut checks, None, router_registration.is_ok());
         return checks;
     };
 
@@ -659,6 +676,7 @@ async fn collect_observability(gateway: &GatewayConfig) -> Vec<Check> {
                 status: Status::Fail,
                 details: format!("invalid plugin config: {err}"),
             });
+            collect_router_component_checks(&mut checks, None, router_registration.is_ok());
             return checks;
         }
     };
@@ -673,6 +691,14 @@ async fn collect_observability(gateway: &GatewayConfig) -> Vec<Check> {
     if let Err(error) = register_pii_redaction_component() {
         checks.push(Check {
             name: "PII redaction plugin",
+            status: Status::Fail,
+            details: format!("registration failed: {error}"),
+        });
+        return checks;
+    }
+    if let Err(error) = router_registration {
+        checks.push(Check {
+            name: "Router registration",
             status: Status::Fail,
             details: format!("registration failed: {error}"),
         });
@@ -709,8 +735,255 @@ async fn collect_observability(gateway: &GatewayConfig) -> Vec<Check> {
         });
     }
     collect_pricing_component_checks(&mut checks, &plugin_config);
+    collect_router_component_checks(&mut checks, Some(&plugin_config), true);
 
     checks
+}
+
+fn collect_router_component_checks(
+    checks: &mut Vec<Check>,
+    plugin_config: Option<&PluginConfig>,
+    registered: bool,
+) {
+    checks.push(Check {
+        name: "Router registration",
+        status: if registered {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        details: if registered {
+            "built-in component registered".into()
+        } else {
+            "built-in component registration failed".into()
+        },
+    });
+    checks.push(router_native_vector_check());
+    checks.push(Check {
+        name: "Router V2 bridge",
+        status: Status::Pass,
+        details: "buffered OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages; streaming and non-generation routes remain ineligible".into(),
+    });
+
+    let Some(component) = plugin_config.and_then(|config| {
+        config
+            .components
+            .iter()
+            .find(|component| component.kind == ROUTER_PLUGIN_KIND)
+    }) else {
+        checks.push(Check {
+            name: "Router",
+            status: Status::Info,
+            details: "component not configured".into(),
+        });
+        return;
+    };
+    let router_config =
+        match serde_json::from_value::<RouterConfig>(Value::Object(component.config.clone())) {
+            Ok(config) => config,
+            Err(error) => {
+                checks.push(Check {
+                    name: "Router",
+                    status: Status::Fail,
+                    details: format!("invalid component config: {error}"),
+                });
+                return;
+            }
+        };
+
+    checks.push(Check {
+        name: "Router mode",
+        status: if component.enabled {
+            Status::Pass
+        } else {
+            Status::Info
+        },
+        details: format!(
+            "{}; {} pool(s)",
+            router_mode_name(router_config.mode),
+            router_config.pools.len()
+        ),
+    });
+    let database_path = Path::new(&router_config.database_path);
+    let database_parent = database_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    checks.push(check_directory(
+        "Router database directory",
+        database_parent,
+    ));
+    let schema_report = inspect_router_database(database_path);
+    checks.push(Check {
+        name: "Router database schema",
+        status: match schema_report.state {
+            RouterDatabaseSchemaState::Current => Status::Pass,
+            RouterDatabaseSchemaState::Missing | RouterDatabaseSchemaState::Empty => Status::Info,
+            RouterDatabaseSchemaState::UpgradeRequired => Status::Warn,
+            RouterDatabaseSchemaState::Newer
+            | RouterDatabaseSchemaState::Incompatible
+            | RouterDatabaseSchemaState::Unreadable => Status::Fail,
+        },
+        details: format!(
+            "{}; observed version {}; supported version {}",
+            router_database_state_name(schema_report.state),
+            schema_report
+                .schema_version
+                .map_or_else(|| "none".into(), |version| version.to_string()),
+            schema_report.supported_schema_version
+        ),
+    });
+    checks.push(Check {
+        name: "Router remote embedding egress",
+        status: Status::Info,
+        details: if router_config.allow_remote_embedding_egress {
+            "explicitly enabled".into()
+        } else {
+            "disabled".into()
+        },
+    });
+    let (shadow_slots, judge_slots, pending_slots) = router_config.pools.iter().fold(
+        (0_usize, 0_usize, 0_usize),
+        |(shadow, judge, pending), pool| {
+            (
+                shadow.saturating_add(pool.concurrency.shadow),
+                judge.saturating_add(pool.concurrency.judge),
+                pending.saturating_add(pool.concurrency.max_pending),
+            )
+        },
+    );
+    checks.push(Check {
+        name: "Router configured queues",
+        status: Status::Info,
+        details: format!(
+            "shadow {shadow_slots}, judge {judge_slots}, pending {pending_slots}; live depths require router inspection"
+        ),
+    });
+    collect_router_active_checks(checks, &router_config, schema_report.state);
+}
+
+fn collect_router_active_checks(
+    checks: &mut Vec<Check>,
+    config: &RouterConfig,
+    schema_state: RouterDatabaseSchemaState,
+) {
+    if config.mode != RouterMode::Active {
+        checks.push(Check {
+            name: "Router controls",
+            status: Status::Info,
+            details: "durable Active controls are not required in this mode".into(),
+        });
+        checks.push(Check {
+            name: "Router outcome policy",
+            status: Status::Info,
+            details: "required only in Active mode".into(),
+        });
+        return;
+    }
+
+    checks.push(Check {
+        name: "Router controls",
+        status: match schema_state {
+            RouterDatabaseSchemaState::Current => Status::Pass,
+            RouterDatabaseSchemaState::Missing
+            | RouterDatabaseSchemaState::Empty
+            | RouterDatabaseSchemaState::UpgradeRequired => Status::Warn,
+            RouterDatabaseSchemaState::Newer
+            | RouterDatabaseSchemaState::Incompatible
+            | RouterDatabaseSchemaState::Unreadable => Status::Fail,
+        },
+        details: match schema_state {
+            RouterDatabaseSchemaState::Current => {
+                "durable control schema is present; runtime state is verified at activation".into()
+            }
+            RouterDatabaseSchemaState::Missing | RouterDatabaseSchemaState::Empty => {
+                "durable controls will be initialized during activation".into()
+            }
+            RouterDatabaseSchemaState::UpgradeRequired => {
+                "durable controls require migration during activation".into()
+            }
+            RouterDatabaseSchemaState::Newer
+            | RouterDatabaseSchemaState::Incompatible
+            | RouterDatabaseSchemaState::Unreadable => {
+                "durable control state is not readable by this build".into()
+            }
+        },
+    });
+    let diagnostics = config.validate();
+    let outcome_errors = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+        .filter(|diagnostic| {
+            diagnostic
+                .field
+                .as_deref()
+                .is_some_and(|field| field.contains("outcome"))
+        })
+        .count();
+    let configured_pools = config
+        .pools
+        .iter()
+        .filter(|pool| !pool.outcome.is_empty())
+        .count();
+    checks.push(Check {
+        name: "Router outcome policy",
+        status: if outcome_errors == 0 && configured_pools == config.pools.len() {
+            Status::Pass
+        } else {
+            Status::Fail
+        },
+        details: format!(
+            "configured policies {}/{}; {} outcome diagnostic error(s)",
+            configured_pools,
+            config.pools.len(),
+            outcome_errors
+        ),
+    });
+}
+
+fn router_native_vector_check() -> Check {
+    static PROBE: OnceLock<
+        Result<
+            nemo_relay_router::RouterNativeVectorCapability,
+            nemo_relay_router::RouterNativeVectorCapabilityError,
+        >,
+    > = OnceLock::new();
+    match PROBE.get_or_init(probe_native_vector_capability) {
+        Ok(report) => Check {
+            name: "Router native vector",
+            status: Status::Pass,
+            details: format!(
+                "SQLite {}; sqlite-vec {}; temporary vec0 insert/query passed",
+                report.sqlite_version, report.vector_version
+            ),
+        },
+        Err(error) => Check {
+            name: "Router native vector",
+            status: Status::Fail,
+            details: error.code().into(),
+        },
+    }
+}
+
+const fn router_mode_name(mode: RouterMode) -> &'static str {
+    match mode {
+        RouterMode::Off => "off",
+        RouterMode::Shadow => "shadow",
+        RouterMode::Recommend => "recommend",
+        RouterMode::Active => "active",
+    }
+}
+
+const fn router_database_state_name(state: RouterDatabaseSchemaState) -> &'static str {
+    match state {
+        RouterDatabaseSchemaState::Missing => "missing",
+        RouterDatabaseSchemaState::Empty => "empty",
+        RouterDatabaseSchemaState::Current => "current",
+        RouterDatabaseSchemaState::UpgradeRequired => "upgrade_required",
+        RouterDatabaseSchemaState::Newer => "newer",
+        RouterDatabaseSchemaState::Incompatible => "incompatible",
+        RouterDatabaseSchemaState::Unreadable => "unreadable",
+    }
 }
 
 async fn collect_observability_component_checks(checks: &mut Vec<Check>, config: &Value) {
@@ -1629,8 +1902,9 @@ pub(crate) fn format_agents_json(agents: &[AgentInfo]) -> Result<String, CliErro
 pub(crate) async fn run_doctor(
     target_agent: Option<CodingAgent>,
     json: bool,
+    server_args: &ServerArgs,
 ) -> Result<std::process::ExitCode, CliError> {
-    let report = collect_report(target_agent).await?;
+    let report = collect_report_with_server(target_agent, server_args).await?;
     if json {
         print!("{}", format_json(&report)?);
     } else {

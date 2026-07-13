@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_stream::stream;
@@ -11,11 +13,14 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, 
 use futures_util::StreamExt;
 use http_body_util::LengthLimitError;
 use nemo_relay::api::llm::{
-    LlmCallExecuteParams, LlmRequest, LlmStreamCallExecuteParams, llm_call_execute,
-    llm_stream_call_execute,
+    LlmApiFamily, LlmCallExecuteParams, LlmCallExecuteV2Params, LlmCallRole,
+    LlmExecutionContextSnapshot, LlmRequest, LlmStreamCallExecuteParams, llm_call_execute,
+    llm_call_execute_v2, llm_stream_call_execute,
 };
 use nemo_relay::api::runtime::{
-    LlmExecutionNextFn, LlmJsonStream, LlmStreamExecutionNextFn, TASK_SCOPE_STACK,
+    LLM_REPLAY_CONTRACT_VERSION, LlmExecutionNextFn, LlmJsonStream, LlmReplayCall,
+    LlmReplayCapability, LlmReplayFactory, LlmReplayTransport, LlmStreamExecutionNextFn,
+    TASK_SCOPE_STACK,
 };
 use nemo_relay::codec::resolve::{
     ProviderSurface, response_codec as build_response_codec,
@@ -31,6 +36,9 @@ use crate::config::header_string;
 use crate::error::CliError;
 use crate::server::AppState;
 use crate::session::{GatewayCallPrep, LlmGatewayStart, SessionManager};
+
+const MAX_FORWARDED_RESPONSE_HEADERS: usize = 256;
+const MAX_FORWARDED_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 
 /// Proxies supported LLM API requests through NeMo Relay's managed execution pipeline.
 ///
@@ -184,10 +192,210 @@ fn build_llm_gateway_start(request: &PreparedGatewayRequest) -> LlmGatewayStart 
 // channel to recover the bytes the client expects.
 type UpstreamResponseInfo = Arc<Mutex<Option<(StatusCode, HeaderMap)>>>;
 
+struct BufferedUpstreamResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Bytes,
+}
+
+type BufferedUpstreamResponseSlot = Arc<Mutex<Option<BufferedUpstreamResponse>>>;
+
 // Captures the original `reqwest::Error` from an upstream send failure so the gateway can return
 // a 502 Bad Gateway on connection-level failures. The runtime collapses every callback failure to
 // `FlowError::Internal`, which would otherwise map to a generic 400.
 type UpstreamErrorSlot = Arc<Mutex<Option<reqwest::Error>>>;
+
+/// Immutable HTTP policy shared by a non-streaming anchor call and its delayed replays.
+///
+/// The policy deliberately excludes the anchor response slots and session state. The cloned
+/// `reqwest::Client` retains the gateway's TLS, proxy, timeout, and connection configuration,
+/// while endpoint, authentication, and routing headers are resolved once before the managed call
+/// starts.
+#[derive(Clone)]
+struct GatewayTransportPolicy {
+    http: reqwest::Client,
+    method: Method,
+    url: String,
+    original_body: Bytes,
+    frozen_headers: HeaderMap,
+    max_response_bytes: usize,
+}
+
+impl GatewayTransportPolicy {
+    fn from_prepared(state: &AppState, prepared: &PreparedGatewayRequest) -> Self {
+        Self {
+            http: state.http.clone(),
+            method: prepared.method.clone(),
+            url: prepared.upstream_url.clone(),
+            original_body: prepared.body_bytes.clone(),
+            frozen_headers: frozen_replay_headers(&prepared.headers, prepared.provider),
+            max_response_bytes: state.config.max_passthrough_body_bytes,
+        }
+    }
+
+    fn body_for(&self, request: &LlmRequest) -> Result<Bytes, serde_json::Error> {
+        if request.content.is_null() {
+            return Ok(self.original_body.clone());
+        }
+        serde_json::to_vec(&request.content).map(Bytes::from)
+    }
+
+    fn headers_for(&self, request: &LlmRequest) -> HeaderMap {
+        let mut headers = self.frozen_headers.clone();
+        overlay_replay_headers(&mut headers, &request.headers);
+        headers
+    }
+
+    async fn send(
+        &self,
+        body: Bytes,
+        headers: HeaderMap,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut upstream = self.http.request(self.method.clone(), &self.url).body(body);
+        for (name, value) in &headers {
+            upstream = upstream.header(name, value);
+        }
+        upstream.send().await
+    }
+
+    async fn execute_replay(&self, request: LlmRequest) -> Result<Value, FlowError> {
+        let body = self.body_for(&request).map_err(|_| {
+            FlowError::Internal("CLI gateway replay request serialization failed".into())
+        })?;
+        let headers = self.headers_for(&request);
+        let response = self
+            .send(body, headers)
+            .await
+            .map_err(|_| FlowError::Internal("CLI gateway replay request failed".to_string()))?;
+        if !response.status().is_success() {
+            return Err(FlowError::Internal(format!(
+                "CLI gateway replay upstream returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let bytes = read_bounded_replay_response(response, self.max_response_bytes).await?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+            FlowError::Internal("CLI gateway replay response was not valid JSON".to_string())
+        })
+    }
+}
+
+async fn read_bounded_replay_response(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+) -> Result<Bytes, FlowError> {
+    let mut chunks = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| {
+            FlowError::Internal("CLI gateway replay response read failed".to_string())
+        })?;
+        let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
+            FlowError::Internal(
+                "CLI gateway replay response exceeded configured byte limit".to_string(),
+            )
+        })?;
+        if next_len > max_response_bytes {
+            return Err(FlowError::Internal(
+                "CLI gateway replay response exceeded configured byte limit".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+struct GatewayReplayFactory {
+    policy: GatewayTransportPolicy,
+    api_family: LlmApiFamily,
+    transport_identity: &'static str,
+    #[cfg(test)]
+    cancellation_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl GatewayReplayFactory {
+    fn new(policy: GatewayTransportPolicy, route: ProviderRoute, api_family: LlmApiFamily) -> Self {
+        Self {
+            policy,
+            api_family,
+            transport_identity: route
+                .replay_transport_identity()
+                .expect("replay factory requires an eligible provider route"),
+            #[cfg(test)]
+            cancellation_count: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cancellation_count(
+        mut self,
+        cancellation_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        self.cancellation_count = Some(cancellation_count);
+        self
+    }
+}
+
+impl LlmReplayFactory for GatewayReplayFactory {
+    fn build(
+        &self,
+        _context: &LlmExecutionContextSnapshot,
+    ) -> Result<Arc<dyn LlmReplayTransport>, FlowError> {
+        Ok(Arc::new(GatewayReplayTransport {
+            capability: LlmReplayCapability {
+                contract_version: LLM_REPLAY_CONTRACT_VERSION,
+                api_family: self.api_family,
+                transport_identity: self.transport_identity.to_string(),
+            },
+            policy: self.policy.clone(),
+            #[cfg(test)]
+            cancellation_count: self.cancellation_count.clone(),
+        }))
+    }
+}
+
+struct GatewayReplayTransport {
+    capability: LlmReplayCapability,
+    policy: GatewayTransportPolicy,
+    #[cfg(test)]
+    cancellation_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl LlmReplayTransport for GatewayReplayTransport {
+    fn capability(&self) -> &LlmReplayCapability {
+        &self.capability
+    }
+
+    fn start(&self, request: LlmRequest) -> Result<LlmReplayCall, FlowError> {
+        let policy = self.policy.clone();
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            FlowError::Internal("CLI gateway replay requires an active Tokio runtime".into())
+        })?;
+        let task = runtime.spawn(async move { policy.execute_replay(request).await });
+        let abort = task.abort_handle();
+        #[cfg(test)]
+        let cancellation_count = self.cancellation_count.clone();
+        Ok(LlmReplayCall::new(
+            async move {
+                task.await.map_err(|error| {
+                    let reason = if error.is_cancelled() {
+                        "CLI gateway replay task cancelled"
+                    } else {
+                        "CLI gateway replay task failed"
+                    };
+                    FlowError::Internal(reason.to_string())
+                })?
+            },
+            move || {
+                #[cfg(test)]
+                if let Some(cancellation_count) = cancellation_count {
+                    cancellation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                abort.abort();
+            },
+        ))
+    }
+}
 
 // Runs the managed pipeline for a prepared gateway request. Streaming and non-streaming branches
 // share the same prep + codec dispatch but diverge in how the runtime drives the upstream call.
@@ -236,8 +444,14 @@ async fn run_unmanaged_gateway(
     )
     .await?;
     let status = response.status();
-    let headers = response_headers(response.headers());
-    let bytes = response.bytes().await?;
+    let headers =
+        bounded_response_headers(response.headers()).ok_or(CliError::UpstreamResponseTooLarge)?;
+    let bytes = read_bounded_buffered_response(response, state.config.max_passthrough_body_bytes)
+        .await
+        .map_err(|error| match error {
+            BufferedResponseReadError::Transport(error) => CliError::Upstream(error),
+            BufferedResponseReadError::TooLarge => CliError::UpstreamResponseTooLarge,
+        })?;
     build_response(status, headers, Body::from(bytes))
 }
 
@@ -261,24 +475,39 @@ fn codecs_for_route(route: ProviderRoute) -> RouteCodecs {
     }
 }
 
-// Runs a non-streaming gateway request through `llm_call_execute`. The runtime handles start/end
-// events and codec annotation; the gateway only sends the upstream request, parses bytes, and
-// forwards the captured status/headers back to the client.
+// Runs a non-streaming gateway request through managed execution. Generation routes use the V2
+// path with an explicit replay factory; models and count-token routes retain the V1 path. The
+// runtime handles start/end events and codec annotation while the gateway forwards the captured
+// anchor status, headers, and bytes back to the client.
 async fn run_managed_buffered(
     state: AppState,
     prepared: PreparedGatewayRequest,
     prep: GatewayCallPrep,
     codecs: RouteCodecs,
 ) -> Result<Response<Body>, CliError> {
-    let upstream_info: UpstreamResponseInfo = Arc::new(Mutex::new(None));
+    let upstream_response: BufferedUpstreamResponseSlot = Arc::new(Mutex::new(None));
     let upstream_error: UpstreamErrorSlot = Arc::new(Mutex::new(None));
-    let response_bytes: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+    let upstream_response_too_large = Arc::new(AtomicBool::new(false));
+    let api_family = prepared.provider.api_family();
+    let transport_policy =
+        api_family.map(|_| GatewayTransportPolicy::from_prepared(&state, &prepared));
+    let replay_factory =
+        api_family
+            .zip(transport_policy.clone())
+            .map(|(api_family, transport_policy)| {
+                Arc::new(GatewayReplayFactory::new(
+                    transport_policy,
+                    prepared.provider,
+                    api_family,
+                )) as Arc<dyn LlmReplayFactory>
+            });
     let func = build_buffered_func(
         state.clone(),
         &prepared,
-        upstream_info.clone(),
+        transport_policy,
+        upstream_response.clone(),
         upstream_error.clone(),
-        response_bytes.clone(),
+        upstream_response_too_large.clone(),
     );
     let GatewayCallPrep {
         scope_stack,
@@ -293,20 +522,45 @@ async fn run_managed_buffered(
         bypass_managed_pipeline: _,
         prune_empty_session_on_finish: _,
     } = prep;
-    let provider_for_event = provider_name.clone();
-    let params = LlmCallExecuteParams::builder()
-        .name(provider_for_event)
-        .request(request)
-        .func(func)
-        .parent_opt(parent)
-        .attributes(attributes)
-        .metadata(metadata)
-        .model_name_opt(model_name)
-        .response_codec_opt(codecs.response)
-        .build();
-    let result = TASK_SCOPE_STACK
-        .scope(scope_stack, async move { llm_call_execute(params).await })
-        .await;
+    let result = match (api_family, replay_factory) {
+        (Some(api_family), Some(replay_factory)) => {
+            let params = LlmCallExecuteV2Params::builder()
+                .name(provider_name)
+                .request(request)
+                .func(func)
+                .api_family(api_family)
+                .call_role(LlmCallRole::Primary)
+                .sanitized_metadata(BTreeMap::new())
+                .parent_opt(parent)
+                .attributes(attributes)
+                .metadata(metadata)
+                .model_name_opt(model_name)
+                .response_codec_opt(codecs.response)
+                .replay_factory(replay_factory)
+                .build();
+            TASK_SCOPE_STACK
+                .scope(
+                    scope_stack,
+                    async move { llm_call_execute_v2(params).await },
+                )
+                .await
+        }
+        _ => {
+            let params = LlmCallExecuteParams::builder()
+                .name(provider_name)
+                .request(request)
+                .func(func)
+                .parent_opt(parent)
+                .attributes(attributes)
+                .metadata(metadata)
+                .model_name_opt(model_name)
+                .response_codec_opt(codecs.response)
+                .build();
+            TASK_SCOPE_STACK
+                .scope(scope_stack, async move { llm_call_execute(params).await })
+                .await
+        }
+    };
     match result {
         Ok(response_json) => {
             state
@@ -314,20 +568,38 @@ async fn run_managed_buffered(
                 .record_gateway_response_hints(&session_id, owner_subagent_id, response_json)
                 .await;
             state.sessions.finish_gateway_call(&session_id, false).await;
-            let (status, headers) = upstream_info
+            let response = upstream_response
                 .lock()
-                .expect("upstream info lock poisoned")
+                .expect("upstream response lock poisoned")
                 .take()
-                .unwrap_or((StatusCode::OK, HeaderMap::new()));
-            let bytes = response_bytes
-                .lock()
-                .expect("response bytes lock poisoned")
-                .take()
-                .unwrap_or_default();
-            build_response(status, headers, Body::from(bytes))
+                .unwrap_or(BufferedUpstreamResponse {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    bytes: Bytes::new(),
+                });
+            build_response(
+                response.status,
+                response.headers,
+                Body::from(response.bytes),
+            )
         }
         Err(error) => {
             state.sessions.finish_gateway_call(&session_id, false).await;
+            if let Some(response) = upstream_response
+                .lock()
+                .expect("upstream response lock poisoned")
+                .take()
+                .filter(|response| !response.status.is_success())
+            {
+                return build_response(
+                    response.status,
+                    response.headers,
+                    Body::from(response.bytes),
+                );
+            }
+            if upstream_response_too_large.load(Ordering::Acquire) {
+                return Err(CliError::UpstreamResponseTooLarge);
+            }
             Err(translate_runtime_error(error, &upstream_error))
         }
     }
@@ -339,9 +611,10 @@ async fn run_managed_buffered(
 fn build_buffered_func(
     state: AppState,
     prepared: &PreparedGatewayRequest,
-    upstream_info: UpstreamResponseInfo,
+    transport_policy: Option<GatewayTransportPolicy>,
+    upstream_response: BufferedUpstreamResponseSlot,
     upstream_error: UpstreamErrorSlot,
-    response_bytes: Arc<Mutex<Option<Bytes>>>,
+    upstream_response_too_large: Arc<AtomicBool>,
 ) -> LlmExecutionNextFn {
     let http = state.http.clone();
     let method = prepared.method.clone();
@@ -349,27 +622,43 @@ fn build_buffered_func(
     let body_bytes = prepared.body_bytes.clone();
     let headers = prepared.headers.clone();
     let route = prepared.provider;
+    let max_response_bytes = state.config.max_passthrough_body_bytes;
     Arc::new(move |request| {
         let http = http.clone();
         let method = method.clone();
         let url = url.clone();
         let body_bytes = body_bytes.clone();
         let headers = headers.clone();
-        let upstream_info = upstream_info.clone();
+        let transport_policy = transport_policy.clone();
+        let upstream_response = upstream_response.clone();
         let upstream_error = upstream_error.clone();
-        let response_bytes = response_bytes.clone();
+        let upstream_response_too_large = upstream_response_too_large.clone();
         Box::pin(async move {
-            let response = match forward_upstream_request(
-                &http,
-                &method,
-                &url,
-                &body_bytes,
-                &headers,
-                Some(&request),
-                route,
-            )
-            .await
-            {
+            let response_result = match transport_policy {
+                Some(policy) => {
+                    let body = policy.body_for(&request).unwrap_or_else(|error| {
+                        eprintln!(
+                            "nemo-relay CLI gateway: failed to serialize rewritten LLM request body; forwarding original request: {error}"
+                        );
+                        policy.original_body.clone()
+                    });
+                    let headers = policy.headers_for(&request);
+                    policy.send(body, headers).await
+                }
+                None => {
+                    forward_upstream_request(
+                        &http,
+                        &method,
+                        &url,
+                        &body_bytes,
+                        &headers,
+                        Some(&request),
+                        route,
+                    )
+                    .await
+                }
+            };
+            let response = match response_result {
                 Ok(response) => response,
                 Err(error) => {
                     let message = error.to_string();
@@ -378,21 +667,43 @@ fn build_buffered_func(
                 }
             };
             let status = response.status();
-            let response_headers = response_headers(response.headers());
-            let bytes = match response.bytes().await {
+            let Some(response_headers) = bounded_response_headers(response.headers()) else {
+                upstream_response_too_large.store(true, Ordering::Release);
+                return Err(FlowError::Internal(
+                    "CLI gateway upstream response exceeded configured limit".to_string(),
+                ));
+            };
+            let bytes = match read_bounded_buffered_response(response, max_response_bytes).await {
                 Ok(bytes) => bytes,
-                Err(error) => {
+                Err(BufferedResponseReadError::Transport(error)) => {
                     let message = error.to_string();
                     *upstream_error.lock().expect("upstream error lock poisoned") = Some(error);
                     return Err(FlowError::Internal(message));
                 }
+                Err(BufferedResponseReadError::TooLarge) => {
+                    upstream_response_too_large.store(true, Ordering::Release);
+                    return Err(FlowError::Internal(
+                        "CLI gateway upstream response exceeded configured limit".to_string(),
+                    ));
+                }
             };
             let json = serde_json::from_slice::<Value>(&bytes)
                 .unwrap_or_else(|_| json!({ "body_bytes": bytes.len() }));
-            *upstream_info.lock().expect("upstream info lock poisoned") =
-                Some((status, response_headers));
-            *response_bytes.lock().expect("response bytes lock poisoned") = Some(bytes);
-            Ok(json)
+            *upstream_response
+                .lock()
+                .expect("upstream response lock poisoned") = Some(BufferedUpstreamResponse {
+                status,
+                headers: response_headers,
+                bytes,
+            });
+            if status.is_success() {
+                Ok(json)
+            } else {
+                Err(FlowError::Internal(format!(
+                    "CLI gateway upstream returned HTTP {}",
+                    status.as_u16()
+                )))
+            }
         })
     })
 }
@@ -713,6 +1024,80 @@ fn encode_sse_frame(event_json: &Value, route: ProviderRoute) -> String {
     }
 }
 
+// Freezes every transport-owned header before Core starts the anchor call. Candidate requests may
+// later overlay only provider-semantic content negotiation/version headers. Credentials, cookies,
+// endpoint routing, and proxy behavior remain private host policy and never enter the replay
+// capability or LLM request metadata.
+fn frozen_replay_headers(headers: &HeaderMap, route: ProviderRoute) -> HeaderMap {
+    let openai_api_key = nonempty_env_value("OPENAI_API_KEY");
+    let anthropic_api_key = nonempty_env_value("ANTHROPIC_API_KEY");
+    frozen_replay_headers_with_keys(
+        headers,
+        route,
+        openai_api_key.as_deref(),
+        anthropic_api_key.as_deref(),
+    )
+}
+
+fn frozen_replay_headers_with_keys(
+    headers: &HeaderMap,
+    route: ProviderRoute,
+    openai_api_key: Option<&str>,
+    anthropic_api_key: Option<&str>,
+) -> HeaderMap {
+    let sanitized = strip_replaceable_agent_auth_headers_with_openai_key_state(
+        headers,
+        route,
+        openai_api_key.is_some(),
+    );
+    let mut frozen = sanitized
+        .iter()
+        .filter(|(name, _)| should_forward_request_header(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<HeaderMap>();
+    if !has_provider_auth(&frozen) {
+        let replacement = match route {
+            ProviderRoute::OpenAiResponses
+            | ProviderRoute::OpenAiChatCompletions
+            | ProviderRoute::OpenAiModels => {
+                openai_api_key.map(|value| (http::header::AUTHORIZATION, format!("Bearer {value}")))
+            }
+            ProviderRoute::AnthropicMessages | ProviderRoute::AnthropicCountTokens => {
+                anthropic_api_key
+                    .map(|value| (HeaderName::from_static("x-api-key"), value.to_string()))
+            }
+        };
+        if let Some((name, value)) = replacement
+            && let Ok(value) = HeaderValue::from_str(&value)
+        {
+            frozen.insert(name, value);
+        }
+    }
+    frozen
+}
+
+fn overlay_replay_headers(headers: &mut HeaderMap, request_headers: &Map<String, Value>) {
+    for (name, value) in request_headers {
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if !should_override_frozen_transport_header(&name) {
+            continue;
+        }
+        let Some(value) = json_header_value(value) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
+}
+
+fn should_override_frozen_transport_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "accept" | "content-type" | "openai-beta" | "anthropic-beta" | "anthropic-version"
+    )
+}
+
 // Forwards the buffered request to the upstream provider with only the safe request headers. This
 // is shared by the buffered and streaming managed funcs so header filtering stays consistent.
 // Agent-native credential quirks are normalized by alignment before provider auth injection runs.
@@ -803,11 +1188,7 @@ fn inject_provider_auth_with_env<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let already_authed = inbound.contains_key(http::header::AUTHORIZATION)
-        || inbound.contains_key("x-api-key")
-        || inbound.contains_key("api-key")
-        || inbound.contains_key("anthropic-api-key");
-    if already_authed {
+    if has_provider_auth(inbound) {
         return builder;
     }
     let (env_var, header_name) = match route {
@@ -834,6 +1215,13 @@ where
         ProviderRoute::AnthropicMessages | ProviderRoute::AnthropicCountTokens => value,
     };
     builder.header(header_name, header_value)
+}
+
+fn has_provider_auth(headers: &HeaderMap) -> bool {
+    headers.contains_key(http::header::AUTHORIZATION)
+        || headers.contains_key("x-api-key")
+        || headers.contains_key("api-key")
+        || headers.contains_key("anthropic-api-key")
 }
 
 // Plain byte passthrough used for streaming routes that lack a typed codec. The managed pipeline
@@ -964,6 +1352,30 @@ impl ProviderRoute {
         self.alignment_route().name()
     }
 
+    /// Returns the explicit V2 family for replay-eligible generation routes.
+    ///
+    /// Models and token-count endpoints are intentionally not treated as LLM generation calls,
+    /// and streaming eligibility is decided by the caller before this mapping is used.
+    const fn api_family(self) -> Option<LlmApiFamily> {
+        match self {
+            Self::OpenAiResponses => Some(LlmApiFamily::OpenAIResponses),
+            Self::OpenAiChatCompletions => Some(LlmApiFamily::OpenAIChatCompletions),
+            Self::AnthropicMessages => Some(LlmApiFamily::AnthropicMessages),
+            Self::OpenAiModels | Self::AnthropicCountTokens => None,
+        }
+    }
+
+    /// Stable non-secret replay partition identity. Endpoint and authentication remain private
+    /// transport state and are never encoded in this value.
+    const fn replay_transport_identity(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiResponses => Some("nemo-relay-cli:openai-responses:v1"),
+            Self::OpenAiChatCompletions => Some("nemo-relay-cli:openai-chat-completions:v1"),
+            Self::AnthropicMessages => Some("nemo-relay-cli:anthropic-messages:v1"),
+            Self::OpenAiModels | Self::AnthropicCountTokens => None,
+        }
+    }
+
     // Builds the upstream URL by combining the configured provider base with the original path and
     // query string. Trailing slashes are stripped from the base to avoid double-slash variants in
     // configured enterprise or local proxy endpoints.
@@ -1067,10 +1479,14 @@ fn strip_replaceable_agent_auth_headers_with_openai_key_state(
 }
 
 fn env_var_is_nonempty(name: &str) -> bool {
+    nonempty_env_value(name).is_some()
+}
+
+fn nonempty_env_value(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 // Delegates provider-specific session fallbacks to `alignment` so request construction stays
@@ -1106,6 +1522,51 @@ fn observable_headers(headers: &HeaderMap) -> Map<String, Value> {
         }
     }
     output
+}
+
+enum BufferedResponseReadError {
+    Transport(reqwest::Error),
+    TooLarge,
+}
+
+async fn read_bounded_buffered_response(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+) -> Result<Bytes, BufferedResponseReadError> {
+    let mut chunks = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(BufferedResponseReadError::Transport)?;
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(BufferedResponseReadError::TooLarge)?;
+        if next_len > max_response_bytes {
+            return Err(BufferedResponseReadError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn bounded_response_headers(headers: &HeaderMap) -> Option<HeaderMap> {
+    let mut output = HeaderMap::new();
+    let mut count = 0_usize;
+    let mut bytes = 0_usize;
+    for (name, value) in headers {
+        if is_hop_by_hop(name) || name == http::header::CONTENT_LENGTH {
+            continue;
+        }
+        count = count.checked_add(1)?;
+        bytes = bytes
+            .checked_add(name.as_str().len())?
+            .checked_add(value.as_bytes().len())?;
+        if count > MAX_FORWARDED_RESPONSE_HEADERS || bytes > MAX_FORWARDED_RESPONSE_HEADER_BYTES {
+            return None;
+        }
+        output.append(name.clone(), value.clone());
+    }
+    Some(output)
 }
 
 // Copies upstream response headers except hop-by-hop transport headers that Axum/hyper must manage
@@ -1151,20 +1612,45 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         && name != http::header::ACCEPT_ENCODING
 }
 
-// Allows headers into observability metadata only after removing credentials and provider API keys.
-// The forwarding filter runs first so hop-by-hop transport headers are also excluded from recorded
-// LLM request attributes. The credential blocklist covers the four canonical cases we see in
-// practice: `Authorization` (most providers), `Cookie` (session credentials), `x-api-key` (OpenAI
-// SDK and similar), `anthropic-api-key` (Anthropic), and the generic `api-key` alias used by some
-// providers/proxies (e.g., Azure OpenAI). `HeaderName::as_str()` already returns the canonical
-// lowercase form so string comparisons are case-insensitive by construction.
+// Allows headers into observability metadata only after removing credentials and private routing
+// policy. The forwarding filter runs first so hop-by-hop transport headers are also excluded from
+// recorded LLM request attributes. `HeaderName::as_str()` already returns the canonical lowercase
+// form, so these comparisons are case-insensitive by construction.
 fn should_record_header(name: &HeaderName) -> bool {
     should_forward_request_header(name)
-        && name != http::header::AUTHORIZATION
-        && name != http::header::COOKIE
-        && name.as_str() != "x-api-key"
-        && name.as_str() != "api-key"
-        && name.as_str() != "anthropic-api-key"
+        && !is_credential_header(name)
+        && !is_private_routing_header(name)
+}
+
+fn is_credential_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    name == http::header::AUTHORIZATION.as_str()
+        || name == http::header::PROXY_AUTHORIZATION.as_str()
+        || name == http::header::COOKIE.as_str()
+        || name == "api-key"
+        || name == "x-api-key"
+        || name == "anthropic-api-key"
+        || name.ends_with("-api-key")
+        || name.ends_with("-token")
+        || name.ends_with("-secret")
+        || name.ends_with("-password")
+        || name.ends_with("-credential")
+        || name.ends_with("-private-key")
+        || name.ends_with("-client-cert")
+        || name.ends_with("-client-certificate")
+}
+
+fn is_private_routing_header(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    matches!(
+        name,
+        "forwarded"
+            | "x-real-ip"
+            | "x-rewrite-url"
+            | "x-http-method-override"
+            | "x-method-override"
+    ) || name.starts_with("x-forwarded-")
+        || name.starts_with("x-original-")
 }
 
 // Identifies headers that describe a single transport hop and therefore must not be proxied across

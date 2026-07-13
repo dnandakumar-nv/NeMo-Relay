@@ -55,6 +55,17 @@ assert_no_temporary_files() {
     return 0
 }
 
+probe_router_if_supported() {
+    probe_binary=$1
+    if "$probe_binary" router-package-probe --help >/dev/null 2>&1; then
+        python_command=python3
+        command -v "$python_command" >/dev/null 2>&1 || python_command=python
+        "$python_command" "${repo_root}/scripts/test-support/router_cli_package_smoke.py" "$probe_binary" \
+            || fail "installed Router package probe failed"
+    fi
+    return 0
+}
+
 test_interface_validation() {
     tests_run=$((tests_run + 1))
 
@@ -89,6 +100,7 @@ test_live_latest_and_pinned_replacement() {
     latest_version=$("${live_install_dir}/nemo-relay" --version)
     assert_contains "$latest_version" "nemo-relay "
     assert_no_temporary_files "$live_install_dir"
+    probe_router_if_supported "${live_install_dir}/nemo-relay"
 
     run_command env NEMO_RELAY_VERSION=0.3.0 sh "$installer" --install-dir "$live_install_dir"
     assert_success

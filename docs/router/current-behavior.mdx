@@ -1,0 +1,312 @@
+---
+title: "Current Runtime Behavior"
+description: "Understand Router selection, Shadow scheduling, Recommend decisions, Active canaries, and lifecycle behavior."
+position: 3
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+Router installs one V2 LLM execution intercept at priority `0`. It inspects
+only the frozen context and request supplied for that managed call.
+
+The CLI, Python, and Node.js packages link and register Router automatically.
+A custom Rust host must link `nemo-relay-router` and call
+`register_router_component()` before plugin validation or initialization.
+
+## Runtime Modes
+
+In `off` mode, Router invokes the next handler with the original request
+without matching pools, decoding provider data, building projections, sampling,
+or inspecting replay.
+
+In `shadow` mode, Router registers every admitted Primary V2 call by physical
+call UUID before eligibility checks. It can then match, decode, sanitize,
+preflight, and sample the request. The pre-dispatch work is synchronous and
+does not call `replay.start`. Router invokes the next handler exactly once with
+the original request and returns the anchor value or error unchanged. A sampled
+successful anchor can leave a bounded future-local observation window after
+that return. After the window closes durably, background workers can run one
+independent counterfactual call for each admitted candidate and a separate
+pairwise Judge call for each deterministically valid candidate response.
+
+Any inspection rejection, runtime error, or caught panic is reduced to a
+stable non-secret health reason. It does not block or rewrite the anchor call.
+Sampling uses operating-system randomness. Sampled and unsampled outcomes
+preserve the same anchor path. Background Shadow or Judge failure changes only
+durable evidence and health state after the anchor has returned.
+
+In `recommend` mode, Router matches and preflights the current Primary call. A
+valid recommendation path prepares one canonical query, performs bounded
+exact-partition searches, and constructs one immutable decision audit. Router
+can inspect replay capability facts for partition identity, but it drops
+executable replay authority before query construction. Recommend schedules no
+future-local window, candidate call, or Judge call. When the intercept
+completes, it invokes the next handler exactly once with the original request
+and returns the exact anchor value or error after recommendation preprocessing
+finishes or falls back.
+
+In `active` mode, Router first reruns the complete Recommend confidence path
+against current exact-partition evidence. Fresh experiment, outcome-look,
+control-generation, canary-cap, tranche, and query-neighborhood authority must
+also pass. It then opens a bounded outcome window and atomically records the
+decision, protected root, randomized arm, propensity, and optional candidate
+dispatch. Treatment changes only the request model and invokes the current
+managed continuation once. Control and holdout invoke it once with the original
+request. Router never retries a failed treatment against the anchor.
+
+> [!IMPORTANT]
+> `shadow` and `recommend` always serve the anchor response. Recommend records
+> a routing decision but performs zero replay execution and zero model rewrite.
+> Active treatment can serve one authorized model-only candidate rewrite;
+> Active control and holdout serve the anchor. Judge labels remain
+> counterfactual proxy evidence and never replace observed production outcomes.
+
+## Pool Selection
+
+In `shadow` mode, Router first registers every admitted Primary V2 call,
+including streaming and stateful calls. Streaming and stateful calls are
+ineligible to open an anchor window, but their registered completion can still
+advance an already accepted same-owner window. Anchor selection first matches
+the exact V2 `api_family` and top-level anchor model, then evaluates all
+configured selector predicates:
+
+Recommend and Active use the same exact family, anchor-model, and selector
+match for the current call. Recommend does not register Primary progress or
+create a Shadow sample intent. Active registers its protected root and outcome
+window only after all foreground gates pass.
+
+| Selector | Match Rule |
+|---|---|
+| `tenant_ids` | Omitted is a wildcard; otherwise the call must have an exact member. |
+| `agent_ids` | Omitted is a wildcard; otherwise the call must have an exact member. |
+| `owner_scope_types` | Omitted is a wildcard; otherwise the first owner-path scope type must be an exact member. |
+| `metadata_equals` | Every key must exist in sanitized metadata and equal the configured null, Boolean, number, or string. Objects and arrays are invalid. |
+| `scope_path_patterns` | Omitted is a wildcard; otherwise at least one pattern must match. |
+
+Scope paths use the frozen owner-to-parent sequence of stable `ScopeType` wire
+names. A literal matches exactly, `*` matches one segment, and terminal `**`
+matches zero or more segments. Patterns do not read scope UUIDs or display
+names. Selection also does not read request headers or mutable global identity.
+
+Configuration rejects any two pools whose family, anchor model set, and
+selector languages can overlap. Pool array order has no routing meaning. If a
+double match nevertheless occurs at runtime, Router selects no pool and records
+`router.runtime.ambiguous_pool`.
+
+## Call Preflight
+
+After a pool matches, the call must provide:
+
+- The current replay contract version.
+- A replay family identical to the frozen V2 API family and pool family.
+- A nonempty, bounded, printable transport identity that does not look like a
+  credential or credential-bearing URL.
+- A decodable provider request with a nonempty model.
+
+Router supports the Core codecs for OpenAI Chat Completions, OpenAI Responses,
+and Anthropic Messages. It proves that decoding and re-encoding the untouched
+request reproduces the original request exactly and preserves normalized
+semantics. Responses calls using `previous_response_id` or `store = true` are
+ineligible. System and Developer instructions must contain text rather than
+content parts. Anthropic top-level `system` accepts a string or exactly one
+valid text block; multi-block, non-text, empty, and malformed forms are
+ineligible. Generic or unknown native structured-output representations,
+unparsed Responses input items, and provider extras that carry unsupported
+capabilities are rejected conservatively.
+
+Structured-output mappings follow the Core codec contract:
+
+| API Family | Normalized Mapping |
+|---|---|
+| OpenAI Chat Completions | `response_format` |
+| OpenAI Responses | `text.format`; leading `instructions` becomes the first System message |
+| Anthropic Messages | `output_config.format`; only `json_schema` is supported and Developer messages are unsupported |
+
+Provider-native wrapper and format extras remain in the memory-only lossless
+envelope. Unknown nonformat provider fields also survive codec round trips, but
+none are copied into the serializable Router projection.
+
+## Candidate Preflight
+
+Candidates are evaluated independently. A candidate must declare every
+capability inferred from normalized semantics: tools, multimodal input,
+structured output, and reasoning controls. A failure excludes that candidate,
+not its siblings.
+
+When a candidate sets `max_context_tokens`, preflight also requires an explicit
+output-token bound. Router conservatively adds the canonical serialized input
+byte length to that bound and rejects an unprovable or excessive total.
+
+Eligible candidates sort by `(cost_rank, candidate_id)`. Shadow request clones
+are truncated to `max_candidates_per_sample`, while Recommend and Active retain
+the complete safe candidate fact set for exact membership, search, and
+correction.
+
+Candidate request construction is model-only. Router clones the normalized
+request, changes `model`, and asks the Core family codec to merge it over the
+original provider request. It accepts the candidate request only after proving
+that:
+
+- Host-owned headers are byte-for-byte unchanged.
+- The raw body differs only at the top-level `model` field.
+- Decoding the result reproduces the intended normalized request.
+- Ordered instructions and structured-output semantics are unchanged.
+
+Router does not implement this as an unvalidated raw JSON patch.
+
+## Sanitized Projections
+
+The full original request exists only in a memory-only envelope while replay
+is live. Its `Debug` output is redacted. Router's serializable request
+projection is a separate versioned allowlist containing normalized messages,
+generation controls, sanitized tools, structured-output semantics, ordered
+instruction facts, required capabilities, and fingerprints.
+
+The projection omits:
+
+- All request headers.
+- Raw user identity and arbitrary provider metadata.
+- Provider extras and continuation or state fields.
+- Native structured-output wrapper and format extras.
+- Scope UUIDs, scope names, and other unregistered position data.
+
+Tool schemas, tool-call argument JSON, JSON tool results, reasoning values, and
+truncation values recursively remove credential-shaped keys. Tool schema
+properties are also removed when marked `writeOnly`, `x-secret`, or
+`x-sensitive`, or when their format is `password`, `secret`, or `credential`;
+matching entries are removed from `required`. Image URLs must use HTTP or HTTPS
+and have userinfo, query, and fragment data stripped. Image detail may be
+omitted or set to `auto`, `low`, or `high`; other values are rejected.
+
+Projection limits fail closed instead of truncating input. Request semantics
+and response schemas are fingerprinted with RFC 8785 canonical JSON and
+SHA-256. Tenant and agent policy partitions are versioned hashes only when the
+pool selects on those identities. Wildcard selectors use a shared sentinel, so
+raw tenant or agent identity is not copied into the routing projection.
+Position features are explicit scalar allowlist entries. Version 1 registers
+only `turn_index`; when configured, it must be supplied as a nonnegative `u64`
+JSON integer in sanitized metadata and is retained as an exact decimal string.
+
+## Durable Scheduling
+
+One serialized coordinator owns per-pool pending capacity, Primary-call and
+ancestry indexes, future-local windows, and terminal state. A nonblocking
+global subscriber projects events into a bounded command channel. The SQLite
+sink reserves scheduler capacity and commits a safe pending anchor before the
+coordinator accepts it. A terminal write commits the trajectory and closure
+before a closed window can cross into the scheduler.
+
+The scheduler owns one pool batch permit and one candidate-slot permit per
+reserved candidate. It runs candidates independently up to
+`concurrency.shadow`. A candidate releases its Shadow permit before waiting for
+the independently bounded `concurrency.judge` permit. One candidate's replay,
+decode, validation, or Judge failure does not cancel its siblings.
+
+Every actual candidate or Judge transport start is enclosed by one managed V2
+call under an Evaluator scope. The call has role `Shadow` or `Judge`, includes
+the anchor UUID in sanitized metadata, and is excluded from Router sampling and
+Primary progress. Default ATIF export and Adaptive learning also exclude these
+internal calls. Middleware can prevent a transport start; Router records that
+as an operational terminal rather than bypassing middleware or starting twice.
+
+The sole bounded writer owns every SQLite mutation. Accepted commands wait for
+writer capacity and retain their frozen idempotency material. Pre-accept
+saturation refuses only the new sample. Database or writer failure suppresses
+new sampling and degrades Router health without changing active Primary calls.
+
+When the selected pool has a version-1 `learning` association, Router records a
+vectorization outcome for each terminal attempt. Canonicalizable attempts also
+create canonical query, embedding-job, evidence-link, and vector
+materialization facts. A noncanonicalizable attempt retains its stable outcome
+and reason without provider or index work. Provider I/O runs outside SQLite
+transactions. Shared background workers execute bounded, leased embedding work
+and maintain the derived sqlite-vec index without changing the anchor response
+or evidence label. Refer to [Embeddings and Vector
+Store](/router/embeddings-and-vector-store) for the exact query, partition,
+cache, egress, and recovery contract.
+
+Recommend requires a complete version-1 learning policy. It reserves bounded
+audit ownership before preflight, obtains a cache-first live embedding, and
+searches each capability-eligible candidate's exact partition in cheapest-first
+order. It applies radius, root, coverage, decay, effective-sample, and
+candidate-corrected Beta lower-bound gates. A missing partition is local to one
+candidate; vector, version, time, or numeric uncertainty stops the decision.
+When preprocessing reaches a valid bounded decision, Router submits its
+replay-verifiable graph before it invokes the unchanged anchor continuation.
+Earlier rejection or failure records only bounded health. Refer to [Router
+Recommendation Confidence](/router/recommendation-confidence) for the exact
+calculation, reasons, retry, retention, and privacy contract.
+
+Active reserves one of four process-wide foreground permits before its fresh
+decision. Immediately before randomized admission, it flushes subscriber
+delivery and opens an outcome window through the coordinator. One writer
+transaction records every admission fact. Only an applied or exactly replayed
+admission can hand a treatment request to the continuation. Provider errors
+are returned unchanged with no anchor retry; a malformed successful response is
+also returned unchanged while Router records a policy failure and invalidates
+that query-local neighborhood. Saturation or stale authority serves the anchor
+without creating an Active graph. Refer to [Active Canary and
+Outcomes](/router/active-canary-and-outcomes) for arm assignment, protected
+signals, posterior looks, invalidation, and controls.
+
+Refer to [Shadow Evaluation and Evidence](/router/shadow-evaluation-and-evidence)
+for candidate validation, Judge scoring, ambiguity, repair, and cool-off.
+
+## Runtime Resources and Teardown
+
+The plugin registers lifecycle ownership first, the subscriber second, and the
+V2 intercept last. Core removes the intercept and subscriber before draining
+the owned runtime.
+
+Graceful teardown uses one absolute Core deadline and follows this order:
+
+1. Close recommendation and Active foreground delivery first, then close new
+   Primary, live-embedding, scheduler, background-claim, and provider
+   admission. Core also flushes queued subscriber callbacks.
+2. Wait for all four Active foreground permits, flush subscriber delivery a
+   second time, and ask the ordered coordinator to close unresolved Active
+   roots. Join the coordinator and then the bounded outcome actor.
+3. Close scheduler admission, terminalize queued work, and await started
+   evaluator calls and their durable terminal writes.
+4. Drain admitted recommendation computation and exact pending audit delivery,
+   then finish or cancel currently owned live embedding, embedding,
+   materialization, and rebuild work within the same deadline. Router does not
+   wait for the complete durable backlog or unrelated retry delays.
+5. Stop and join retention, then stop and join the heartbeat worker.
+6. Append one retry-stable process-stop event as the final domain write, flush
+   the writer FIFO, close readers, and drain the writer.
+
+Use `clear_plugin_configuration_async(timeout)` for this deadline-bound path.
+Component replacement completes the old drain and durable process stop before
+starting the successor. A timeout or drain failure aborts the old runtime and
+does not open a successor.
+
+Synchronous abort is nonblocking. It atomically closes intake, replay starts,
+provider starts, retention triggers, and writer admission. Writer acceptance is
+fenced before Router clears pending recommendation delivery. Router then
+cancels registered work, aborts HTTP, tasks and readers, and interrupts SQLite.
+It does not join tasks or append a process-stop event. A transaction or
+provider start that linearized first can finish atomically; startup
+reconciliation terminalizes or reclaims remaining dead-process facts. Drop
+uses the same defensive abort authority.
+
+Refer to [Ledger Migrations and Recovery](/router/ledger-migrations-and-recovery)
+for durable lifecycle and restart behavior.
+
+## Surface Boundary
+
+The current runtime records vectorization facts, executes embedding jobs,
+maintains a derived vector index, records recommendations, and can run bounded
+Active canaries with protected production outcomes. Rust exposes typed
+inspection and operator APIs. The CLI exposes reads, exports, and operator
+commands, and Rust hosts can enable the authenticated HTTP adapter. Python and
+Node.js expose typed configuration helpers but no inspection or operator
+methods. The local dashboard is not part of this release.
+
+The CLI gateway has a validated V2 replay bridge for buffered Responses, Chat
+Completions, and Anthropic Messages calls. Its transport freezes host-owned
+endpoint and authentication policy and can outlive the anchor call. The bundled
+CLI registers Router before validation and can activate it through the normal
+plugin configuration. Streaming, model-list, and token-count routes remain
+ineligible. CLI, wheel, and npm release artifacts verify the pinned sqlite-vec
+extension with a temporary `vec0` insert/query probe.

@@ -173,6 +173,17 @@ jobs:
           fi
           just "${args[@]}" test-rust
 
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        if: ${{ matrix.platform == 'linux-amd64' }}
+        with:
+          node-version: ${{ steps.ci-config.outputs.node_version }}
+          cache: npm
+
+      - name: Run Router dashboard browser tests
+        if: ${{ matrix.platform == 'linux-amd64' }}
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: just --set ci true test-dashboard
+
       - name: Upload Rust coverage to Codecov
         if: ${{ matrix.platform != 'windows-arm64' }}
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
@@ -234,6 +245,13 @@ jobs:
           cache-bin: false
           save-if: false
 
+      - name: Set up Windows ARM Python for CLI package probe
+        if: ${{ matrix.platform == 'windows-arm64' }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: ${{ steps.ci-config.outputs.default_python_version }}
+          architecture: arm64
+
       - name: Install musl tools
         if: ${{ startsWith(matrix.target, 'x86_64-unknown-linux-musl') || startsWith(matrix.target, 'aarch64-unknown-linux-musl') }}
         run: |
@@ -270,6 +288,20 @@ jobs:
           rm -rf "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli"
           mkdir -p "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli"
           cp "$source" "${NEMO_RELAY_CI_WORKSPACE_TMP}/cli/${asset}"
+
+      - name: Probe installed CLI Router activation and native vector support
+        working-directory: ${{ env.NEMO_RELAY_CI_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          python_command=python3
+          if ! command -v "$python_command" >/dev/null 2>&1; then
+            python_command=python
+          fi
+          cli_assets=("${NEMO_RELAY_CI_WORKSPACE_TMP}"/cli/*)
+          "$python_command" scripts/test-support/router_cli_package_smoke.py "${cli_assets[0]}"
+          if [[ "${{ matrix.platform }}" == linux-* ]]; then
+            NEMO_RELAY_ROUTER_TEST_BINARY="${cli_assets[0]}" sh scripts/test-install-mocks.sh
+          fi
 
       - name: Upload CLI binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

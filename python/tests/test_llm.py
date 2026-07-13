@@ -3,7 +3,9 @@
 
 """Tests for NeMo Relay LLM lifecycle, guardrails, intercepts, and streaming."""
 
-from typing import NoReturn, cast
+import inspect
+from types import MappingProxyType
+from typing import Awaitable, Callable, NoReturn, cast
 
 import pytest
 
@@ -20,6 +22,12 @@ from nemo_relay import (
     llm,
     scope,
     subscribers,
+)
+
+V2_API_FAMILIES: tuple[llm.LlmApiFamily, ...] = (
+    "openai_chat_completions",
+    "openai_responses",
+    "anthropic_messages",
 )
 
 
@@ -111,6 +119,191 @@ class TestLLMAsync:
         request = make_request()
         result = await llm.execute("async_method_llm", request, func)
         assert result["messages"] == []
+
+    @pytest.mark.parametrize("api_family", V2_API_FAMILIES)
+    async def test_execute_v2_captures_explicit_context_and_builds_factory_once(self, api_family: llm.LlmApiFamily):
+        contexts: list[llm.LlmExecutionContext] = []
+
+        async def replay(request):
+            return {"replayed_model": request.content["model"]}
+
+        def replay_factory(context: llm.LlmExecutionContext):
+            contexts.append(context)
+            return {
+                "contract_version": 1,
+                "api_family": api_family,
+                "transport_identity": "python-test-transport",
+                "replay": replay,
+            }
+
+        result = await llm.execute_v2(
+            "v2_llm",
+            make_request(),
+            lambda request: {"model": request.content["model"]},
+            api_family=api_family,
+            call_role="primary",
+            sanitized_metadata={
+                "region": "us-west",
+                "nested": {"items": [{"value": 1}]},
+            },
+            tenant_id="tenant-a",
+            agent_id="agent-a",
+            replay_factory=replay_factory,
+        )
+
+        assert result == {"model": "test-model"}
+        assert len(contexts) == 1
+        context = contexts[0]
+        assert isinstance(context, MappingProxyType)
+        assert context["api_family"] == api_family
+        assert context["call_role"] == "primary"
+        assert context["tenant_id"] == "tenant-a"
+        assert context["agent_id"] == "agent-a"
+
+        metadata = cast(dict[str, object], context["sanitized_metadata"])
+        assert isinstance(metadata, MappingProxyType)
+        assert metadata["region"] == "us-west"
+        nested = cast(dict[str, object], metadata["nested"])
+        items = cast(tuple[object, ...], nested["items"])
+        item = cast(dict[str, object], items[0])
+        assert isinstance(nested, MappingProxyType)
+        assert isinstance(items, tuple)
+        assert isinstance(item, MappingProxyType)
+        with pytest.raises(TypeError):
+            cast(dict[str, object], context)["tenant_id"] = "changed"
+        with pytest.raises(TypeError):
+            item["value"] = 2
+        with pytest.raises(AttributeError):
+            cast(list[object], items).append({"value": 2})
+
+        path = cast(tuple[object, ...], context["trajectory_owner_path"])
+        assert path
+        assert isinstance(path, tuple)
+        assert isinstance(path[0], MappingProxyType)
+
+    @pytest.mark.parametrize("api_family", V2_API_FAMILIES)
+    @pytest.mark.parametrize("failure", ["factory_error", "unsupported_contract", "family_mismatch"])
+    async def test_execute_v2_factory_errors_fail_open(self, api_family: llm.LlmApiFamily, failure: str):
+        async def replay(request):
+            return request.content
+
+        def replay_factory(context):
+            if failure == "factory_error":
+                raise_runtime_error("factory secret")
+            mismatched_families: dict[llm.LlmApiFamily, llm.LlmApiFamily] = {
+                "openai_chat_completions": "openai_responses",
+                "openai_responses": "anthropic_messages",
+                "anthropic_messages": "openai_chat_completions",
+            }
+            return {
+                "contract_version": 99 if failure == "unsupported_contract" else 1,
+                "api_family": (mismatched_families[api_family] if failure == "family_mismatch" else api_family),
+                "transport_identity": "python-test-transport",
+                "replay": replay,
+            }
+
+        result = await llm.execute_v2(
+            "v2_fail_open",
+            make_request(),
+            lambda request: {"anchor": request.content["model"]},
+            api_family=api_family,
+            call_role="primary",
+            sanitized_metadata={},
+            replay_factory=cast(llm.LlmReplayFactory, replay_factory),
+        )
+        assert result == {"anchor": "test-model"}
+
+    async def test_execute_v2_rejects_async_factory_without_failing_anchor(self):
+        async def replay_factory(context):
+            return context
+
+        result = await llm.execute_v2(
+            "v2_async_factory",
+            make_request(),
+            lambda request: {"anchor": True},
+            api_family="openai_responses",
+            call_role="primary",
+            sanitized_metadata={},
+            replay_factory=cast(llm.LlmReplayFactory, replay_factory),
+        )
+        assert result == {"anchor": True}
+
+    def test_execute_v2_rejects_unknown_family_role_and_metadata_shape(self):
+        def provider(request):
+            return {"unexpected": True}
+
+        with pytest.raises(ValueError, match="unsupported api_family"):
+            llm.execute_v2(
+                "bad_family",
+                make_request(),
+                provider,
+                api_family=cast(llm.LlmApiFamily, "unknown"),
+                call_role="primary",
+                sanitized_metadata={},
+            )
+        with pytest.raises(ValueError, match="unsupported call_role"):
+            llm.execute_v2(
+                "bad_role",
+                make_request(),
+                provider,
+                api_family="openai_responses",
+                call_role=cast(llm.LlmCallRole, "unknown"),
+                sanitized_metadata={},
+            )
+        with pytest.raises(TypeError, match="sanitized_metadata must be a mapping"):
+            llm.execute_v2(
+                "bad_metadata",
+                make_request(),
+                provider,
+                api_family="openai_responses",
+                call_role="primary",
+                sanitized_metadata=cast(dict[str, str], []),
+            )
+
+    @pytest.mark.parametrize(
+        ("identity", "value"),
+        [("tenant_id", ""), ("agent_id", "secret=not-routing-data")],
+    )
+    async def test_execute_v2_rejects_invalid_identity_before_provider(self, identity, value):
+        provider_called = False
+
+        def provider(request):
+            nonlocal provider_called
+            provider_called = True
+            return {"unexpected": True}
+
+        execute_v2 = cast(Callable[..., Awaitable[object]], llm.execute_v2)
+        with pytest.raises(RuntimeError, match=identity):
+            await execute_v2(
+                "bad_identity",
+                make_request(),
+                provider,
+                api_family="openai_responses",
+                call_role="primary",
+                sanitized_metadata={},
+                **{identity: value},
+            )
+        assert not provider_called
+
+    @pytest.mark.parametrize("required", ["api_family", "call_role", "sanitized_metadata"])
+    def test_execute_v2_requires_explicit_routing_fields(self, required):
+        execute_v2 = cast(Callable[..., object], llm.execute_v2)
+        kwargs = {
+            "api_family": "openai_responses",
+            "call_role": "primary",
+            "sanitized_metadata": {},
+        }
+        del kwargs[required]
+
+        with pytest.raises(TypeError, match=required):
+            execute_v2("missing_context", make_request(), lambda request: {}, **kwargs)
+
+    def test_execute_v1_signature_remains_unchanged(self):
+        assert str(inspect.signature(llm.execute)) == (
+            "(name: 'str', request: 'LLMRequest', func, *, handle=None, "
+            "attributes=None, data=None, metadata=None, model_name: 'str | None' = None, "
+            "codec: 'LlmCodec | None' = None, response_codec: 'LlmResponseCodec | None' = None)"
+        )
 
 
 class TestLLMGuardrails:

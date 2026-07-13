@@ -35,6 +35,13 @@ tool or LLM integration.
 - Built-in provider codecs include `OpenAIChatCodec`, `OpenAIResponsesCodec`,
   and `AnthropicMessagesCodec` in Python, Node.js, and Rust. Choose the
   codec that matches the actual provider payload shape.
+- Normalized requests preserve `developer` as a distinct message role and use
+  typed `json_object` or `json_schema` response formats. Chat maps
+  `response_format`, Responses maps `text.format`, and Anthropic maps
+  `output_config.format` with `json_schema` support only.
+- Unknown native wrapper and descriptor fields remain in `native_wrapper` and
+  `native_format`. Unknown format kinds stay generic and lossless. Do not
+  relabel unsupported Anthropic Developer messages or guess malformed formats.
 - Response codecs annotate LLM end events with fields such as `id`, `model`,
   `message`, `tool_calls`, `finish_reason`, `usage`, provider-specific data, and
   extra unmodeled fields. They do not rewrite the caller-visible response.

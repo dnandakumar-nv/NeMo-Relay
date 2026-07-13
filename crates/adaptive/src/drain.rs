@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::learner::traits::Learner;
 use crate::storage::traits::StorageBackendDyn;
-use crate::subscriber::{event_to_call_record, is_run_boundary};
+use crate::subscriber::{event_to_call_record, is_non_primary_llm_event, is_run_boundary};
 use crate::types::cache::HotCache;
 use crate::types::records::{CallRecord, RunRecord};
 
@@ -40,6 +40,9 @@ impl RunAccumulator {
     }
 
     pub(crate) fn process_event(&mut self, event: &Event) -> Option<RunRecord> {
+        if is_non_primary_llm_event(event) {
+            return None;
+        }
         if let Some(boundary_result) = self.process_run_boundary(event) {
             return boundary_result;
         }

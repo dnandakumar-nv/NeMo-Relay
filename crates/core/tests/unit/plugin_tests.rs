@@ -4,16 +4,28 @@
 //! Unit tests for plugin in the NeMo Relay core crate.
 
 use super::*;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Barrier, Mutex, OnceLock};
+use std::time::Duration;
 
 use serde_json::json;
 
-use crate::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
-use crate::api::llm::{llm_conditional_execution, llm_request_intercepts};
-use crate::api::runtime::NemoRelayContextState;
-use crate::api::runtime::global_context;
+use crate::api::llm::{
+    LlmApiFamily, LlmCallExecuteV2Params, LlmCallRole, LlmRequest, LlmRequestInterceptOutcome,
+    llm_call_execute_v2, llm_conditional_execution, llm_request_intercepts,
+};
+use crate::api::runtime::{
+    LLM_REPLAY_CONTRACT_VERSION, LlmReplayCall, LlmReplayCapability, LlmReplayTransport,
+    NemoRelayContextState, ScopeStackHandle, TASK_SCOPE_STACK, create_scope_stack, global_context,
+    set_thread_scope_stack, with_scope_stack,
+};
+use crate::api::scope::{
+    EmitMarkEventParams, PushScopeParams, ScopeHandle, ScopeType, event as emit_scope_event,
+    push_scope,
+};
 use crate::api::tool::tool_conditional_execution;
 use crate::error::FlowError;
 
@@ -26,12 +38,402 @@ struct RestoreFailPlugin;
 struct RestoreBreakPlugin;
 struct PartialFailPlugin;
 struct VanishingPlugin;
+struct ActivationCancelPlugin;
+struct ActivationCommitRacePlugin {
+    barrier: Arc<Barrier>,
+    candidate_rollbacks: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum TestDrainBehavior {
+    Success,
+    Error,
+    Panic,
+    Pending,
+}
+
+fn shutdown_test_registration(
+    name: &'static str,
+    order: Arc<Mutex<Vec<String>>>,
+    drain_behavior: TestDrainBehavior,
+) -> PluginRegistration {
+    let deregister_order = Arc::clone(&order);
+    let stop_order = Arc::clone(&order);
+    let drain_order = Arc::clone(&order);
+    let abort_order = Arc::clone(&order);
+    PluginRegistration::with_shutdown(
+        "test",
+        name,
+        Box::new(move || {
+            deregister_order
+                .lock()
+                .unwrap()
+                .push(format!("deregister:{name}"));
+            Ok(())
+        }),
+        Box::new(move || {
+            stop_order.lock().unwrap().push(format!("stop:{name}"));
+            Ok(())
+        }),
+        Box::new(move |_deadline| {
+            let order = Arc::clone(&drain_order);
+            Box::pin(async move {
+                order.lock().unwrap().push(format!("drain:{name}"));
+                match drain_behavior {
+                    TestDrainBehavior::Success => Ok(()),
+                    TestDrainBehavior::Error => {
+                        Err(PluginError::Internal(format!("{name} drain error")))
+                    }
+                    TestDrainBehavior::Panic => panic!("{name} drain panic"),
+                    TestDrainBehavior::Pending => std::future::pending::<Result<()>>().await,
+                }
+            })
+        }),
+        Box::new(move || {
+            abort_order.lock().unwrap().push(format!("abort:{name}"));
+            Ok(())
+        }),
+    )
+}
+
+#[derive(Default)]
+struct InternalReplayShutdownState {
+    intake_open: bool,
+    after_return: bool,
+    managed_calls: usize,
+    replay_starts: usize,
+    managed_calls_after_return: usize,
+    replay_starts_after_return: usize,
+    completed_workers: usize,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct InternalReplayShutdownInner {
+    state: Mutex<InternalReplayShutdownState>,
+    scope_stack: ScopeStackHandle,
+    evaluator: ScopeHandle,
+    anchor_uuid: uuid::Uuid,
+    replay_release: AtomicBool,
+    replay_aborted: AtomicBool,
+    replay_release_notify: tokio::sync::Notify,
+    provider_start_release: AtomicBool,
+    provider_start_notify: tokio::sync::Notify,
+    worker_completion_notify: tokio::sync::Notify,
+    replay_started: SyncSender<()>,
+    provider_paused: SyncSender<()>,
+    intake_stopped: SyncSender<()>,
+}
+
+struct InternalReplayShutdownTransport {
+    capability: LlmReplayCapability,
+    inner: Arc<InternalReplayShutdownInner>,
+}
+
+impl LlmReplayTransport for InternalReplayShutdownTransport {
+    fn capability(&self) -> &LlmReplayCapability {
+        &self.capability
+    }
+
+    fn start(&self, request: LlmRequest) -> crate::error::Result<LlmReplayCall> {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            if !state.intake_open {
+                return Err(FlowError::Internal(
+                    "internal replay intake is closed".to_string(),
+                ));
+            }
+            state.replay_starts += 1;
+            if state.after_return {
+                state.replay_starts_after_return += 1;
+            }
+        }
+        let _ = self.inner.replay_started.try_send(());
+        let inner = Arc::clone(&self.inner);
+        Ok(LlmReplayCall::new(
+            async move {
+                while !inner.replay_release.load(Ordering::SeqCst) {
+                    inner.replay_release_notify.notified().await;
+                }
+                if inner.replay_aborted.load(Ordering::SeqCst) {
+                    Err(FlowError::Internal("internal replay aborted".to_string()))
+                } else {
+                    Ok(request.content)
+                }
+            },
+            || {},
+        ))
+    }
+}
+
+struct InternalReplayShutdownHarness {
+    inner: Arc<InternalReplayShutdownInner>,
+    replay_started: Receiver<()>,
+    provider_paused: Receiver<()>,
+    intake_stopped: Receiver<()>,
+}
+
+impl InternalReplayShutdownHarness {
+    fn schedule(&self, role: LlmCallRole) -> bool {
+        schedule_internal_replay_call(&self.inner, role, false)
+    }
+
+    fn schedule_paused_before_replay_start(&self, role: LlmCallRole) -> bool {
+        schedule_internal_replay_call(&self.inner, role, true)
+    }
+
+    fn wait_for_first_replay_start(&self) {
+        self.replay_started
+            .recv_timeout(Duration::from_secs(2))
+            .expect("managed internal replay did not start");
+        let state = self.inner.state.lock().unwrap();
+        assert_eq!(state.managed_calls, 1);
+        assert_eq!(state.replay_starts, 1);
+    }
+
+    fn wait_for_second_provider_pause(&self) {
+        self.provider_paused
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second managed internal provider did not pause before replay start");
+        let state = self.inner.state.lock().unwrap();
+        assert_eq!(state.managed_calls, 2);
+        assert_eq!(state.replay_starts, 1);
+    }
+
+    fn wait_for_intake_stop(&self) {
+        self.intake_stopped
+            .recv_timeout(Duration::from_secs(2))
+            .expect("plugin teardown did not stop internal replay intake");
+    }
+
+    fn complete_replay(&self) {
+        release_internal_replay(&self.inner, false);
+    }
+
+    fn poised_contender(
+        &self,
+        role: LlmCallRole,
+    ) -> (SyncSender<()>, std::thread::JoinHandle<bool>) {
+        let (release, wait) = sync_channel(1);
+        let inner = Arc::clone(&self.inner);
+        let contender = std::thread::spawn(move || {
+            wait.recv().expect("contender release sender dropped");
+            schedule_internal_replay_call(&inner, role, false)
+        });
+        (release, contender)
+    }
+
+    fn assert_closed_at_return(
+        &self,
+        release_contender: SyncSender<()>,
+        contender: std::thread::JoinHandle<bool>,
+    ) {
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.after_return = true;
+            assert!(!state.intake_open);
+            assert_eq!(state.managed_calls, 2);
+            assert_eq!(state.replay_starts, 1);
+            assert_eq!(state.completed_workers, 2);
+            assert!(state.workers.is_empty());
+        }
+        release_contender.send(()).unwrap();
+        assert!(!contender.join().unwrap());
+        let state = self.inner.state.lock().unwrap();
+        assert_eq!(state.managed_calls, 2);
+        assert_eq!(state.replay_starts, 1);
+        assert_eq!(state.managed_calls_after_return, 0);
+        assert_eq!(state.replay_starts_after_return, 0);
+    }
+}
+
+fn schedule_internal_replay_call(
+    inner: &Arc<InternalReplayShutdownInner>,
+    role: LlmCallRole,
+    pause_before_replay_start: bool,
+) -> bool {
+    let mut state = inner.state.lock().unwrap();
+    if !state.intake_open {
+        return false;
+    }
+    state.managed_calls += 1;
+    if state.after_return {
+        state.managed_calls_after_return += 1;
+    }
+
+    let worker_inner = Arc::clone(inner);
+    state.workers.push(std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let call_inner = Arc::clone(&worker_inner);
+        runtime.block_on(
+            TASK_SCOPE_STACK.scope(worker_inner.scope_stack.clone(), async move {
+                let transport = Arc::new(InternalReplayShutdownTransport {
+                    capability: LlmReplayCapability {
+                        contract_version: LLM_REPLAY_CONTRACT_VERSION,
+                        api_family: LlmApiFamily::OpenAIResponses,
+                        transport_identity: "plugin-shutdown-race".to_string(),
+                    },
+                    inner: Arc::clone(&call_inner),
+                });
+                let replay = Arc::clone(&transport);
+                let provider_inner = Arc::clone(&call_inner);
+                let params = LlmCallExecuteV2Params::builder()
+                    .name("plugin-shutdown-internal-replay")
+                    .request(LlmRequest {
+                        headers: Map::new(),
+                        content: json!({"candidate": true}),
+                    })
+                    .func(Arc::new(move |request| {
+                        let replay = Arc::clone(&replay);
+                        let inner = Arc::clone(&provider_inner);
+                        Box::pin(async move {
+                            if pause_before_replay_start {
+                                let _ = inner.provider_paused.try_send(());
+                                while !inner.provider_start_release.load(Ordering::SeqCst) {
+                                    inner.provider_start_notify.notified().await;
+                                }
+                            }
+                            replay.start(request)?.await
+                        })
+                    }))
+                    .api_family(LlmApiFamily::OpenAIResponses)
+                    .call_role(role)
+                    .sanitized_metadata(BTreeMap::from([(
+                        "anchor_uuid".to_string(),
+                        json!(call_inner.anchor_uuid.to_string()),
+                    )]))
+                    .parent(call_inner.evaluator.clone())
+                    .build();
+                let _ = llm_call_execute_v2(params).await;
+            }),
+        );
+        {
+            let mut state = worker_inner.state.lock().unwrap();
+            state.completed_workers += 1;
+        }
+        worker_inner.worker_completion_notify.notify_one();
+    }));
+    true
+}
+
+fn close_internal_replay_intake(inner: &InternalReplayShutdownInner) {
+    inner.state.lock().unwrap().intake_open = false;
+    inner.provider_start_release.store(true, Ordering::SeqCst);
+    inner.provider_start_notify.notify_one();
+    let _ = inner.intake_stopped.try_send(());
+}
+
+fn release_internal_replay(inner: &InternalReplayShutdownInner, aborted: bool) {
+    if aborted {
+        inner.replay_aborted.store(true, Ordering::SeqCst);
+    }
+    inner.replay_release.store(true, Ordering::SeqCst);
+    inner.replay_release_notify.notify_one();
+}
+
+async fn drain_internal_replay_workers(inner: Arc<InternalReplayShutdownInner>) -> Result<()> {
+    loop {
+        let completed = {
+            let state = inner.state.lock().unwrap();
+            state.completed_workers == state.managed_calls
+        };
+        if completed {
+            return Ok(());
+        }
+        inner.worker_completion_notify.notified().await;
+    }
+}
+
+fn join_internal_replay_workers(inner: &InternalReplayShutdownInner) -> Result<()> {
+    if !inner.replay_release.load(Ordering::SeqCst) {
+        release_internal_replay(inner, true);
+    }
+    let workers = std::mem::take(&mut inner.state.lock().unwrap().workers);
+    for worker in workers {
+        worker.join().map_err(|_| {
+            PluginError::Internal("managed internal replay worker panicked".to_string())
+        })?;
+    }
+    Ok(())
+}
+
+fn install_internal_replay_shutdown_race(role: LlmCallRole) -> InternalReplayShutdownHarness {
+    let scope_stack = create_scope_stack();
+    let evaluator = with_scope_stack(scope_stack.clone(), || {
+        push_scope(
+            PushScopeParams::builder()
+                .name("plugin-shutdown-evaluator")
+                .scope_type(ScopeType::Evaluator)
+                .build(),
+        )
+        .unwrap()
+    });
+    let (replay_started_sender, replay_started) = sync_channel(1);
+    let (provider_paused_sender, provider_paused) = sync_channel(1);
+    let (intake_stopped_sender, intake_stopped) = sync_channel(1);
+    let inner = Arc::new(InternalReplayShutdownInner {
+        state: Mutex::new(InternalReplayShutdownState {
+            intake_open: true,
+            ..InternalReplayShutdownState::default()
+        }),
+        scope_stack,
+        evaluator,
+        anchor_uuid: uuid::Uuid::now_v7(),
+        replay_release: AtomicBool::new(false),
+        replay_aborted: AtomicBool::new(false),
+        replay_release_notify: tokio::sync::Notify::new(),
+        provider_start_release: AtomicBool::new(false),
+        provider_start_notify: tokio::sync::Notify::new(),
+        worker_completion_notify: tokio::sync::Notify::new(),
+        replay_started: replay_started_sender,
+        provider_paused: provider_paused_sender,
+        intake_stopped: intake_stopped_sender,
+    });
+
+    let deregister_inner = Arc::clone(&inner);
+    let stop_inner = Arc::clone(&inner);
+    let drain_inner = Arc::clone(&inner);
+    let abort_inner = Arc::clone(&inner);
+    install_active_registrations(vec![PluginRegistration::with_shutdown(
+        "test",
+        "managed-internal-replay",
+        Box::new(move || join_internal_replay_workers(&deregister_inner)),
+        Box::new(move || {
+            close_internal_replay_intake(&stop_inner);
+            Ok(())
+        }),
+        Box::new(move |_deadline| {
+            let inner = Arc::clone(&drain_inner);
+            Box::pin(async move { drain_internal_replay_workers(inner).await })
+        }),
+        Box::new(move || {
+            close_internal_replay_intake(&abort_inner);
+            release_internal_replay(&abort_inner, true);
+            Ok(())
+        }),
+    )]);
+
+    let harness = InternalReplayShutdownHarness {
+        inner,
+        replay_started,
+        provider_paused,
+        intake_stopped,
+    };
+    assert!(harness.schedule(role));
+    harness.wait_for_first_replay_start();
+    harness
+}
 
 static RECORDED_NAMES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static PARTIAL_FAIL_ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
 static RESTORE_FAIL_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
 static RESTORE_BREAK_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
 static REPLACEMENT_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVATION_CANCEL_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVATION_CANCEL_ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVATION_CANCEL_PENDING_ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
 
 fn recorded_names() -> &'static Mutex<Vec<String>> {
     RECORDED_NAMES.get_or_init(|| Mutex::new(Vec::new()))
@@ -289,8 +691,82 @@ impl Plugin for VanishingPlugin {
     }
 }
 
+impl Plugin for ActivationCancelPlugin {
+    fn plugin_kind(&self) -> &str {
+        "activation.cancel.plugin"
+    }
+
+    fn validate(&self, _plugin_config: &Map<String, Json>) -> Vec<ConfigDiagnostic> {
+        vec![]
+    }
+
+    fn register<'a>(
+        &'a self,
+        _plugin_config: &Map<String, Json>,
+        ctx: &'a mut PluginRegistrationContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let registration = ACTIVATION_CANCEL_REGISTRATIONS.fetch_add(1, Ordering::SeqCst);
+            ctx.add_registration(
+                PluginRegistration::new(
+                    "plugin",
+                    ctx.qualify_name("cancellation-test"),
+                    Box::new(|| {
+                        ACTIVATION_CANCEL_ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                )
+                .with_activation_rollback(Box::new(|| {
+                    ACTIVATION_CANCEL_PENDING_ROLLBACKS.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })),
+            );
+            if registration == 1 {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Plugin for ActivationCommitRacePlugin {
+    fn plugin_kind(&self) -> &str {
+        "activation.commit.race.plugin"
+    }
+
+    fn validate(&self, _plugin_config: &Map<String, Json>) -> Vec<ConfigDiagnostic> {
+        vec![]
+    }
+
+    fn register<'a>(
+        &'a self,
+        _plugin_config: &Map<String, Json>,
+        ctx: &'a mut PluginRegistrationContext,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        let barrier = self.barrier.clone();
+        let candidate_rollbacks = self.candidate_rollbacks.clone();
+        Box::pin(async move {
+            ctx.add_registration(PluginRegistration::new(
+                "plugin",
+                ctx.qualify_name("candidate"),
+                Box::new(move || {
+                    candidate_rollbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            ));
+            barrier.wait();
+            barrier.wait();
+            Ok(())
+        })
+    }
+}
+
 fn reset_global() {
     crate::shared_runtime::reset_runtime_owner_for_tests();
+    FAILED_PLUGIN_DEREGISTRATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clear();
     let ctx = global_context();
     let mut state = ctx.write().unwrap();
     *state = NemoRelayContextState::new();
@@ -300,6 +776,9 @@ fn reset_global() {
     RESTORE_FAIL_REGISTRATIONS.store(0, Ordering::SeqCst);
     RESTORE_BREAK_REGISTRATIONS.store(0, Ordering::SeqCst);
     REPLACEMENT_REGISTRATIONS.store(0, Ordering::SeqCst);
+    ACTIVATION_CANCEL_REGISTRATIONS.store(0, Ordering::SeqCst);
+    ACTIVATION_CANCEL_ROLLBACKS.store(0, Ordering::SeqCst);
+    ACTIVATION_CANCEL_PENDING_ROLLBACKS.store(0, Ordering::SeqCst);
     let _ = deregister_plugin("test.plugin");
     let _ = deregister_plugin("singleton.plugin");
     let _ = deregister_plugin("recording.plugin");
@@ -308,6 +787,15 @@ fn reset_global() {
     let _ = deregister_plugin("restore.break.plugin");
     let _ = deregister_plugin("partial.fail.plugin");
     let _ = deregister_plugin("vanishing.plugin");
+    let _ = deregister_plugin("activation.cancel.plugin");
+}
+
+fn install_active_registrations(registrations: Vec<PluginRegistration>) {
+    *ACTIVE_PLUGIN_CONFIGURATION.lock().unwrap() = Some(ActivePluginConfiguration {
+        config: PluginConfig::default(),
+        report: ConfigReport::default(),
+        registrations,
+    });
 }
 
 #[test]
@@ -432,7 +920,9 @@ fn test_config_report_has_errors() {
 fn test_register_and_deregister_plugin() {
     let _guard = lock_runtime_owner();
     reset_global();
-    assert!(register_plugin(Arc::new(TestPlugin)).is_ok());
+    let plugin: Arc<dyn Plugin> = Arc::new(TestPlugin);
+    let foreign_instance: Arc<dyn Plugin> = Arc::new(TestPlugin);
+    assert!(register_plugin(Arc::clone(&plugin)).is_ok());
     match register_plugin(Arc::new(TestPlugin)) {
         Err(PluginError::RegistrationFailed(message)) => {
             assert!(message.contains("already registered"));
@@ -441,8 +931,11 @@ fn test_register_and_deregister_plugin() {
         Ok(_) => panic!("expected duplicate registration to fail"),
     }
     assert!(list_plugin_kinds().contains(&"test.plugin".to_string()));
-    assert!(lookup_plugin("test.plugin").is_some());
-    assert!(deregister_plugin("test.plugin"));
+    let registered = lookup_plugin("test.plugin").expect("test plugin should be registered");
+    assert!(Arc::ptr_eq(&registered, &plugin));
+    assert!(!deregister_plugin_if(&foreign_instance));
+    assert!(deregister_plugin_if(&plugin));
+    assert!(!deregister_plugin_if(&plugin));
     assert!(!deregister_plugin("missing.plugin"));
     assert!(clear_plugin_configuration().is_ok());
     assert!(active_plugin_report().is_none());
@@ -770,6 +1263,14 @@ fn test_plugin_registration_context_covers_all_registration_helpers() {
         Arc::new(|_name, request, _next| Box::pin(async move { Ok(request.content) })),
     )
     .unwrap();
+    ctx.register_llm_execution_intercept_v2(
+        "llm-exec-v2",
+        1,
+        Arc::new(|_name, _context, request, _replay, _next| {
+            Box::pin(async move { Ok(request.content) })
+        }),
+    )
+    .unwrap();
     ctx.register_llm_stream_execution_intercept(
         "llm-stream",
         1,
@@ -797,6 +1298,7 @@ fn test_plugin_registration_context_covers_all_registration_helpers() {
             "demo::tool-exec",
             "demo::llm-request",
             "demo::llm-exec",
+            "demo::llm-exec-v2",
             "demo::llm-stream",
         ]
     );
@@ -808,8 +1310,11 @@ fn test_plugin_registration_context_covers_all_registration_helpers() {
 
 #[test]
 fn test_rollback_registrations_runs_in_reverse_and_ignores_failures() {
+    let _guard = lock_runtime_owner();
+    reset_global();
     let mut registrations = vec![];
     let call_order = Arc::new(Mutex::new(Vec::new()));
+    let second_attempts = Arc::new(AtomicUsize::new(0));
 
     let first_order = Arc::clone(&call_order);
     registrations.push(PluginRegistration::new(
@@ -822,14 +1327,19 @@ fn test_rollback_registrations_runs_in_reverse_and_ignores_failures() {
     ));
 
     let second_order = Arc::clone(&call_order);
+    let attempts = Arc::clone(&second_attempts);
     registrations.push(PluginRegistration::new(
         "plugin",
         "second",
         Box::new(move || {
             second_order.lock().unwrap().push("second");
-            Err(PluginError::RegistrationFailed(
-                "expected rollback failure".into(),
-            ))
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(PluginError::RegistrationFailed(
+                    "expected rollback failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }),
     ));
 
@@ -837,6 +1347,718 @@ fn test_rollback_registrations_runs_in_reverse_and_ignores_failures() {
 
     assert!(registrations.is_empty());
     assert_eq!(*call_order.lock().unwrap(), vec!["second", "first"]);
+    retry_failed_plugin_deregistrations().unwrap();
+    assert_eq!(
+        *call_order.lock().unwrap(),
+        vec!["second", "first", "second"]
+    );
+    reset_global();
+}
+
+#[test]
+fn test_pending_activation_rollback_hook_runs_before_shutdown() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let rollback_order = Arc::clone(&order);
+    let mut registrations = vec![
+        shutdown_test_registration(
+            "pending-activation",
+            Arc::clone(&order),
+            TestDrainBehavior::Success,
+        )
+        .with_activation_rollback(Box::new(move || {
+            rollback_order
+                .lock()
+                .unwrap()
+                .push("activation-rollback:pending-activation".to_string());
+            Ok(())
+        })),
+    ];
+
+    rollback_registrations(&mut registrations);
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "activation-rollback:pending-activation",
+            "stop:pending-activation",
+            "abort:pending-activation",
+            "deregister:pending-activation",
+        ]
+    );
+}
+
+#[test]
+fn test_activation_commit_consumes_pending_rollback_hook() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let rollback_calls = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&rollback_calls);
+    let registration = PluginRegistration::new("test", "committed", Box::new(|| Ok(())))
+        .with_activation_rollback(Box::new(move || {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+    store_active_plugin_configuration(
+        PluginConfig::default(),
+        ConfigReport::default(),
+        vec![registration],
+    )
+    .unwrap();
+    clear_plugin_configuration().unwrap();
+
+    assert_eq!(rollback_calls.load(Ordering::SeqCst), 0);
+    reset_global();
+}
+
+#[test]
+fn test_dropping_unconsumed_registration_context_rolls_back() {
+    let rollbacks = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&rollbacks);
+    {
+        let mut context = PluginRegistrationContext::new();
+        context.add_registration(PluginRegistration::new(
+            "test",
+            "drop-owned",
+            Box::new(move || {
+                captured.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        ));
+    }
+    assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn test_immediate_teardown_stops_then_aborts_and_deregisters_in_reverse() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut registrations = vec![
+        shutdown_test_registration("first", Arc::clone(&order), TestDrainBehavior::Success),
+        shutdown_test_registration("second", Arc::clone(&order), TestDrainBehavior::Success),
+    ];
+
+    teardown_registrations_immediate(&mut registrations, false).unwrap();
+
+    assert!(registrations.is_empty());
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:first",
+            "stop:second",
+            "abort:second",
+            "abort:first",
+            "deregister:second",
+            "deregister:first",
+        ]
+    );
+}
+
+#[test]
+fn test_immediate_teardown_contains_panics_and_aggregates_all_hook_errors() {
+    let mut registrations = vec![PluginRegistration::with_shutdown(
+        "test",
+        "failing",
+        Box::new(|| panic!("deregister panic")),
+        Box::new(|| panic!("stop panic")),
+        Box::new(|_deadline| Box::pin(async { Ok(()) })),
+        Box::new(|| Err(PluginError::Internal("abort error".into()))),
+    )];
+
+    let error = teardown_registrations_immediate(&mut registrations, false).unwrap_err();
+
+    assert_eq!(registrations.len(), 1);
+    let message = error.to_string();
+    assert!(message.contains("stop_intake failed: hook panicked"));
+    assert!(message.contains("abort failed: internal error: abort error"));
+    assert!(message.contains("deregister failed: hook panicked"));
+}
+
+#[test]
+fn test_async_teardown_drains_and_deregisters_in_reverse_without_abort() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut registrations = vec![
+        shutdown_test_registration("first", Arc::clone(&order), TestDrainBehavior::Success),
+        shutdown_test_registration("second", Arc::clone(&order), TestDrainBehavior::Success),
+    ];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime
+        .block_on(teardown_registrations_async(
+            &mut registrations,
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .unwrap();
+
+    assert!(registrations.is_empty());
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:first",
+            "stop:second",
+            "drain:second",
+            "drain:first",
+            "deregister:second",
+            "deregister:first",
+        ]
+    );
+    reset_global();
+}
+
+#[test]
+fn test_async_teardown_aggregates_drain_errors_and_aborts_only_unfinished() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut registrations = vec![
+        shutdown_test_registration("success", Arc::clone(&order), TestDrainBehavior::Success),
+        shutdown_test_registration("panic", Arc::clone(&order), TestDrainBehavior::Panic),
+        shutdown_test_registration("error", Arc::clone(&order), TestDrainBehavior::Error),
+    ];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let error = runtime
+        .block_on(teardown_registrations_async(
+            &mut registrations,
+            Instant::now() + Duration::from_secs(1),
+        ))
+        .unwrap_err();
+
+    assert!(registrations.is_empty());
+    let message = error.to_string();
+    assert!(message.contains("error' drain failed: internal error: error drain error"));
+    assert!(message.contains("panic' drain failed: future panicked"));
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:success",
+            "stop:panic",
+            "stop:error",
+            "drain:error",
+            "drain:panic",
+            "drain:success",
+            "abort:error",
+            "abort:panic",
+            "deregister:error",
+            "deregister:panic",
+            "deregister:success",
+        ]
+    );
+    reset_global();
+}
+
+#[test]
+fn test_async_teardown_timeout_aborts_timed_out_and_unattempted_registrations() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut registrations = vec![
+        shutdown_test_registration(
+            "unattempted",
+            Arc::clone(&order),
+            TestDrainBehavior::Success,
+        ),
+        shutdown_test_registration("pending", Arc::clone(&order), TestDrainBehavior::Pending),
+    ];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let error = runtime
+        .block_on(teardown_registrations_async(
+            &mut registrations,
+            Instant::now() + Duration::from_millis(20),
+        ))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("shared deadline expired"));
+    assert!(registrations.is_empty());
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:unattempted",
+            "stop:pending",
+            "drain:pending",
+            "abort:pending",
+            "abort:unattempted",
+            "deregister:pending",
+            "deregister:unattempted",
+        ]
+    );
+    reset_global();
+}
+
+#[test]
+fn test_async_clear_timeout_aborts_before_deregister_and_leaves_state_empty() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![shutdown_test_registration(
+        "pending",
+        Arc::clone(&order),
+        TestDrainBehavior::Pending,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let error = runtime
+        .block_on(clear_plugin_configuration_async(Duration::from_millis(20)))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("shared deadline expired"));
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:pending",
+            "drain:pending",
+            "abort:pending",
+            "deregister:pending",
+        ]
+    );
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_failed_deregistration_is_retained_and_retried_before_activation() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let captured_attempts = Arc::clone(&attempts);
+    install_active_registrations(vec![PluginRegistration::new(
+        "test",
+        "retry-cleanup",
+        Box::new(move || {
+            if captured_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(PluginError::Internal("transient cleanup failure".into()))
+            } else {
+                Ok(())
+            }
+        }),
+    )]);
+
+    let error = clear_plugin_configuration().unwrap_err();
+    assert!(error.to_string().contains("transient cleanup failure"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(active_plugin_report().is_none());
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(initialize_plugins_exact(PluginConfig::default()))
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().is_empty());
+    assert!(active_plugin_report().is_some());
+    clear_plugin_configuration().unwrap();
+    reset_global();
+}
+
+#[test]
+fn test_unresolved_retained_cleanup_does_not_prevent_sync_clear() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let retained_attempts = Arc::new(AtomicUsize::new(0));
+    let captured_retained_attempts = Arc::clone(&retained_attempts);
+    FAILED_PLUGIN_DEREGISTRATIONS
+        .lock()
+        .unwrap()
+        .push(PluginRegistration::new(
+            "test",
+            "unresolved",
+            Box::new(move || {
+                captured_retained_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(PluginError::Internal("still unresolved".into()))
+            }),
+        ));
+    let active_cleanups = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&active_cleanups);
+    install_active_registrations(vec![PluginRegistration::new(
+        "test",
+        "active",
+        Box::new(move || {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+    )]);
+
+    clear_plugin_configuration().unwrap();
+    assert_eq!(active_cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(retained_attempts.load(Ordering::SeqCst), 0);
+    assert!(active_plugin_report().is_none());
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+    reset_global();
+}
+
+#[test]
+fn test_unresolved_retained_cleanup_does_not_prevent_async_clear() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let retained_attempts = Arc::new(AtomicUsize::new(0));
+    let captured_retained_attempts = Arc::clone(&retained_attempts);
+    FAILED_PLUGIN_DEREGISTRATIONS
+        .lock()
+        .unwrap()
+        .push(PluginRegistration::new(
+            "test",
+            "unresolved",
+            Box::new(move || {
+                captured_retained_attempts.fetch_add(1, Ordering::SeqCst);
+                Err(PluginError::Internal("still unresolved".into()))
+            }),
+        ));
+    let active_cleanups = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::clone(&active_cleanups);
+    install_active_registrations(vec![PluginRegistration::new(
+        "test",
+        "active",
+        Box::new(move || {
+            captured.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime
+        .block_on(clear_plugin_configuration_async(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(active_cleanups.load(Ordering::SeqCst), 1);
+    assert_eq!(retained_attempts.load(Ordering::SeqCst), 0);
+    assert!(active_plugin_report().is_none());
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+    reset_global();
+}
+
+#[test]
+fn test_dropping_async_clear_aborts_and_deregisters_taken_state() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![shutdown_test_registration(
+        "pending",
+        Arc::clone(&order),
+        TestDrainBehavior::Pending,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let mut clear = Box::pin(clear_plugin_configuration_async(Duration::from_secs(30)));
+        tokio::select! {
+            result = &mut clear => panic!("pending drain unexpectedly completed: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        drop(clear);
+    });
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:pending",
+            "drain:pending",
+            "abort:pending",
+            "deregister:pending",
+        ]
+    );
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_sync_clear_returns_with_no_new_managed_internal_replay_starts() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let harness = install_internal_replay_shutdown_race(LlmCallRole::Shadow);
+    assert!(harness.schedule_paused_before_replay_start(LlmCallRole::Judge));
+    harness.wait_for_second_provider_pause();
+    let (release_contender, contender) = harness.poised_contender(LlmCallRole::Shadow);
+
+    clear_plugin_configuration().unwrap();
+
+    harness.assert_closed_at_return(release_contender, contender);
+    assert!(harness.inner.replay_aborted.load(Ordering::SeqCst));
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_async_clear_returns_with_no_new_managed_internal_replay_starts() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let harness = install_internal_replay_shutdown_race(LlmCallRole::Judge);
+    assert!(harness.schedule_paused_before_replay_start(LlmCallRole::Shadow));
+    harness.wait_for_second_provider_pause();
+    let (release_contender, contender) = harness.poised_contender(LlmCallRole::Judge);
+    let clear = std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(clear_plugin_configuration_async(Duration::from_secs(1)))
+    });
+
+    harness.wait_for_intake_stop();
+    harness.complete_replay();
+    clear.join().unwrap().unwrap();
+
+    harness.assert_closed_at_return(release_contender, contender);
+    assert!(!harness.inner.replay_aborted.load(Ordering::SeqCst));
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_replacement_returns_with_no_new_managed_internal_replay_starts() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let harness = install_internal_replay_shutdown_race(LlmCallRole::Shadow);
+    assert!(harness.schedule_paused_before_replay_start(LlmCallRole::Judge));
+    harness.wait_for_second_provider_pause();
+    let (release_contender, contender) = harness.poised_contender(LlmCallRole::Shadow);
+    let replace = std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(initialize_plugins_exact_with_options(
+                PluginConfig::default(),
+                PluginInitializationOptions {
+                    shutdown_timeout: Duration::from_secs(1),
+                },
+            ))
+    });
+
+    harness.wait_for_intake_stop();
+    harness.complete_replay();
+    replace.join().unwrap().unwrap();
+
+    harness.assert_closed_at_return(release_contender, contender);
+    assert!(!harness.inner.replay_aborted.load(Ordering::SeqCst));
+    assert!(active_plugin_report().is_some());
+    clear_plugin_configuration().unwrap();
+    reset_global();
+}
+
+#[test]
+fn test_rollback_aborts_hook_bearing_partial_registrations() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut registrations = vec![shutdown_test_registration(
+        "partial",
+        Arc::clone(&order),
+        TestDrainBehavior::Success,
+    )];
+
+    rollback_registrations(&mut registrations);
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["stop:partial", "abort:partial", "deregister:partial"]
+    );
+}
+
+#[test]
+fn test_clear_stops_intake_before_flushing_queued_subscriber_callbacks() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+
+    let intake_open = Arc::new(AtomicBool::new(true));
+    let callback_started = Arc::new(AtomicBool::new(false));
+    let callback_saw_closed = Arc::new(AtomicBool::new(false));
+    let release_callback = Arc::new(Barrier::new(2));
+    let mut ctx = PluginRegistrationContext::new();
+    let callback_open = Arc::clone(&intake_open);
+    let callback_started_flag = Arc::clone(&callback_started);
+    let callback_closed_flag = Arc::clone(&callback_saw_closed);
+    let callback_barrier = Arc::clone(&release_callback);
+    ctx.register_subscriber(
+        "shutdown-order",
+        Arc::new(move |_event| {
+            callback_started_flag.store(true, Ordering::SeqCst);
+            callback_barrier.wait();
+            callback_closed_flag.store(!callback_open.load(Ordering::SeqCst), Ordering::SeqCst);
+        }),
+    )
+    .unwrap();
+    let stop_open = Arc::clone(&intake_open);
+    ctx.add_registration(PluginRegistration::with_shutdown(
+        "test",
+        "shutdown-resource",
+        Box::new(|| Ok(())),
+        Box::new(move || {
+            stop_open.store(false, Ordering::SeqCst);
+            Ok(())
+        }),
+        Box::new(|_deadline| Box::pin(async { Ok(()) })),
+        Box::new(|| Ok(())),
+    ));
+    install_active_registrations(ctx.into_registrations());
+
+    emit_scope_event(
+        EmitMarkEventParams::builder()
+            .name("queued-before-clear")
+            .build(),
+    )
+    .unwrap();
+    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    while !callback_started.load(Ordering::SeqCst) && Instant::now() < wait_deadline {
+        std::thread::yield_now();
+    }
+    assert!(callback_started.load(Ordering::SeqCst));
+
+    let clear_thread = std::thread::spawn(clear_plugin_configuration);
+    let wait_deadline = Instant::now() + Duration::from_secs(1);
+    while intake_open.load(Ordering::SeqCst) && Instant::now() < wait_deadline {
+        std::thread::yield_now();
+    }
+    assert!(!intake_open.load(Ordering::SeqCst));
+    release_callback.wait();
+
+    clear_thread.join().unwrap().unwrap();
+    assert!(callback_saw_closed.load(Ordering::SeqCst));
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_dispatcher_thread_clear_returns_conflict_without_taking_active_state() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    set_thread_scope_stack(create_scope_stack());
+
+    let callback_result = Arc::new(Mutex::new(None));
+    let result_slot = Arc::clone(&callback_result);
+    let mut ctx = PluginRegistrationContext::new();
+    ctx.register_subscriber(
+        "reentrant-clear",
+        Arc::new(move |_event| {
+            *result_slot.lock().unwrap() = Some(clear_plugin_configuration());
+        }),
+    )
+    .unwrap();
+    install_active_registrations(ctx.into_registrations());
+
+    emit_scope_event(
+        EmitMarkEventParams::builder()
+            .name("reentrant-clear")
+            .build(),
+    )
+    .unwrap();
+    crate::api::runtime::flush_subscribers().unwrap();
+
+    match callback_result.lock().unwrap().take().unwrap() {
+        Err(PluginError::Conflict(message)) => {
+            assert!(message.contains("subscriber callback"));
+        }
+        other => panic!("unexpected dispatcher clear result: {other:?}"),
+    }
+    assert!(active_plugin_report().is_some());
+    clear_plugin_configuration().unwrap();
+    reset_global();
+}
+
+#[test]
+fn test_sync_clear_returns_conflict_while_an_async_transition_owns_the_gate() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    install_active_registrations(Vec::new());
+    let transition = PLUGIN_CONFIGURATION_TRANSITION.try_lock().unwrap();
+
+    match clear_plugin_configuration() {
+        Err(PluginError::Conflict(message)) => {
+            assert!(message.contains("transition is already in progress"));
+        }
+        other => panic!("unexpected concurrent clear result: {other:?}"),
+    }
+    assert!(active_plugin_report().is_some());
+
+    drop(transition);
+    clear_plugin_configuration().unwrap();
+    reset_global();
+}
+
+#[test]
+fn test_replacement_drains_previous_configuration_before_storing_new_state() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![shutdown_test_registration(
+        "previous",
+        Arc::clone(&order),
+        TestDrainBehavior::Success,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime
+        .block_on(initialize_plugins_exact_with_options(
+            PluginConfig::default(),
+            PluginInitializationOptions {
+                shutdown_timeout: Duration::from_secs(1),
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["stop:previous", "drain:previous", "deregister:previous"]
+    );
+    assert!(active_plugin_report().is_some());
+    clear_plugin_configuration().unwrap();
+    reset_global();
+}
+
+#[test]
+fn test_replacement_teardown_failure_leaves_configuration_cleared() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![shutdown_test_registration(
+        "previous",
+        Arc::clone(&order),
+        TestDrainBehavior::Error,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let error = runtime
+        .block_on(initialize_plugins_exact(PluginConfig::default()))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("previous' drain failed"));
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:previous",
+            "drain:previous",
+            "abort:previous",
+            "deregister:previous",
+        ]
+    );
+    assert!(active_plugin_report().is_none());
+    reset_global();
 }
 
 #[test]
@@ -910,6 +2132,45 @@ fn test_initialize_plugins_rolls_back_partial_component_registration_on_failure(
     }
 
     assert_eq!(PARTIAL_FAIL_ROLLBACKS.load(Ordering::SeqCst), 1);
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_cancelling_activation_rolls_back_completed_and_in_progress_components() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    register_plugin(Arc::new(ActivationCancelPlugin)).unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut initialize = Box::pin(initialize_plugins_exact(PluginConfig {
+            components: vec![
+                PluginComponentSpec::new("activation.cancel.plugin"),
+                PluginComponentSpec::new("activation.cancel.plugin"),
+            ],
+            ..PluginConfig::default()
+        }));
+
+        tokio::select! {
+            result = &mut initialize => panic!("pending activation unexpectedly completed: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert_eq!(
+            ACTIVATION_CANCEL_REGISTRATIONS.load(Ordering::SeqCst),
+            2
+        );
+        drop(initialize);
+    });
+
+    assert_eq!(ACTIVATION_CANCEL_ROLLBACKS.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        ACTIVATION_CANCEL_PENDING_ROLLBACKS.load(Ordering::SeqCst),
+        2
+    );
     assert!(active_plugin_report().is_none());
     reset_global();
 }
@@ -1210,6 +2471,16 @@ fn test_plugin_registration_context_maps_duplicate_registration_errors() {
         ),
         "llm execution intercept:",
     );
+    expect_registration_failed(
+        ctx.register_llm_execution_intercept_v2(
+            "llm-exec",
+            1,
+            Arc::new(|_name, _context, request, _replay, _next| {
+                Box::pin(async move { Ok(request.content) })
+            }),
+        ),
+        "llm V2 execution intercept:",
+    );
 
     ctx.register_llm_stream_execution_intercept(
         "llm-stream",
@@ -1341,6 +2612,14 @@ fn test_plugin_registration_context_maps_deregistration_errors() {
         Arc::new(|_name, request, _next| Box::pin(async move { Ok(request.content) })),
     )
     .unwrap();
+    ctx.register_llm_execution_intercept_v2(
+        "llm-exec-v2",
+        1,
+        Arc::new(|_name, _context, request, _replay, _next| {
+            Box::pin(async move { Ok(request.content) })
+        }),
+    )
+    .unwrap();
     ctx.register_llm_stream_execution_intercept(
         "llm-stream",
         1,
@@ -1377,6 +2656,7 @@ fn test_plugin_registration_context_maps_deregistration_errors() {
         "llm sanitize response guardrail deregistration failed:",
         "llm conditional execution guardrail deregistration failed:",
         "llm execution intercept deregistration failed:",
+        "llm V2 execution intercept deregistration failed:",
         "llm stream execution intercept deregistration failed:",
         "tool request intercept deregistration failed:",
         "tool execution intercept deregistration failed:",
@@ -1583,4 +2863,466 @@ fn test_layer_config_applies_typed_overlay_defaults_over_file_base() {
     assert_eq!(observability.config["output_directory"], json!("/var/log"));
     // A kind the code config does not declare is inherited from the file.
     assert_eq!(typed.components[1].kind, "adaptive");
+}
+
+struct DrainWithPanickingDrop {
+    name: &'static str,
+    order: Arc<Mutex<Vec<String>>>,
+    completes: bool,
+}
+
+impl Future for DrainWithPanickingDrop {
+    type Output = Result<()>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.completes {
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+impl Drop for DrainWithPanickingDrop {
+    fn drop(&mut self) {
+        {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("drop:{}", self.name));
+        }
+        panic!("{} drain future drop panic", self.name);
+    }
+}
+
+fn panicking_drop_shutdown_registration(
+    name: &'static str,
+    order: Arc<Mutex<Vec<String>>>,
+    completes: bool,
+) -> PluginRegistration {
+    let stop_order = order.clone();
+    let drain_order = order.clone();
+    let drain_future_order = order.clone();
+    let abort_order = order.clone();
+    let deregister_order = order;
+    PluginRegistration::with_shutdown(
+        "test",
+        name,
+        Box::new(move || {
+            deregister_order
+                .lock()
+                .unwrap()
+                .push(format!("deregister:{name}"));
+            Ok(())
+        }),
+        Box::new(move || {
+            stop_order.lock().unwrap().push(format!("stop:{name}"));
+            Ok(())
+        }),
+        Box::new(move |_deadline| {
+            drain_order.lock().unwrap().push(format!("drain:{name}"));
+            Box::pin(DrainWithPanickingDrop {
+                name,
+                order: drain_future_order.clone(),
+                completes,
+            })
+        }),
+        Box::new(move || {
+            abort_order.lock().unwrap().push(format!("abort:{name}"));
+            Ok(())
+        }),
+    )
+}
+
+#[test]
+fn test_async_clear_contains_drain_future_drop_panic_on_timeout() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![panicking_drop_shutdown_registration(
+        "timeout",
+        order.clone(),
+        false,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(clear_plugin_configuration_async(Duration::from_millis(20)))
+    }));
+
+    let error = result
+        .expect("drain future drop panic must be contained")
+        .unwrap_err();
+    assert!(error.to_string().contains("shared deadline expired"));
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:timeout",
+            "drain:timeout",
+            "drop:timeout",
+            "abort:timeout",
+            "deregister:timeout",
+        ]
+    );
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_async_clear_contains_drain_future_drop_panic_on_cancellation() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![panicking_drop_shutdown_registration(
+        "cancelled",
+        order.clone(),
+        false,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(async {
+            let mut clear = Box::pin(clear_plugin_configuration_async(Duration::from_secs(30)));
+            tokio::select! {
+                result = &mut clear => panic!("pending drain unexpectedly completed: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            drop(clear);
+        });
+    }));
+
+    result.expect("drain future drop panic must be contained");
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:cancelled",
+            "drain:cancelled",
+            "drop:cancelled",
+            "abort:cancelled",
+            "deregister:cancelled",
+        ]
+    );
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_async_clear_reports_completed_drain_future_drop_panic() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    install_active_registrations(vec![panicking_drop_shutdown_registration(
+        "completed",
+        order.clone(),
+        true,
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        runtime.block_on(clear_plugin_configuration_async(Duration::from_secs(1)))
+    }));
+
+    let error = result
+        .expect("completed drain future drop panic must be contained")
+        .unwrap_err();
+    assert!(error.to_string().contains("future panicked"));
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "stop:completed",
+            "drain:completed",
+            "drop:completed",
+            "abort:completed",
+            "deregister:completed",
+        ]
+    );
+    assert!(active_plugin_report().is_none());
+    reset_global();
+}
+
+#[test]
+fn test_async_deregistration_quarantine_releases_unused_abort_hook() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let owner = Arc::new(());
+    let owner_weak = Arc::downgrade(&owner);
+    let abort_owner = owner.clone();
+    drop(owner);
+    install_active_registrations(vec![PluginRegistration::with_shutdown(
+        "test",
+        "async-quarantine",
+        Box::new(|| Err(PluginError::Internal("deregister failed".into()))),
+        Box::new(|| Ok(())),
+        Box::new(|_deadline| Box::pin(async { Ok(()) })),
+        Box::new(move || {
+            let _ = &abort_owner;
+            Ok(())
+        }),
+    )]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let error = runtime
+        .block_on(clear_plugin_configuration_async(Duration::from_secs(1)))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("deregister failed"));
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+    assert!(
+        owner_weak.upgrade().is_none(),
+        "quarantine retained an abort hook after successful drain"
+    );
+    reset_global();
+}
+
+#[test]
+fn test_sync_deregistration_quarantine_releases_unused_drain_hook() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let owner = Arc::new(());
+    let owner_weak = Arc::downgrade(&owner);
+    let drain_owner = owner.clone();
+    drop(owner);
+    install_active_registrations(vec![PluginRegistration::with_shutdown(
+        "test",
+        "sync-quarantine",
+        Box::new(|| Err(PluginError::Internal("deregister failed".into()))),
+        Box::new(|| Ok(())),
+        Box::new(move |_deadline| {
+            let owner = drain_owner.clone();
+            Box::pin(async move {
+                let _ = owner;
+                Ok(())
+            })
+        }),
+        Box::new(|| Ok(())),
+    )]);
+
+    let error = clear_plugin_configuration().unwrap_err();
+
+    assert!(error.to_string().contains("deregister failed"));
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+    assert!(
+        owner_weak.upgrade().is_none(),
+        "quarantine retained a drain hook after synchronous abort"
+    );
+    reset_global();
+}
+
+#[test]
+fn test_activation_commit_rejects_quarantine_added_during_registration() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let barrier = Arc::new(Barrier::new(2));
+    let candidate_rollbacks = Arc::new(AtomicUsize::new(0));
+    register_plugin(Arc::new(ActivationCommitRacePlugin {
+        barrier: barrier.clone(),
+        candidate_rollbacks: candidate_rollbacks.clone(),
+    }))
+    .unwrap();
+
+    let initializer = std::thread::spawn(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(initialize_plugins_exact(PluginConfig {
+            components: vec![PluginComponentSpec::new("activation.commit.race.plugin")],
+            ..PluginConfig::default()
+        }))
+    });
+
+    barrier.wait();
+    let failed_cleanup_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = failed_cleanup_attempts.clone();
+    let mut concurrent_cleanup = vec![PluginRegistration::new(
+        "test",
+        "concurrent-failed-cleanup",
+        Box::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(PluginError::Internal("unresolved cleanup".to_string()))
+        }),
+    )];
+    rollback_registrations(&mut concurrent_cleanup);
+    assert!(concurrent_cleanup.is_empty());
+    assert_eq!(failed_cleanup_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+    barrier.wait();
+
+    let error = initializer.join().unwrap().unwrap_err();
+    assert!(error.to_string().contains("failed deregistration cleanup"));
+    assert_eq!(candidate_rollbacks.load(Ordering::SeqCst), 1);
+    assert!(active_plugin_report().is_none());
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+
+    FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().clear();
+    assert!(deregister_plugin("activation.commit.race.plugin"));
+    reset_global();
+}
+
+#[test]
+fn test_replacement_commit_rejection_attempts_previous_configuration_restore() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    register_plugin(Arc::new(RecordingPlugin)).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let candidate_rollbacks = Arc::new(AtomicUsize::new(0));
+    register_plugin(Arc::new(ActivationCommitRacePlugin {
+        barrier: barrier.clone(),
+        candidate_rollbacks: candidate_rollbacks.clone(),
+    }))
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(initialize_plugins_exact(PluginConfig {
+            components: vec![PluginComponentSpec::new("recording.plugin")],
+            ..PluginConfig::default()
+        }))
+        .unwrap();
+    assert_eq!(recorded_names().lock().unwrap().len(), 1);
+
+    let initializer = std::thread::spawn(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(initialize_plugins_exact(PluginConfig {
+            components: vec![PluginComponentSpec::new("activation.commit.race.plugin")],
+            ..PluginConfig::default()
+        }))
+    });
+
+    barrier.wait();
+    let mut concurrent_cleanup = vec![PluginRegistration::new(
+        "test",
+        "replacement-concurrent-failed-cleanup",
+        Box::new(|| Err(PluginError::Internal("unresolved cleanup".to_string()))),
+    )];
+    rollback_registrations(&mut concurrent_cleanup);
+    barrier.wait();
+
+    let error = initializer.join().unwrap().unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("plugin activation blocked by failed deregistration cleanup"));
+    assert!(message.contains("previous plugin configuration could not be restored"));
+    assert_eq!(candidate_rollbacks.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        recorded_names().lock().unwrap().len(),
+        2,
+        "previous plugin registration was not retried"
+    );
+    assert!(active_plugin_report().is_none());
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+
+    FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().clear();
+    assert!(deregister_plugin("activation.commit.race.plugin"));
+    assert!(deregister_plugin("recording.plugin"));
+    reset_global();
+}
+
+#[test]
+fn test_activation_commit_quarantine_lock_poison_rolls_back_without_deadlock() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _quarantine = FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap();
+        panic!("poison quarantine lock");
+    }));
+    assert!(FAILED_PLUGIN_DEREGISTRATIONS.is_poisoned());
+    let deregistration_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = deregistration_attempts.clone();
+
+    let error = store_active_plugin_configuration(
+        PluginConfig::default(),
+        ConfigReport::default(),
+        vec![PluginRegistration::new(
+            "test",
+            "quarantine-poison-candidate",
+            Box::new(move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(PluginError::Internal(
+                    "candidate cleanup failed".to_string(),
+                ))
+            }),
+        )],
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("failed plugin deregistration lock poisoned")
+    );
+    assert_eq!(deregistration_attempts.load(Ordering::SeqCst), 1);
+    assert!(active_plugin_report().is_none());
+    assert_eq!(
+        FAILED_PLUGIN_DEREGISTRATIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len(),
+        1
+    );
+
+    FAILED_PLUGIN_DEREGISTRATIONS.clear_poison();
+    FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().clear();
+    reset_global();
+}
+
+#[test]
+fn test_activation_commit_active_lock_poison_releases_quarantine_before_rollback() {
+    let _guard = lock_runtime_owner();
+    reset_global();
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _active = ACTIVE_PLUGIN_CONFIGURATION.lock().unwrap();
+        panic!("poison active configuration lock");
+    }));
+    assert!(ACTIVE_PLUGIN_CONFIGURATION.is_poisoned());
+    let deregistration_attempts = Arc::new(AtomicUsize::new(0));
+    let attempts = deregistration_attempts.clone();
+
+    let error = store_active_plugin_configuration(
+        PluginConfig::default(),
+        ConfigReport::default(),
+        vec![PluginRegistration::new(
+            "test",
+            "active-poison-candidate",
+            Box::new(move || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(PluginError::Internal(
+                    "candidate cleanup failed".to_string(),
+                ))
+            }),
+        )],
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("active plugin configuration lock poisoned")
+    );
+    assert_eq!(deregistration_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().len(), 1);
+
+    ACTIVE_PLUGIN_CONFIGURATION.clear_poison();
+    *ACTIVE_PLUGIN_CONFIGURATION.lock().unwrap() = None;
+    FAILED_PLUGIN_DEREGISTRATIONS.lock().unwrap().clear();
+    reset_global();
 }

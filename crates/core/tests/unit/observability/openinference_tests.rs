@@ -101,6 +101,7 @@ fn empty_annotated_request() -> AnnotatedLlmRequest {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -370,6 +371,10 @@ fn sample_openinference_annotated_request() -> AnnotatedLlmRequest {
                 content: MessageContent::Text("Use concise answers.".to_string()),
                 name: None,
             },
+            Message::Developer {
+                content: MessageContent::Text("Use the public API.".to_string()),
+                name: None,
+            },
             Message::User {
                 content: MessageContent::Text("Search docs.".to_string()),
                 name: None,
@@ -391,6 +396,7 @@ fn sample_openinference_annotated_request() -> AnnotatedLlmRequest {
                     "type": "object",
                     "properties": {"query": {"type": "string"}}
                 })),
+                strict: None,
             },
         }]),
         ..empty_annotated_request()
@@ -3705,10 +3711,15 @@ fn annotated_llm_payloads_emit_flattened_openinference_message_and_tool_attribut
     let attributes = attr_map(&spans[0].attributes);
     assert_attr(&attributes, "llm.system", "Use concise answers.");
     assert_attr(&attributes, "llm.input_messages.0.message.role", "system");
-    assert_attr(&attributes, "llm.input_messages.1.message.role", "user");
     assert_attr(
         &attributes,
-        "llm.input_messages.1.message.content",
+        "llm.input_messages.1.message.role",
+        "developer",
+    );
+    assert_attr(&attributes, "llm.input_messages.2.message.role", "user");
+    assert_attr(
+        &attributes,
+        "llm.input_messages.2.message.content",
         "Search docs.",
     );
     assert_attr_contains(

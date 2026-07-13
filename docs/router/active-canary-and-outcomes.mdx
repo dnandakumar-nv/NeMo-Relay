@@ -1,0 +1,235 @@
+---
+title: "Active Canary and Outcomes"
+sidebar-title: "Active Canary"
+description: "Configure bounded Active canaries, protected outcomes, randomized controls, and operator controls."
+position: 7
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+Active mode can substitute a candidate model for a bounded randomized subset of
+independent Primary roots. Router keeps a positive anchor-control population and
+a separate holdout population. It authorizes treatment only from fresh
+counterfactual evidence and current randomized outcomes.
+
+> [!IMPORTANT]
+> The CLI, Python, and Node.js packages link and register Router automatically.
+> A custom Rust host must link `nemo-relay-router` and call
+> `register_router_component()` before plugin initialization. Python and
+> Node.js can configure and activate Active mode, but they expose no inspection
+> or operator methods. Use the Rust service, CLI, or optional Rust HTTP adapter
+> for those operations. The generic C FFI and Go binding have no eligible V2
+> replay bridge.
+
+## Configure Active Policy
+
+Active requires a complete recommendation policy plus all three Active learning
+fields:
+
+```toml
+[components.config.pools.learning]
+version = 1
+embedder = "local-embedding-v1"
+top_k = 32
+radius = 0.35
+min_points = 12
+min_independent_roots = 8
+min_effective_samples = 6.0
+min_coverage = 0.8
+time_decay_half_life_seconds = 604800.0
+prior_success = 1.0
+prior_failure = 1.0
+familywise_credible_level = 0.95
+promotion_lower_bound = 0.9
+retention_lower_bound = 0.8
+holdout_probability = 0.2
+active_canary_fraction = 0.4
+```
+
+`retention_lower_bound` must be nonnegative and lower than
+`promotion_lower_bound`. `holdout_probability` must be in `(0, 0.25]`, and
+`active_canary_fraction` must be in `(0, 1)`. Their sum must be lower than `1`,
+which preserves positive anchor-control probability. Both probabilities must
+map to exact nonzero 64-bit integer thresholds.
+
+Every Active pool also requires a complete version-1 outcome policy:
+
+```toml
+[components.config.pools.outcome]
+version = 1
+success_matchers = [
+  { event_kind = "scope_end", category = "agent", name = "completed", terminal_status = "ok", metadata_equals = {} },
+]
+failure_matchers = [
+  { event_kind = "scope_end", category = "agent", name = "completed", terminal_status = "error", metadata_equals = {} },
+]
+completion_disposition = "success"
+error_disposition = "failure"
+tool_failure_disposition = "failure"
+end_of_run_disposition = "ignore"
+max_attribution_seconds = 600
+actual_outcome_half_life_seconds = 1800
+anchor_shadow_half_life_seconds = 1800
+relearning_cooloff_seconds = 300
+min_treatment_roots = 32
+min_control_roots = 32
+min_treatment_effective_weight = 16.0
+min_control_effective_weight = 16.0
+noninferiority_margin = 0.1
+noninferiority_probability = 0.99
+rollback_probability = 0.95
+outcome_evaluation_batch_size = 64
+max_canary_roots = 64
+authorization_ttl_seconds = 600
+```
+
+Outcome matchers are disjunctive within the success or failure list. A matcher
+uses an exact Scope End or Mark shape, sanitized category and name, terminal
+status, and up to 16 allowlisted scalar metadata clauses. Each list contains at
+most 64 matchers. Category and name are limited to 256 UTF-8 bytes.
+
+Durations are positive and at most one year. The attribution interval cannot
+exceed the retention horizon. Actual-outcome and anchor-shadow half-lives must
+be shorter than the recommendation evidence half-life, and authorization TTL
+cannot exceed the actual-outcome half-life. Treatment and control minima are at
+least 32. The canary cap is an exact multiple of the evaluation batch, produces
+at most 256 looks, and twice the cap fits `max_evidence_records`.
+
+## Understand Randomized Arms
+
+Router protects each raw root UUID with the current owner-only cohort salt. It
+derives a stable root key and separate holdout and canary digests. The root is
+assigned to exactly one arm:
+
+- `candidate_treatment` serves the authorized model-only rewrite.
+- `anchor_control` serves the unchanged anchor and supplies the comparison
+  population.
+- `anchor_holdout` serves the unchanged anchor as monitoring evidence and is
+  not pooled into control.
+
+The assignment records exact threshold numerators, configured and effective
+probabilities, conditional selection probability, and propensity. A unique
+root/cohort constraint prevents a second randomized admission for the same raw
+root. Root UUIDs and cohort salt bytes are not copied into outcome or decision
+inspection fields.
+
+## Follow Exact-Once Foreground Serving
+
+Router freshly reruns strict-partition similarity, root selection, coverage,
+Kish support, weighted Beta confidence, and candidate correction. It also
+requires current experiment, outcome-look, generation, control, cap, tranche,
+and query-local neighborhood authority.
+
+Immediately before randomization, Router flushes subscriber callbacks and opens
+the outcome window through the trajectory coordinator. One immediate SQLite
+transaction then records the decision, root window, assignment, propensity,
+and optional candidate dispatch. Only `Applied` or an exact replayed
+`AlreadyApplied` permits candidate handoff.
+
+The current managed continuation is invoked exactly once:
+
+- Treatment receives the original provider request with only the model changed.
+- Control and holdout receive the original request unchanged.
+- Provider error is returned to the caller and is never retried against the
+  anchor.
+- A malformed successful candidate response is returned unchanged. Router
+  records a policy failure and invalidates that exact query neighborhood.
+- Cancellation and panic produce explicit dispatch terminal facts and do not
+  start a detached or fallback call.
+- Foreground saturation, stale authority, storage uncertainty, or control
+  uncertainty serves the anchor without creating a candidate graph.
+
+Candidate treatment does not seed the Shadow pipeline. Successful control,
+holdout, force-anchor, and ordinary anchor fallback can seed Shadow work under
+the normal sampling limits. A paused call schedules no new background work.
+
+## Attribute Protected Outcomes
+
+One outcome window is pinned to the first resolved trajectory owner. It accepts
+only events ordered after the durable opening boundary. Each root stores at
+most 64 protected signals and 64 KiB of canonical signal data. Raw root and
+owner UUIDs remain memory-only.
+
+Router combines exact matchers, representative completion or error, terminal
+Tool failure, and response-policy failure. Failure dominates success. Signals
+do not rewrite the real request or response. Owner end and attribution deadline
+use a subscriber flush and coordinator barrier before terminalization.
+
+A treatment outcome is eligible only when exactly one coherent candidate
+dispatch has terminal state `completed` or `provider_error` and agrees with the
+representative result. A coherent control has no candidate dispatch. Holdout is
+monitoring-only. Cancellation, panic, missing terminal data, event loss,
+multiple candidates, conflicting intervals, or a dead process becomes
+unattributed, ambiguous, orphaned, or shutdown-orphaned and enters neither
+posterior.
+
+At each fixed look, treatment and control use separate `Beta(1, 1)` priors and
+deterministically decayed success and failure weights. Router authorizes when
+raw-root, effective-weight, attribution, differential-attribution, and
+noninferiority gates pass. It rolls back when the configured posterior rollback
+probability passes. Judge evidence remains an independent secondary gate and
+never satisfies actual-outcome minima.
+
+A provider, codec, policy, or attributable Tool failure invalidates only the
+current experiment, canonical query, and sorted-neighbor identity. Cool-off
+must expire before fresh evidence can restore that neighborhood. Other queries
+and candidates remain independent.
+
+## Apply Operator Controls
+
+The public Rust control service supports global or per-pool pause and
+force-anchor state. Mutations use compare-and-swap generation authority:
+
+```rust
+use nemo_relay_router::{
+    ControlMutation, ControlMutationOptions, ControlOperation, ControlScope,
+    router_control_service,
+};
+use uuid::Uuid;
+
+let service = router_control_service().expect("Router must be active");
+let snapshot = service.snapshot().await?;
+service
+    .apply_mutation(
+        ControlMutation {
+            mutation_id: Uuid::now_v7(),
+            scope: ControlScope::All,
+            operation: ControlOperation::SetPaused { value: true },
+            expected_control_generation: snapshot.control_generation,
+            actor: "operator".into(),
+            reason: "pause rollout".into(),
+        },
+        ControlMutationOptions::default(),
+    )
+    .await?;
+```
+
+Pause stops new sampling, embedding, judging, look claims, and substitution.
+Already admitted work can finish. Force-anchor stops substitution but preserves
+eligible Shadow work, outcome terminalization, relearning, process maintenance,
+control compaction, and retention. Missing, saturated, stale, or unreadable
+control authority behaves as force-anchor.
+
+## Recover and Retain Active State
+
+Startup converts dead-process dispatches without terminal facts to
+`unknown_after_crash`, terminalizes open roots as orphaned, and reclaims stale
+look claims. It never invents a success, failure, provider receipt, or control
+result.
+
+Graceful shutdown closes foreground admission, waits every tracked foreground
+permit, flushes subscribers again, and terminalizes unresolved windows as
+shutdown-orphaned before stopping the outcome actor and writer. Abort closes
+provider and writer admission and leaves only facts that startup can reconcile
+conservatively.
+
+Ordinary decision retention excludes Active rows. Terminal Active experiments
+use marker-first cleanup with limits of 1,000 root/outcome parents, 4,095 child
+facts, and 32 MiB per transaction. Chained receipts and checkpoints preserve
+aggregate row and byte totals while the graph is removed.
+
+Treat the owner-only ledger and configured embedding endpoint as recipients of
+sensitive application text. Router excludes request headers, credentials,
+replay state, raw root identity, and cohort salt from Active decision and
+outcome records, but it does not discover secrets written into ordinary prompt,
+response, event-name, metadata, or scope-name text.

@@ -241,7 +241,7 @@ def validate_config(config: PricingConfig | JsonObject) -> ConfigReport:
             components=[ComponentSpec(config)],
         )
     )
-    return cast(ConfigReport, report)
+    return report
 
 
 __all__ = [

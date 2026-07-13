@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "nemo-relay-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shadow, recommendation, and bounded Active routing for NeMo Relay."
+readme = "README.md"
+exclude = [
+    "src/active_math_tests.rs",
+    "src/active_math_simulation_tests.rs",
+    "src/active_runtime_integration_tests.rs",
+    "src/background_jobs_tests.rs",
+    "src/embedder_tests.rs",
+    "src/ledger/repository/materialization_tests.rs",
+    "src/ledger/repository/retention_race_tests.rs",
+    "src/live_embedding_tests.rs",
+    "src/recommendation_runtime_integration_tests.rs",
+    "src/scheduler_live_provider_tests.rs",
+    "src/scheduler_tests.rs",
+    "src/selector_integration_tests.rs",
+    "src/sqlite_vec_capability_tests.rs",
+    "tests/**",
+]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+http = [
+    "dep:axum",
+    "dep:futures-util",
+    "dep:http-body-util",
+    "dep:subtle",
+    "dep:tower",
+]
+schema = ["dep:schemars", "nemo-relay/schema", "nemo-relay-types/schema"]
+
+[dependencies]
+axum = { version = "0.8", optional = true }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = { version = "0.3", optional = true }
+getrandom = "0.3"
+hmac = { version = "=0.13.0", features = ["zeroize"] }
+http-body-util = { version = "0.1", optional = true }
+jsonschema = { version = "=0.46.8", default-features = false }
+libm = { version = "=0.2.16", default-features = false, features = ["force-soft-floats"] }
+nemo-relay.workspace = true
+nemo-relay-types.workspace = true
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+ryu-js = "1"
+schemars = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_json_canonicalizer = "0.3"
+sha2 = { version = "0.11", features = ["zeroize"] }
+sqlite-vec = "=0.1.9"
+statrs = { version = "=0.18.0", default-features = false }
+subtle = { version = "2", optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }
+tower = { version = "0.5", optional = true, features = ["util"] }
+unicode-normalization.workspace = true
+url = "2"
+uuid = { workspace = true, features = ["v7", "serde"] }
+zeroize = "=1.8.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.4", default-features = false, features = ["fs", "process", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[build-dependencies]
+sha2 = "=0.11.0"
+toml = "=0.9.12"
+
+[dev-dependencies]
+nemo-relay-adaptive.workspace = true
+static_assertions = "=1.1.0"
+tempfile = "=3.27.0"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "test-util", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }

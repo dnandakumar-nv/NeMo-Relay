@@ -81,6 +81,45 @@ The built-in provider codecs expose the same core methods:
 
 Choose the provider codec that matches the payload shape the framework already sends to the provider. Do not translate to a different provider shape only to make the codec fit.
 
+Normalized function tool definitions can include an optional Boolean
+`function.strict` field. `OpenAIChatCodec` and `OpenAIResponsesCodec` preserve
+native `strict` values in both directions; an omitted value remains omitted and
+`false` remains explicit. An explicit OpenAI value must be Boolean; `null` and
+other types are rejected. Responses accepts native flat function tools and the
+legacy nested function shape, but rejects mixed shapes, unmodeled tool fields,
+and non-function tool types instead of discarding data. Anthropic Messages has
+no equivalent field. An Anthropic tool without `strict` decodes with
+`function.strict` unset, while any explicit native `strict` key is rejected.
+Encoding likewise rejects a normalized Anthropic tool whenever
+`function.strict` is present, including `false`, instead of silently discarding
+it.
+
+## Instructions And Structured Output
+
+`AnnotatedLlmRequest` preserves System and Developer instructions as distinct
+message roles. It exposes a typed `response_format` for `json_object` and
+`json_schema` output contracts.
+
+| Provider codec | Instruction mapping | Structured-output mapping |
+|---|---|---|
+| `OpenAIChatCodec` | Preserves System and Developer entries in `messages` order. | Maps `response_format`. For `json_schema`, the outer object is the native wrapper and `json_schema` is the native format descriptor. |
+| `OpenAIResponsesCodec` | Places top-level string `instructions` first as a System fact, followed by System and Developer input items in wire order. | Maps `text.format`; other `text` fields are native-wrapper extras. |
+| `AnthropicMessagesCodec` | Keeps a supported top-level `system` value in its original location. Developer messages and System roles inside `messages` are rejected. | Maps `output_config.format`; only native `json_schema` is supported. Other `output_config` fields are native-wrapper extras. |
+
+For every typed format, `extra.native_wrapper` preserves unknown fields on the
+containing native object and `extra.native_format` preserves unknown fields on
+the format descriptor. Encoding restores those fields to their original
+locations. An unknown native format kind stays in the annotated request's
+generic `extra` data and round-trips unchanged. A malformed supported format or
+a simultaneous typed and generic representation is an error.
+
+Do not relabel an unsupported instruction role or discard a provider-native
+representation. A caller that needs exact model-only replay should decode and
+encode against the original request; the built-in codecs retain native message
+details such as explicit `content: null`, Responses input representation, and
+Anthropic content-block extensions when the normalized message semantics did
+not change.
+
 ## Example: Add a System Message with a Provider Codec
 
 This example uses a request intercept to edit the normalized request. The codec writes the edited messages back into the provider payload before the provider callback runs.

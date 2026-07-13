@@ -1059,6 +1059,7 @@ fn push_annotated_input_messages(attributes: &mut Vec<KeyValue>, messages: &[Mes
     for (index, message) in messages.iter().enumerate() {
         let (role, content) = match message {
             Message::System { content, .. } => ("system", Some(content)),
+            Message::Developer { content, .. } => ("developer", Some(content)),
             Message::User { content, .. } => ("user", Some(content)),
             Message::Assistant { content, .. } => ("assistant", content.as_ref()),
             Message::Tool { content, .. } => ("tool", Some(content)),

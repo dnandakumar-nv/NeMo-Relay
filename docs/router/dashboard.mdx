@@ -1,0 +1,147 @@
+---
+title: "Use the Local Router Dashboard"
+sidebar-title: "Local Dashboard"
+description: "Launch and use the embedded, read-only Router operations dashboard."
+position: 11
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+The NeMo Relay CLI includes an embedded Router dashboard for local inspection.
+The dashboard opens the same merged Router configuration and read-only
+inspection service as the other `nemo-relay router` read commands. It does not
+start the gateway, run model calls, migrate the Router database, or mount
+operator mutation routes.
+
+## Launch the Dashboard
+
+Launch the dashboard on an available loopback port:
+
+```bash
+nemo-relay router dashboard
+```
+
+The command opens the system browser by default. The launch URL contains a
+one-time bootstrap value in its fragment. The page removes the fragment before
+it makes a request, exchanges the value for an HttpOnly process-session cookie,
+and keeps filters, cursors, and cached data only in browser memory.
+
+Use headless mode when the CLI cannot open a browser:
+
+```bash
+nemo-relay router dashboard --no-open
+```
+
+Without `--token-file`, headless mode prints the one-time URL to standard
+output. Open that URL in a browser on the same host.
+
+For an automated handoff, direct the URL to a new file:
+
+```bash
+nemo-relay router dashboard \
+  --no-open \
+  --token-file /run/user/$UID/nemo-relay-dashboard.url
+```
+
+The path must not exist. The CLI creates an owner-only regular file and removes
+it after successful bootstrap and during shutdown. The CLI does not print the
+URL when `--token-file` is present.
+
+## Configure Lifetime and Content
+
+The default session exits after 900 seconds without authenticated activity.
+Set a value from 60 through 86,400 seconds when you need a different lifetime:
+
+```bash
+nemo-relay router dashboard --idle-timeout 3600
+```
+
+Authenticated reads refresh the timer. A connected Decisions stream keeps the
+session active. Closing the process invalidates the cookie, closes streams, and
+removes any remaining token file. Relaunch the command to create another
+session.
+
+The dashboard returns redacted previews by default. Enable bounded, secret-
+filtered full inspection content only when the operator and browser are allowed
+to view it:
+
+```bash
+nemo-relay router dashboard --full-content
+```
+
+Full fields remain collapsed in the detail sheet and are bounded in the page.
+Use authenticated Evidence export for complete output.
+
+## Bind a Remote Address
+
+Loopback HTTP is the default. A non-loopback listener requires a concrete
+address, explicit consent, a token file, and a TLS certificate-key pair:
+
+```bash
+nemo-relay router dashboard \
+  --bind 192.0.2.10:7443 \
+  --allow-remote \
+  --token-file /secure/handoff/router-dashboard.url \
+  --tls-cert /secure/tls/router-dashboard.crt \
+  --tls-key /secure/tls/router-dashboard.key \
+  --no-open
+```
+
+The CLI rejects unspecified addresses such as `0.0.0.0`, incomplete TLS
+configuration, and remote launches that omit any required option. The
+certificate must be valid for the concrete host that the browser opens.
+
+## Use the Views
+
+The dashboard provides six read-only views:
+
+- **Overview** shows exact 24-hour decision, assignment, outcome, freshness,
+  queue, lease, vector-index, control, and health state.
+- **Pools** shows configured anchors, candidates, support, policy and generation
+  identity, effective controls, and health. Select a row for full pool detail.
+- **Evidence** filters immutable evidence records and shows their strict
+  partition, generation, evaluation, hashes, vector state, and bounded content.
+  Export streams JSON Lines or CSV without buffering the complete file in page
+  memory.
+- **Neighborhoods** inspects a persisted evidence ID or an exact canonical query
+  hash and partition. It shows ordered neighbors, confidence gates,
+  recommendation facts, and a diagnostic two-dimensional projection. The UI
+  intentionally omits provider-backed request-file lookup.
+- **Decisions** starts with a resumable newest page, follows immutable decisions
+  over a forward-cursor event stream, and falls back to polling if the stream
+  closes. Turn off **Live** to pause it.
+- **Operations** shows current control authority, control history, health events,
+  migrations, generations, queues, and leases. It contains no mutation forms or
+  confirmation actions.
+
+The client polls Overview, Pools, and Operations data every five seconds. It
+pauses polling and the live stream when the page is hidden. A failed refresh
+keeps the last successful data visible and marks it stale. An incompatible
+Inspection API schema stops refresh and displays an incompatibility state.
+
+## Preserve the Read-Only Boundary
+
+The dashboard host fixes the inspection service to read-only mode. Requests
+cannot enable operator routes, request-file embedding, or a broader content
+policy. Use explicit CLI operator commands from [Use Router CLI and
+HTTP](/router/cli-and-http) for pause, force-anchor, learning reset, and cohort
+rotation workflows.
+
+## Troubleshoot the Dashboard
+
+Use these checks for common launch and session failures:
+
+- If launch reports a Router configuration error, confirm that the merged
+  `plugins.toml` layers contain exactly one enabled `kind = "router"`
+  component.
+- If token-file creation fails, choose a new path. Do not create the file in
+  advance or point it at a directory or symbolic link.
+- If browser launch fails, rerun with `--no-open`. The CLI prints the URL only
+  when no token file was requested.
+- If the page reports an unavailable session, close it and relaunch the command.
+  A bootstrap value succeeds only one time and belongs to one process.
+- If browser export is unavailable, use `nemo-relay router evidence export`.
+  Browser export requires support for streaming file creation.
+- If data is stale, use the refresh button and inspect Router database and
+  health status. If the page reports an incompatible API, use a CLI and Router
+  crate from the same release.

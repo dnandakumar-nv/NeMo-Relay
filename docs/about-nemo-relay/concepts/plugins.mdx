@@ -71,6 +71,51 @@ example, an exporter can report delivery failures without changing tool or LLM
 execution semantics. Keep those component-specific failure rules in the
 component guide rather than redefining them in the plugin concept.
 
+### Shutdown Ownership
+
+Most registrations need only deregistration. Rust components that also own
+background tasks, queues, replay transports, or durable work can attach one
+component resource registration with `PluginRegistration::with_shutdown`.
+That registration supplies three idempotent hooks:
+
+- `stop_intake` synchronously closes new scheduling paths.
+- `drain(deadline)` asynchronously finishes or records accepted work and
+  releases drained resources.
+- `abort` synchronously cancels work and releases resources without waiting.
+
+The plugin system stops intake before it flushes queued subscriber callbacks.
+This boundary ensures that a callback queued before shutdown observes closed
+intake and cannot schedule new component work.
+
+Choose the clear API based on the required shutdown behavior:
+
+| API | Component Sequence | Use Case |
+|---|---|---|
+| `clear_plugin_configuration()` | Stop intake, flush subscribers, abort, then deregister in reverse order. | Process exit or another path that requires immediate cancellation. |
+| `clear_plugin_configuration_async(timeout)` | Stop intake, flush subscribers, drain in reverse order under one deadline, abort unfinished work, then deregister in reverse order. | Graceful shutdown for accepted or durable work. |
+
+Async replacement follows the graceful sequence and uses a 30-second default
+deadline. Rust hosts can override it with `PluginInitializationOptions` and
+`initialize_plugins_with_options`. Teardown errors are aggregated after cleanup;
+the old configuration remains cleared. A failed new activation restores the
+previous configuration only when old teardown completed successfully.
+
+Shutdown hooks and deregistration callbacks must establish their closed or
+inert boundary before returning, including when they report a secondary
+cleanup or persistence error. Core retains failed deregistration callbacks for
+retry and blocks later activation until that retained cleanup succeeds. A
+later clear does not re-enter the retained callback; it still stops and removes
+the current active configuration.
+
+A durable component must reconcile work after an immediate abort or process
+crash. Persist or mark accepted work before its drain completes, and inspect
+that state during the next activation. Do not invoke clear or replacement from
+a subscriber callback because the dispatcher cannot wait for its own flush
+barrier.
+
+These hooks belong to embedded Rust component registrations. They do not add a
+field or callback to native plugin ABI v1 or worker `grpc-v1`.
+
 <MermaidStyles />
 
 ```mermaid
@@ -249,4 +294,7 @@ Use these practices when applying the concept in application or integration code
 - Validate plugin config before initialization.
 - Treat plugins as the configuration-driven installation path for runtime
   behavior.
+- Give resource-owning Rust components explicit stop, drain, and abort hooks.
+- Use asynchronous clear for graceful durable-work shutdown and synchronous
+  clear for immediate cancellation.
 - Keep detailed field-by-field config questions in the relevant guide for that plugin component.

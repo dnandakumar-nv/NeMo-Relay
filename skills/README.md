@@ -23,6 +23,7 @@ Use these skills for tasks such as:
 - Instrumenting tool and LLM calls
 - Choosing the current primary documentation track: Rust, Python, or Node.js
 - Tuning performance with adaptive features
+- Inspecting and operating a configured Router rollout
 - Building reusable plugin behavior
 - Setting up observability and trace export
 - Debugging application-side NeMo Relay integrations

@@ -15,7 +15,8 @@ use std::sync::Arc;
 use tokio_stream::Stream;
 
 use crate::api::event::{Event, EventSanitizeFields};
-use crate::api::llm::{LlmRequest, LlmRequestInterceptOutcome};
+use crate::api::llm::{LlmExecutionContextSnapshot, LlmRequest, LlmRequestInterceptOutcome};
+use crate::api::runtime::LlmReplayTransport;
 use crate::api::tool::ToolExecutionInterceptOutcome;
 use crate::codec::request::AnnotatedLlmRequest;
 use crate::error::Result;
@@ -239,6 +240,32 @@ pub type LlmExecutionFn = Arc<
         + Send
         + Sync,
 >;
+
+/// Wrap or replace non-streaming V2 LLM execution with frozen call context.
+///
+/// V2 intercepts receive the same immutable context and optional host-owned
+/// replay transport for the lifetime of one managed call. The continuation is
+/// call-scoped and may be invoked at most once while the callback is active.
+pub type LlmExecutionV2Fn = Arc<
+    dyn Fn(
+            &str,
+            Arc<LlmExecutionContextSnapshot>,
+            LlmRequest,
+            Option<Arc<dyn LlmReplayTransport>>,
+            LlmExecutionNextFn,
+        ) -> Pin<Box<dyn Future<Output = Result<Json>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Internal payload stored in the one mixed V1/V2 execution registry.
+#[derive(Clone)]
+pub(crate) enum LlmExecutionInterceptFn {
+    /// Existing callback invoked by V1 and adapted into V2 calls.
+    V1(LlmExecutionFn),
+    /// Context-aware callback invoked only by V2 managed calls.
+    V2(LlmExecutionV2Fn),
+}
 /// Stream of JSON chunks produced by the managed streaming LLM pipeline.
 pub type LlmJsonStream = Pin<Box<dyn Stream<Item = Result<Json>> + Send>>;
 /// Per-chunk collector used by the streaming LLM runtime.

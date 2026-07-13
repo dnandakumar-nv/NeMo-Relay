@@ -7,9 +7,12 @@ use super::*;
 use nemo_relay::api::event::{
     BaseEvent, CategoryProfile, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
 };
+use nemo_relay::api::llm::LlmCallRole;
 use nemo_relay::api::scope::ScopeType;
 use nemo_relay::codec::response::{AnnotatedLlmResponse, FinishReason};
+use serde_json::json;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Clone, Copy)]
 enum EventType {
@@ -47,6 +50,43 @@ fn make_test_event(
             None,
         )),
     }
+}
+
+fn with_llm_call_role_value(mut event: Event, value: serde_json::Value) -> Event {
+    let Event::Scope(scope) = &mut event else {
+        panic!("LLM role test fixture must be a scope event");
+    };
+    scope
+        .category_profile
+        .get_or_insert_with(CategoryProfile::default)
+        .extra
+        .insert("call_role".to_string(), value);
+    event
+}
+
+fn make_evaluator_llm_event(event_type: EventType, role: LlmCallRole, name: &str) -> Event {
+    let mut event = with_llm_call_role_value(
+        make_test_event(event_type, Some(ScopeType::Llm), Some(name)),
+        json!(role),
+    );
+    let Event::Scope(scope) = &mut event else {
+        unreachable!("evaluator LLM fixture must be a scope event");
+    };
+    scope.base.metadata = Some(json!({
+        "anchor_uuid": Uuid::now_v7().to_string(),
+        "anchor_id": Uuid::now_v7().to_string(),
+        "pool_id": "primary",
+        "candidate_id": name,
+        "config_generation_id": "primary-generation",
+        "learning_generation_id": Uuid::now_v7().to_string(),
+        "call_role": "primary",
+        "name": "primary",
+    }));
+    scope
+        .category_profile
+        .get_or_insert_with(CategoryProfile::default)
+        .model_name = Some("primary-model".to_string());
+    event
 }
 
 // -----------------------------------------------------------------------
@@ -91,6 +131,49 @@ fn test_event_to_call_record_llm_start() {
     assert_eq!(record.name, "gpt-4");
     assert!(record.ended_at.is_none());
     assert!(record.metadata_snapshot.is_none());
+}
+
+#[test]
+fn test_event_to_call_record_accepts_only_primary_llm_starts() {
+    let explicit_primary = with_llm_call_role_value(
+        make_test_event(EventType::Start, Some(ScopeType::Llm), Some("primary")),
+        json!(LlmCallRole::Primary),
+    );
+    assert!(event_to_call_record(&explicit_primary).is_some());
+
+    for role in [LlmCallRole::Shadow, LlmCallRole::Judge] {
+        let event = with_llm_call_role_value(
+            make_test_event(EventType::Start, Some(ScopeType::Llm), Some("internal")),
+            json!(role),
+        );
+        assert!(event_to_call_record(&event).is_none());
+    }
+
+    let malformed = with_llm_call_role_value(
+        make_test_event(EventType::Start, Some(ScopeType::Llm), Some("malformed")),
+        json!("PRIMARY"),
+    );
+    assert!(event_to_call_record(&malformed).is_none());
+}
+
+#[test]
+fn test_evaluator_llm_events_ignore_primary_looking_names_and_metadata() {
+    for (role, name) in [
+        (LlmCallRole::Shadow, "nemo_relay.router.shadow"),
+        (LlmCallRole::Judge, "nemo_relay.router.judge"),
+    ] {
+        for event_type in [EventType::Start, EventType::End] {
+            let event = make_evaluator_llm_event(event_type, role, name);
+            assert!(is_non_primary_llm_event(&event));
+            assert!(event_to_call_record(&event).is_none());
+        }
+
+        let primary = with_llm_call_role_value(
+            make_test_event(EventType::Start, Some(ScopeType::Llm), Some(name)),
+            json!(LlmCallRole::Primary),
+        );
+        assert!(event_to_call_record(&primary).is_some());
+    }
 }
 
 #[test]

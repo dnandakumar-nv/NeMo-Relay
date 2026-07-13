@@ -45,8 +45,8 @@ should install it from npm rather than depend on the Rust crate directly.
 - **Observability exporters**: Subscriber and exporter support for common
   runtime telemetry flows.
 - **Additional entry points**: `nemo-relay-node/typed`,
-  `nemo-relay-node/plugin`, `nemo-relay-node/adaptive`, and
-  `nemo-relay-node/observability`.
+  `nemo-relay-node/plugin`, `nemo-relay-node/router`,
+  `nemo-relay-node/adaptive`, and `nemo-relay-node/observability`.
 
 ## Installation
 
@@ -92,7 +92,116 @@ main().catch((error) => {
 
 The main runtime API is exported from `nemo-relay-node`. Additional entry points
 are available at `nemo-relay-node/typed`, `nemo-relay-node/plugin`,
-`nemo-relay-node/adaptive`, and `nemo-relay-node/observability`.
+`nemo-relay-node/router`, `nemo-relay-node/adaptive`, and
+`nemo-relay-node/observability`.
+
+## Context-Aware LLM Calls
+
+Use `llmCallExecuteV2` when middleware needs an explicit API family, call role,
+and a frozen routing context. The optional replay factory is separate from the
+provider callback. It returns a transport descriptor whose replay callable can
+outlive the anchor call; it never receives the managed `next` continuation. The
+binding freezes and retains the original descriptor until the replay transport
+is released. Host-private state can use non-enumerable or symbol-keyed fields;
+additional enumerable fields invalidate the descriptor.
+
+```js
+const { llmCallExecuteV2 } = require("nemo-relay-node");
+
+const request = {
+  headers: {},
+  content: { model: "model-name", input: "hello" },
+};
+async function callProvider(request, { signal } = {}) {
+  if (signal?.aborted) throw new Error("cancelled");
+  return { model: request.content.model, output: "hello" };
+}
+
+const replayFactory = (context) => ({
+  contractVersion: 1,
+  apiFamily: context.apiFamily,
+  transportIdentity: "prod-openai-us",
+  replay: (request) => {
+    const controller = new AbortController();
+    return {
+      result: callProvider(request, { signal: controller.signal }),
+      cancel: () => controller.abort(),
+    };
+  },
+});
+
+async function main() {
+  const response = await llmCallExecuteV2(
+    "openai.responses",
+    request,
+    callProvider,
+    "openai_responses",
+    "primary",
+    { region: "us" },
+    null,
+    null,
+    null,
+    null,
+    "model-name",
+    "tenant-a",
+    "agent-a",
+    replayFactory,
+  );
+  console.log(response);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+Family and role are closed string enums and are never inferred from the request.
+The factory must return synchronously. Each replay invocation returns its own
+`Promise` and idempotent cancellation callback, so dropping one pending replay
+does not affect siblings. Factory or capability validation failures make replay
+unavailable while leaving the anchor provider result unchanged. Streaming,
+stateful, Shadow, and Judge calls are replay-ineligible.
+
+Plugin configuration has two teardown modes. `clearPluginConfiguration()` and
+`plugin.clear()` stop intake and abort immediately. Use
+`clearPluginConfigurationAsync(timeoutMillis)` or
+`plugin.clearAsync(timeoutMillis)` to flush subscriber callbacks and drain
+component resources under one shared deadline before deregistration.
+
+## Bundled Router
+
+Loading `nemo-relay-node` registers the native Router component. Typed
+configuration builders ship in the same npm package under
+`nemo-relay-node/router`; there is no separate Router npm package.
+
+```javascript
+const plugin = require('nemo-relay-node/plugin');
+const router = require('nemo-relay-node/router');
+
+async function main() {
+  const config = router.defaultConfig({ mode: 'off' });
+  if (router.validateConfig(config).diagnostics.length !== 0) {
+    throw new Error('invalid Router configuration');
+  }
+  await plugin.initialize({
+    version: 1,
+    components: [router.ComponentSpec(config)],
+  });
+  await plugin.clearAsync(30000);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+The builders apply Rust defaults, omit `undefined` values, and emit canonical
+snake-case plugin fields. The native package includes the same V2 replay bridge
+and pinned sqlite-vec capability as the CLI. Node.js can activate all Router
+modes through the generic plugin lifecycle, but Active controls and decision
+inspection are not exposed as Node.js APIs.
 
 ## Documentation
 

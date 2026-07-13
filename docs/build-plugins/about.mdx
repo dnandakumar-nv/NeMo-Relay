@@ -74,5 +74,11 @@ subscribers, or a combination of related runtime behavior. Define the smallest
 JSON-compatible config that can drive that behavior, validate it before
 registration, and keep external objects or callables out of the config document.
 
+If an embedded Rust component also owns background tasks, queues, replay
+transports, or durable work, define its stop, drain, abort, and reconciliation
+behavior before registration. [Register Plugin Behavior](/build-plugins/language-binding/register-behavior)
+documents the component shutdown hooks and the difference between immediate
+and graceful clear.
+
 Use plugins for reusable process-level behavior. Keep request-specific behavior
 scope-local so Relay removes it when the owning scope closes.

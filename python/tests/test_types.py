@@ -368,7 +368,10 @@ class TestConcreteEvents:
         assert tool_end.metadata == {"tool_meta": True, "tool_end": True}
 
         assert llm_start.data == {"headers": request.headers, "content": request.content}
-        assert llm_start.category_profile == {"model_name": "event-model"}
+        assert llm_start.category_profile == {
+            "model_name": "event-model",
+            "call_role": "primary",
+        }
         assert llm_end.uuid == llm_start.uuid
         assert llm_end.data == {"message": "hello"}
         assert llm_end.metadata == {"llm_meta": True, "llm_end": True, "otel.status_code": "OK"}

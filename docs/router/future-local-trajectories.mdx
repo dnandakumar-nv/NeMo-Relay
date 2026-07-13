@@ -1,0 +1,258 @@
+---
+title: "Future-Local Trajectories"
+description: "Understand Router trajectory boundaries, progress, terminal states, hard limits, and shutdown behavior."
+position: 4
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+In `shadow` mode, an eligible sampled anchor can create a bounded observation
+window over later work owned by the same Agent scope. The window is
+future-local: it contains no event at or before the anchor's own end event and
+does not wait on or change the response served to the caller.
+
+The CLI, Python, and Node.js packages register Router automatically. A custom
+Rust host must register `nemo-relay-router` explicitly.
+
+Router stores safe facts in its local SQLite ledger. A pending anchor is
+durable before the coordinator accepts it. Its trajectory and terminal state
+are durable before scheduler handoff. The original provider request, replay
+transport, and authentication state remain memory-only.
+
+## Admission and Anchor Boundary
+
+Every admitted Shadow Primary V2 call attempts bounded registration before
+Router invokes the managed continuation. A successfully enqueued registration
+freezes:
+
+- Physical call, root, immediate parent, and trajectory-owner UUIDs.
+- The owner-to-parent scope path.
+- API family and Primary role.
+
+Router validates and projects that owner path before copying it into the
+coordinator command. A path can contain at most 64 scopes, and its projected
+allocation and canonical form must fit the runtime-wide maximum derived from
+configured window byte limits. A violation records classification loss,
+suppresses sampling, and still invokes the provider exactly once with the
+original request. Any active window that could cross the missing registration
+is rejected rather than silently undercounted.
+
+The attempt occurs even when the call is streaming, stateful, unmatched,
+missing replay, candidate-ineligible, or unsampled. Those calls cannot open a
+window, but a successfully registered call's later end event can be an
+authoritative progress unit for an already accepted same-owner window. A full
+registration channel records classification loss, suppresses new sampling,
+and still serves the call normally.
+
+For an eligible sampled call, Router retains a memory-only sample intent and
+invokes `next` exactly once with the original request. A nonblocking per-pool
+limit derived from `max_pending` bounds intents across the provider await and
+through coordinator command handling. When that limit is full, Router skips the
+sample, drops its replay handle before awaiting the provider, and serves the
+call normally. A provider error, cancellation, response-codec error, or response
+projection that exceeds the configured bound creates no anchor. A successful
+projection is proposed under the same admission epoch immediately before the
+original raw response returns.
+Beyond the required memory-only envelope, replay transport, and truncated
+candidate requests, the intent retains only scalar call/pool settings and
+bounded safe projections across that await. Unknown candidate extension maps
+are removed; a complete pool configuration and rejected-candidate diagnostics
+are not retained.
+
+The anchor end is matched by physical call UUID. It establishes the exclusive
+`capture_after_ingest_seq` boundary and is never included in the retained
+event list. Only same-owner events with a greater sequence can enter the
+window.
+
+## Progress Units
+
+`lookahead.primary_llm_completions` is the shared progress target. One
+physical event contributes at most one unit when it is either:
+
+- The first end event for a later registered same-owner Primary call.
+- A matching enabled lifecycle preset.
+
+The anchor's own end, duplicate ends, unregistered V1 ends, Shadow or Judge
+calls, tools, ordinary marks, and descendant subagent work contribute zero.
+Multiple overlapping windows keep independent boundaries and progress totals
+while sharing immutable projected events.
+
+The supported lifecycle presets are:
+
+| Preset | Exact Match |
+|---|---|
+| `handoff` | An Agent start with normalized metadata `nemo_relay_scope_role = "subagent"`. The boundary event belongs to the parent owner; later child work belongs to the child. |
+| `compaction` | An owner-local mark named `compaction`, or normalized `hook_event_name` equal to `precompact`, `postcompact`, or `compaction`. |
+
+If one event matches both enabled presets, it still contributes one unit.
+Matching is case-sensitive and does not broaden separators or aliases.
+
+## Safe Event Evidence
+
+The subscriber assigns a strictly increasing process-local sequence before
+projection. A retained event contains only:
+
+- Schema version, sequence, UUIDs, kind, phase, category, role, timestamp, and
+  name.
+- Sanitized data and metadata, data-schema identity, and safe scope
+  attributes.
+- Allowlisted codec annotations: model name, tool-call ID, subtype, sanitized
+  normalized request, and safe normalized response.
+- Canonical RFC 8785 size and SHA-256 payload fingerprint.
+
+Raw LLM wire data, provider extras, headers, cookies, authentication,
+transport state, callbacks, and replay implementation state are excluded.
+Credential-shaped keys and transport-container keys are removed recursively.
+Free-form prompt and response text, event data or metadata values, scope
+attributes, event names, and owner-path scope names can be retained as evidence.
+Router does not claim to detect secrets embedded in those strings.
+
+The shared projection uses the largest configured window-byte limit. An event
+that cannot meet its depth, node, string, or byte bound becomes a small
+structural oversize observation. Any window that would capture it is rejected;
+Router never truncates it into apparently valid evidence.
+
+## Closure and Terminal States
+
+A window closes on the first authoritative condition:
+
+| Condition | Terminal |
+|---|---|
+| Progress target reached | `closed / progress_reached` |
+| Owner Agent ends first | `closed / owner_terminated` |
+| Wall deadline expires after the subscriber barrier | `closed / deadline_elapsed` |
+| Graceful shutdown freezes a remaining accepted window | `closed / shutdown` |
+| Event delivery was lost | `rejected / event_loss` |
+| An event count or byte bound was exceeded | `rejected / overflow` |
+| Root, parent, owner, path, or role facts conflict | `rejected / contradictory_ownership` |
+| The window ends before its anchor-end boundary is known | `rejected / canceled_before_anchor_end` |
+| The deadline could not confirm the subscriber barrier | `rejected / rejected_delivery_barrier` |
+
+Progress completion wins when the same physical event also terminates the
+owner. An earlier safety rejection remains authoritative.
+
+Only `progress_reached` has `is_partial = false`. Owner termination,
+deadline, and shutdown are explicit partial windows. The window terminal keeps
+`promotion_eligible = false`. A later full Pass or Fail evaluation can be
+marked eligible for the future learning rollout, while a partial evaluation
+always remains ineligible. Rejected windows never enter candidate evaluation.
+
+## Acknowledgement Order
+
+The coordinator and sole SQLite writer use the following acknowledgement
+order:
+
+1. The sink reserves bounded per-pool batch and candidate capacity, then commits
+   the safe pending anchor through the sole writer.
+2. A proposal becomes accepted only after an exact matching durable pending
+   acknowledgement. Queue-full is a distinct durable terminal;
+   evidence-capacity pressure is a transient refusal that creates no pending
+   fact.
+3. Events can arrive while that acknowledgement is pending, but replay
+   authority cannot cross the delivery boundary.
+4. Closure freezes one canonical terminal payload and hash.
+5. The writer commits the exact trajectory and terminal before an evaluable
+   closed window is delivered.
+6. One delivery transaction creates the sample batch and reserved Shadow
+   attempts. Only its exact acknowledgement transfers the memory-only replay
+   authority to the bounded scheduler.
+7. Rejected windows release after terminal acknowledgement. Closed windows
+   release after delivery acknowledgement.
+
+Retries use the same frozen IDs, payloads, and canonical hashes. Exact retries
+return the existing fact. A different payload for the same identity appends an
+integrity health event and suppresses new sampling rather than guessing. The
+coordinator retains the authoritative closed window and replay transport until
+the matching delivery acknowledgement. The scheduler then owns that replay
+authority until every reserved candidate reaches a terminal state.
+
+## Bounds and Loss
+
+The runtime has explicit bounds for:
+
+- The coordinator command channel.
+- Registered Primary calls and ancestry.
+- Projected Primary owner paths, capped at 64 scopes and configured bytes before
+  cloning.
+- Pre-registration V2 and unresolved V1 staging.
+- Sampled intents awaiting a live response or coordinator handling, capped per
+  pool by `max_pending`.
+- Active coordinator windows, independently capped per pool by `max_pending`.
+- Per-window event count and canonical bytes.
+- Terminal tombstones, sink records, and delivery records.
+
+A full intent limiter skips only the new sample. A full coordinator pool refuses
+only the new proposal. Accepted records are not evicted, and the coordinator
+remains the sole semantic pending-capacity authority.
+A failed event enqueue raises a loss watermark; every window whose capture
+interval crosses that sequence is rejected. A failed Primary registration
+raises a separate classification-loss epoch and suppresses new sampling,
+because a later completion could otherwise be counted without frozen
+authority. If staged or pressure-tracked V1 evidence later resolves to an active
+root, only windows whose capture interval crosses that evidence are rejected;
+pre-boundary unregistered traffic does not poison the window.
+
+## Deadlines and Shutdown
+
+At a wall deadline, a lightweight task calls Core's subscriber flush through
+`spawn_blocking`. The coordinator closes the window only after the barrier
+result returns. This orders already queued progress and owner-end events before
+deadline closure. Barrier failure or cancellation rejects the window instead
+of accepting an unknown prefix.
+
+Stop and drain are distinct:
+
+1. Stop acquires the admission mutex, closes new Primary/sample and Active
+   foreground intake, and advances the admission epoch. The replay-start and
+   provider-start gates also close.
+2. Event ingestion, the actor, timers, sink, and delivery stay live while Core
+   flushes queued subscriber callbacks.
+3. Graceful drain waits for every Active foreground permit, flushes subscribers
+   again, and orders unresolved Active outcome terminalization through the
+   coordinator before joining the outcome actor.
+4. It waits for coordinator acknowledgements, closes scheduler admission,
+   terminalizes queued work, and waits for started evaluator calls and terminal
+   writes within the shared deadline.
+5. Router finishes or cancels currently owned live embedding, background
+   embedding, materialization, and rebuild work within that deadline. It does
+   not drain the durable backlog or wait through retry delays.
+6. Retention and heartbeat stop in order. Router then writes one process-stop
+   event, flushes the writer, and closes readers and the writer.
+7. A pending write already in flight remains authoritative. If acknowledged
+   after shutdown, it receives its frozen shutdown or cancellation terminal.
+
+Immediate abort cannot await the ledger. It closes all admission and start
+gates first, then cancels registered replay work, aborts owned tasks and
+readers, and interrupts SQLite without joining. It does not append a
+process-stop event. A transaction or replay start that already linearized can
+finish atomically. After the process heartbeat expires, the next activation
+reconciles nonterminal work without reconstructing the replay transport.
+
+## Relate Other Modes
+
+This rollout executes counterfactual candidates and Judges after durable
+handoff. For pools with a version-1 `learning` association, it also embeds
+canonicalizable terminal evidence and maintains the derived vector index.
+Recommend mode can query that index to record an observational recommendation,
+but it does not create or advance a future-local window, execute replay, or
+substitute the anchor. The replay transport and candidate requests remain
+memory-only and cross the private scheduler boundary only after the terminal
+trajectory, sample batch, and reserved attempts are durable. Router does not
+reconstruct that transport after a crash.
+
+Active uses a separate protected outcome window rather than a Shadow
+future-local candidate window. Treatment calls do not seed new Shadow work.
+Successful control, holdout, force-anchor, and ordinary anchor fallback calls
+can seed it under the normal sampling limits; paused calls schedule no new
+background work. Refer to [Active Canary and
+Outcomes](/router/active-canary-and-outcomes) for the protected window and its
+second terminal barrier.
+
+Refer to [Shadow Evaluation and Evidence](/router/shadow-evaluation-and-evidence)
+for evaluation semantics, [Embeddings and Vector
+Store](/router/embeddings-and-vector-store) for the post-terminal vectorization
+pipeline, [Router Recommendation
+Confidence](/router/recommendation-confidence) for strict confidence decisions,
+and
+[Ledger Migrations and Recovery](/router/ledger-migrations-and-recovery) for
+restart reconciliation.

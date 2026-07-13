@@ -15,6 +15,7 @@ use nemo_relay::plugins::nemo_guardrails::component::{
 use nemo_relay_adaptive::AdaptiveConfig;
 use nemo_relay_adaptive::plugin_component::ADAPTIVE_PLUGIN_KIND;
 use nemo_relay_pii_redaction::component::{PII_REDACTION_PLUGIN_KIND, PiiRedactionConfig};
+use nemo_relay_router::{ROUTER_PLUGIN_KIND, RouterConfig, RouterMode};
 use serde_json::Map;
 use std::path::PathBuf;
 
@@ -475,6 +476,61 @@ fn component_enablement_shortcuts_clear_and_reset_differ() {
     adaptive.set_enabled(true);
     reset_component_menu_item(adaptive, Some(ComponentMenuAction::Toggle)).unwrap();
     assert!(!adaptive.enabled());
+}
+
+#[test]
+fn router_editor_uses_typed_schema_and_preserves_unknown_config() {
+    let mut existing = Map::new();
+    existing.insert("version".into(), serde_json::json!(1));
+    existing.insert("mode".into(), serde_json::json!("off"));
+    existing.insert(
+        "future_extension".into(),
+        serde_json::json!({"preserve": true}),
+    );
+    let mut config = PluginConfig {
+        version: 1,
+        components: vec![PluginComponentSpec {
+            kind: ROUTER_PLUGIN_KIND.into(),
+            enabled: false,
+            config: existing,
+        }],
+        policy: ConfigPolicy::default(),
+    };
+
+    let mut state = component_router_state(&config).unwrap();
+    assert_eq!(state.config.mode, RouterMode::Off);
+    assert_eq!(
+        state.config.unknown_fields["future_extension"]["preserve"],
+        true
+    );
+    assert!(
+        RouterConfig::editor_schema()
+            .field("pools")
+            .is_some_and(|field| field.kind == EditorFieldKind::Json)
+    );
+    state.config.mode = RouterMode::Shadow;
+    state.set_enabled(true);
+    state.mark_config_touched();
+    store_router_state(&mut config, &state).unwrap();
+
+    let component = config
+        .components
+        .iter()
+        .find(|component| component.kind == ROUTER_PLUGIN_KIND)
+        .unwrap();
+    assert!(component.enabled);
+    assert_eq!(component.config["mode"], "shadow");
+    assert_eq!(component.config["future_extension"]["preserve"], true);
+    assert_eq!(
+        router_summary(&state),
+        "component enabled, mode Shadow, pools 0"
+    );
+    assert!(
+        editable_components(&config)
+            .unwrap()
+            .iter()
+            .any(|component| component.label() == "Router")
+    );
 }
 
 #[test]
@@ -2027,6 +2083,29 @@ fn validate_config_accepts_pii_redaction_component() {
     };
 
     validate_config(&config).unwrap();
+}
+
+#[test]
+fn validate_config_registers_and_accepts_router_component() {
+    let temporary = tempfile::tempdir().unwrap();
+    let config = PluginConfig {
+        components: vec![PluginComponentSpec {
+            kind: ROUTER_PLUGIN_KIND.to_string(),
+            enabled: true,
+            config: json!({
+                "version": 1,
+                "mode": "off",
+                "database_path": temporary.path().join("router.sqlite3")
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        }],
+        ..PluginConfig::default()
+    };
+
+    validate_config(&config).unwrap();
+    assert!(nemo_relay::plugin::lookup_plugin(ROUTER_PLUGIN_KIND).is_some());
 }
 
 #[test]

@@ -152,6 +152,12 @@ def _is_useful_license_text(text: str) -> bool:
     return not _is_unknown_value(text)
 
 
+def _normalize_license_text(text: str) -> str:
+    """Normalize line endings and discard source-file trailing whitespace."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in normalized.split("\n"))
+
+
 def _normalize_license_name(license_name: str) -> str:
     """Normalize common license labels that are equivalent but noisy across metadata sources."""
     normalized = " ".join(license_name.strip().split()).lower()
@@ -376,7 +382,7 @@ def _rust_license_files(crate: dict[str, Any]) -> list[tuple[str, str]]:
             text = path.read_text(encoding="utf-8", errors="replace")
         label = path.name if path.parent == package_dir else str(path)
         if _is_useful_license_text(text):
-            texts.append((label, text))
+            texts.append((label, _normalize_license_text(text)))
     return texts
 
 
@@ -436,6 +442,7 @@ def _render_rust_crate_attribution(
     repo = str(crate.get("repository") or "").strip()
     if not repo:
         repo = f"https://crates.io/crates/{name}"
+    license_text = _normalize_license_text(license_text)
 
     rendered = "".join(
         [

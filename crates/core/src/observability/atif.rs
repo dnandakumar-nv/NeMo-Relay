@@ -25,8 +25,8 @@
 //! | Mark            | *(skipped)*             | Point-in-time telemetry is not a step|
 //! | Scope Start/End | *(skipped)*             | Structural events, not trajectory    |
 //!
-//! The exporter serializes the full collected event stream into a single ATIF
-//! trajectory.
+//! By default, the exporter excludes internal Evaluator and Embedder subtrees
+//! before it serializes the collected event stream into a single ATIF trajectory.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::api::event::{Event, EventNormalizationExt};
+use crate::api::llm::LlmCallRole;
 use crate::api::runtime::EventSubscriberFn;
 use crate::api::subscriber::flush_subscribers;
 use crate::codec::request::{AnnotatedLlmRequest, Message, MessageContent};
@@ -322,6 +323,17 @@ pub struct AtifTrajectory {
 // AtifExporter
 // ---------------------------------------------------------------------------
 
+/// Options controlling which runtime events contribute to an ATIF export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AtifExportOptions {
+    /// Include Evaluator and Embedder subtrees plus non-Primary or malformed-role
+    /// LLM events.
+    ///
+    /// Production trajectory exports exclude these events by default. Enable
+    /// this option only when the complete event stream is needed for diagnostics.
+    pub include_non_primary_llm_calls: bool,
+}
+
 struct AtifExporterState {
     session_id: String,
     agent_info: AtifAgentInfo,
@@ -392,11 +404,25 @@ impl AtifExporter {
         self.try_export()
     }
 
+    /// Export the collected event history with explicit diagnostic options.
+    ///
+    /// The default export excludes Evaluator and Embedder scope subtrees plus
+    /// non-Primary and malformed-role LLM events. Set
+    /// [`AtifExportOptions::include_non_primary_llm_calls`] to include the
+    /// complete buffered event stream.
+    pub fn export_with_options(&self, options: AtifExportOptions) -> Result<AtifTrajectory> {
+        self.try_export_with_options(options)
+    }
+
     /// Try to export the collected event history as an [`AtifTrajectory`].
     ///
     /// This is equivalent to [`AtifExporter::export`] and is retained for
     /// callers that prefer an explicitly fallible method name.
     pub fn try_export(&self) -> Result<AtifTrajectory> {
+        self.try_export_with_options(AtifExportOptions::default())
+    }
+
+    fn try_export_with_options(&self, options: AtifExportOptions) -> Result<AtifTrajectory> {
         flush_subscribers()?;
         let (session_id, agent_info, events) = {
             let state = self.state.lock().unwrap();
@@ -406,7 +432,7 @@ impl AtifExporter {
                 state.events.clone(),
             )
         };
-        let collected_events: Vec<&Event> = events.iter().collect();
+        let collected_events = collect_events_for_atif(&events, options);
         Ok(events_to_trajectory(
             &session_id,
             agent_info,
@@ -422,6 +448,67 @@ impl AtifExporter {
         let mut state = self.state.lock().unwrap();
         state.events.clear();
     }
+}
+
+fn collect_events_for_atif(events: &[Event], options: AtifExportOptions) -> Vec<&Event> {
+    if options.include_non_primary_llm_calls {
+        return events.iter().collect();
+    }
+    let excluded_internal_uuids = internal_subtree_uuids(events);
+    let excluded_llm_uuids = events
+        .iter()
+        .filter(|event| {
+            is_llm_lifecycle_event(event) && event.llm_call_role() != Some(LlmCallRole::Primary)
+        })
+        .map(Event::uuid)
+        .collect::<HashSet<_>>();
+    events
+        .iter()
+        .filter(|event| {
+            !excluded_internal_uuids.contains(&event.uuid())
+                && (!is_llm_lifecycle_event(event) || !excluded_llm_uuids.contains(&event.uuid()))
+        })
+        .collect()
+}
+
+fn internal_subtree_uuids(events: &[Event]) -> HashSet<Uuid> {
+    let mut children_by_parent = HashMap::<Uuid, Vec<Uuid>>::new();
+    let mut pending = Vec::new();
+
+    for event in events {
+        if is_default_excluded_scope_event(event) {
+            pending.push(event.uuid());
+        }
+        if let Some(parent_uuid) = event.parent_uuid() {
+            children_by_parent
+                .entry(parent_uuid)
+                .or_default()
+                .push(event.uuid());
+        }
+    }
+
+    let mut subtree_uuids = HashSet::new();
+    while let Some(uuid) = pending.pop() {
+        if !subtree_uuids.insert(uuid) {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(&uuid) {
+            pending.extend(children.iter().copied());
+        }
+    }
+    subtree_uuids
+}
+
+fn is_default_excluded_scope_event(event: &Event) -> bool {
+    matches!(
+        event.scope_type(),
+        Some(crate::api::scope::ScopeType::Evaluator | crate::api::scope::ScopeType::Embedder)
+    ) && (event.is_scope_start() || event.is_scope_end())
+}
+
+fn is_llm_lifecycle_event(event: &Event) -> bool {
+    event.category().map(|category| category.as_str()) == Some("llm")
+        && (event.is_scope_start() || event.is_scope_end())
 }
 
 // ---------------------------------------------------------------------------

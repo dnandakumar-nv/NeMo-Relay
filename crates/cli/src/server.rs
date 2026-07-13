@@ -17,10 +17,12 @@ use nemo_relay::plugin::dynamic::{
     WorkerPluginLoadSpec, load_native_plugins, load_worker_plugins,
 };
 use nemo_relay::plugin::{
-    PluginComponentSpec, PluginConfig, clear_plugin_configuration, initialize_plugins_exact,
+    PluginComponentSpec, PluginConfig, clear_plugin_configuration,
+    clear_plugin_configuration_async, initialize_plugins_exact,
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_router::register_router_component;
 use reqwest::Client;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -36,6 +38,7 @@ use crate::session::SessionManager;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(300);
+const PLUGIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -138,6 +141,22 @@ pub(crate) async fn serve_listener_with_dynamic(
     .await
 }
 
+pub(crate) async fn probe_router_package_activation(config: Value) -> Result<(), CliError> {
+    let parsed: PluginConfig = serde_json::from_value(config.clone())
+        .map_err(|error| CliError::Config(format!("invalid plugin config: {error}")))?;
+    if !parsed.components.iter().any(|component| {
+        component.enabled && component.kind == nemo_relay_router::ROUTER_PLUGIN_KIND
+    }) {
+        return Err(CliError::Config(
+            "Router package probe requires an enabled Router component".into(),
+        ));
+    }
+    PluginActivation::initialize(Some(config), Vec::new())
+        .await?
+        .clear()
+        .await
+}
+
 type ShutdownFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum ShutdownMode {
@@ -187,7 +206,7 @@ async fn serve_listener_with_dynamic_inner(
     };
     let close_result = sessions.close_all("gateway_shutdown").await;
     let flush_result = nemo_relay::api::runtime::flush_subscribers().map_err(CliError::from);
-    let clear_result = plugin_activation.clear();
+    let clear_result = plugin_activation.clear().await;
     if let Err(serve_error) = serve_result {
         if let Err(close_error) = close_result {
             eprintln!("session teardown failed after server error: {close_error}");
@@ -250,6 +269,7 @@ impl AppState {
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .read_timeout(HTTP_READ_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("gateway HTTP client configuration is valid");
         Self {
@@ -341,6 +361,9 @@ impl PluginActivation {
         register_pii_redaction_component().map_err(|error| {
             CliError::Config(format!("PII redaction plugin registration failed: {error}"))
         })?;
+        register_router_component().map_err(|error| {
+            CliError::Config(format!("Router plugin registration failed: {error}"))
+        })?;
         let native_specs = dynamic_plugins
             .iter()
             .filter(|plugin| plugin.kind == DynamicPluginKind::RustDynamic)
@@ -418,10 +441,11 @@ impl PluginActivation {
         })
     }
 
-    fn clear(mut self) -> Result<(), CliError> {
+    async fn clear(mut self) -> Result<(), CliError> {
         let result = if self.active {
             self.active = false;
-            clear_plugin_configuration()
+            clear_plugin_configuration_async(PLUGIN_SHUTDOWN_TIMEOUT)
+                .await
                 .map_err(|error| CliError::Config(format!("plugin teardown failed: {error}")))?;
             Ok(())
         } else {

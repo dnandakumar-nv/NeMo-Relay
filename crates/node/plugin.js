@@ -8,6 +8,18 @@ const path = require('node:path');
 
 const nativeRequire = createRequire(path.join(__dirname, 'index.js'));
 const lib = nativeRequire('./index.js');
+const MAX_TIMEOUT_MILLIS = 0xffffffff;
+
+function validateTimeoutMillis(timeoutMillis) {
+  if (
+    !Number.isFinite(timeoutMillis) ||
+    !Number.isInteger(timeoutMillis) ||
+    timeoutMillis < 0 ||
+    timeoutMillis > MAX_TIMEOUT_MILLIS
+  ) {
+    throw new RangeError('timeoutMillis must be a finite non-negative integer no greater than 4294967295');
+  }
+}
 
 /**
  * Create an empty plugin configuration.
@@ -93,6 +105,23 @@ function clear() {
 }
 
 /**
+ * Drain and clear the active plugin configuration.
+ *
+ * Stops component intake, flushes queued subscriber callbacks, and gives all
+ * hook-bearing component resources one shared drain deadline before removing
+ * their registrations.
+ *
+ * @param {number} timeoutMillis - Finite non-negative integer timeout in milliseconds.
+ * @returns {Promise<void>} A promise that resolves after teardown completes.
+ * @remarks Failed or timed-out drains are aborted before deregistration. Use
+ * `clear()` when immediate abort semantics are required.
+ */
+async function clearAsync(timeoutMillis) {
+  validateTimeoutMillis(timeoutMillis);
+  return lib.clearPluginConfigurationAsync(timeoutMillis);
+}
+
+/**
  * Return the last successfully activated plugin report.
  *
  * Exposes the most recent activation report emitted by the native plugin system
@@ -162,6 +191,7 @@ module.exports = {
   validate,
   initialize,
   clear,
+  clearAsync,
   report,
   listKinds,
   register,

@@ -1,0 +1,458 @@
+---
+title: "Shadow Evaluation and Evidence"
+description: "Understand how Router evaluates counterfactual candidates and records durable observe-only evidence."
+position: 5
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+> [!IMPORTANT]
+> In `shadow` mode, Router always serves the anchor response. Candidate and
+> Judge calls run later as counterfactual evaluation. Their labels are proxy
+> evidence, not observed production outcomes.
+
+Router uses shadow evaluation to measure whether a cheaper candidate could have
+produced an equivalent response and future-local trajectory. The observe-only
+runtime records the result without substituting a candidate on the Primary
+call.
+
+The CLI, Python, and Node.js packages register Router automatically. A custom
+Rust host must link `nemo-relay-router` and call
+`register_router_component()` before plugin validation or initialization.
+
+## What Shadow Mode Does
+
+For an eligible sampled call, Router performs the following sequence:
+
+1. It invokes the managed Primary continuation exactly once with the original
+   anchor request.
+2. It returns the original anchor value or error unchanged.
+3. After a successful anchor response, it captures a bounded future-local
+   window for the same trajectory owner.
+4. It durably records the pending anchor and reserves scheduler capacity before
+   accepting the window.
+5. After the window closes, it replays each eligible candidate independently on
+   the anchor's replay transport and API family.
+6. It validates each candidate response against the original family, tool, and
+   structured-response contracts.
+7. It judges each deterministically valid candidate against the anchor response
+   and captured trajectory.
+8. It records the complete sanitized evidence and terminal state in the local
+   SQLite ledger.
+
+Shadow, judge, storage, retention, and shutdown failures occur after the anchor
+response is authoritative. They cannot rewrite that response or trigger a
+second anchor provider call.
+
+## Eligibility and Admission
+
+A call can open a shadow window only when all of the following conditions are
+true:
+
+- The V2 call role is `Primary`.
+- The request is non-streaming and has no unsupported provider state, such as an
+  unresolved Responses continuation.
+- The API family is OpenAI Chat Completions, OpenAI Responses, or Anthropic
+  Messages.
+- The request passes an exact decode and encode round trip through the matching
+  Core provider codec.
+- A configured pool matches the frozen call context, family, and anchor model.
+- The host supplies a live replay capability with the current contract version,
+  the same API family, and a bounded non-secret transport identity.
+- At least one candidate supports every capability required by the request.
+- The anchor provider call completes successfully and its response can be
+  projected within the configured bounds.
+
+Responses requests with `previous_response_id` or `store = true` are
+ineligible. Unknown structured-output forms, unsupported provider extras, and
+ambiguous instruction encodings also fail closed. An ineligible or unsampled
+call still follows the original anchor path.
+
+Router must secure both durable pending evidence and the matching scheduler
+reservation before it accepts a sample. Queue saturation records a durable
+`not_scheduled_queue_full` terminal. Evidence-capacity pressure refuses the
+sample before a pending fact is created. Neither condition changes the Primary
+response.
+
+## Candidate and Judge Concurrency
+
+Each pool has separate bounds for accepted batches, candidate work, Shadow
+provider calls, and Judge provider calls:
+
+- `max_pending` bounds accepted batches for the pool.
+- `max_pending * max_candidates_per_sample` bounds the pool's candidate slots.
+- `concurrency.shadow` bounds concurrent candidate provider calls.
+- `concurrency.judge` independently bounds concurrent judge provider calls.
+
+The validated total batch count and candidate-slot count across all pools must
+each be no greater than `65536` and must fit the Tokio semaphore limit. The
+writer command channel is also derived from the checked candidate-slot total and
+is bounded.
+
+Candidates retain the validated `(cost_rank, candidate_id)` order before
+`max_candidates_per_sample` truncation. After admission, each candidate owns one
+reserved slot until its terminal attempt and evidence record are durable.
+Accepted work is not evicted, and one candidate failure does not cancel its
+siblings.
+
+## Isolated Internal Calls
+
+Every candidate or Judge operation runs under a Router-owned `Evaluator` scope
+on a fresh task-local scope stack. The scope records immutable linkage such as
+the anchor, pool, candidate, configuration generation, and learning generation.
+
+Candidate calls use the authoritative `Shadow` role. Initial and repair judge
+calls use the authoritative `Judge` role. Each actual replay start is enclosed
+by one managed V2 call with an exact-once terminal callback. The callback
+rechecks the background-start gate immediately before starting the transport.
+
+Middleware can reject, bypass, or mutate an internal call, but it cannot start
+the replay transport twice. Request mutation, response replacement, multiple
+continuation calls, or callback bypass becomes operational
+`middleware_interference` and produces no quality label.
+
+Internal Router calls remain visible in raw ATOF diagnostics. Router matching
+and sampling reject non-Primary managed LLM calls. Each `Evaluator` uses a
+fresh task-local root, so its descendants do not belong to a Primary
+future-local window. Default ATIF independently removes the complete
+`Evaluator` subtree, and Adaptive excludes the internal LLM roles. Shadow
+evaluation therefore cannot recursively sample itself or advance a Primary
+lookahead window.
+
+Embedding provider operations use a separate fresh-root `Embedder` scope with
+bounded linkage. Operator-controlled profile IDs must not contain sensitive
+values. Default ATIF also excludes each complete Embedder
+subtree, while raw ATOF, OpenTelemetry, OpenInference, and explicit complete
+ATIF diagnostics remain available. Refer to [Embeddings and Vector
+Store](/router/embeddings-and-vector-store#treat-query-content-as-sensitive)
+for the query-disclosure and observability boundary.
+
+## Candidate Response Classification
+
+Router first classifies the complete candidate response with the matching
+provider-family codec and the original memory-only contracts. The classification
+distinguishes deterministic quality evidence from operational uncertainty.
+
+| Classification | Examples | Evidence Result |
+|---|---|---|
+| Deterministic quality failure | Complete readable invalid family shape, response-schema violation, or tool-contract violation | Records `Fail` with `malformed_candidate`, `response_schema`, or `tool_contract`; does not call the judge |
+| Deterministically valid | Complete readable response that satisfies the family, response-schema, and tool contracts | Enters the pairwise judge queue |
+| Operational failure | Transport, authentication, rate limit, timeout, cancellation, unreadable or truncated bytes, ambiguous decode, projection bound, or middleware interference | Records a stable operational class with no quality label |
+
+An operational failure means that Router could not establish a quality result.
+It does not mean that the candidate failed the quality policy, and Router never
+turns it into a negative observation.
+
+## Pairwise Judge
+
+Every deterministically valid candidate is judged independently. The judge uses
+the pool's separately configured model with the anchor's replay transport, API
+family, and endpoint policy. The initial attempt and an optional repair are
+separate managed `Judge` calls, while one Judge concurrency permit covers both.
+
+The canonical judge input contains the following sanitized evidence:
+
+- The versioned Router request projection.
+- The normalized anchor response.
+- Exactly one normalized candidate response.
+- The ordered future-local trajectory, requested and observed horizon, closure
+  trigger, and partial flag.
+- The tool, response-schema, and capability contracts.
+- The immutable prompt, rubric, and output-schema identities.
+
+The version-1 structured output contains the following fields:
+
+| Field | Contract |
+|---|---|
+| `response_equivalence` | Finite number in the inclusive range `[0, 1]`. |
+| `trajectory_equivalence` | Finite number in the inclusive range `[0, 1]`. |
+| `judge_confidence` | Finite number in the inclusive range `[0, 1]`. |
+| `hard_failures` | Unique values from `tool_contract`, `response_schema`, `safety`, and `malformed_candidate`. |
+| `rationale` | Nonempty, NFC-normalized, control-free text within `max_rationale_bytes`. |
+
+Unknown fields, missing fields, invalid numbers, unknown or duplicate hard
+failures, and invalid rationale text make the structured output invalid.
+The provider-facing schema omits JSON Schema `uniqueItems`, which is outside
+the OpenAI strict-schema subset. Router's independent bounded parser still
+rejects duplicate hard-failure values before creating an evaluation.
+
+### Repair Behavior
+
+An invalid structured judge output receives exactly one bounded repair attempt.
+The repair includes the exact invalid output only when it fits the configured
+bound, together with stable validation issues and the exact output schema.
+Oversized output is represented by a structural marker, its hash, and its
+original byte count instead of retaining the full text.
+
+A provider transport failure does not trigger repair. If the repair output is
+also invalid, the evaluation ends as `judge_output_invalid`, records both
+attempts, enters Judge dependency cool-off, and creates no quality label.
+
+## Evaluation Labels
+
+Router applies hard-failure precedence before confidence and numeric gates. The
+version-1 calculation is:
+
+```text
+aggregate = response_weight * response_equivalence
+          + trajectory_weight * trajectory_equivalence
+
+label = Fail, if hard_failures is non-empty
+        Ambiguous, if judge_confidence < judge_confidence_floor
+        Pass, if response_equivalence >= response_floor
+                 and trajectory_equivalence >= trajectory_floor
+                 and aggregate >= pass_threshold
+        Fail, otherwise
+```
+
+The labels have the following meanings:
+
+| Label | Meaning | Binary Evidence |
+|---|---|---|
+| `Pass` | The result satisfies the hard-failure, confidence, component-floor, and aggregate policy. | Yes |
+| `Fail` | A hard failure exists or one of the configured quality gates fails. | Yes |
+| `Ambiguous` | The structured result is valid, but Judge confidence is below the configured floor. | No |
+| No label | An operational failure prevented a quality conclusion. | No |
+
+Scores, weights, the aggregate, and their IEEE-754 representations are durable
+so later verification can reproduce the exact label. The `1e-9` tolerance
+applies only when validating that the two configured weights sum to `1.0`.
+
+## Full, Partial, and Rejected Evidence
+
+Only a window that reaches its configured progress target is non-partial. A
+window closed by owner termination, deadline, or graceful shutdown is partial.
+A partial window can retain an evaluation label for inspection, but it is never
+promotion-eligible. An `Ambiguous` or operational result is also not
+promotion-eligible.
+
+Safety rejections such as event loss, overflow, contradictory ownership, a
+missing anchor boundary, or an unconfirmed delivery barrier are durable rejected
+windows. They are not sent to candidate evaluation.
+
+Recommend mode can consume promotion-eligible evidence, but it does not
+substitute a candidate. Active serving can consume evidence only after its
+separate control and outcome rollout is implemented.
+
+## Use Evidence in Recommend Mode
+
+Recommend searches each candidate's exact evaluator, policy, learning,
+transport, model, decoding, and vector-space partition. It does not mix
+evidence across a broader partition. Every terminal row inside the configured
+radius contributes its trajectory root to the attempted-root and coverage
+denominator, including unlabeled operational, cool-off, shutdown, and orphaned
+outcomes.
+
+A row enters the labeled subset only when it has a promotion-eligible binary
+label. Judge-sourced evidence must also meet the current pool's
+`judge_confidence_floor`; deterministic validation contributes only its exact
+`Fail` result. Router selects at most one labeled observation per trajectory
+root by lowest distance, newest evaluation time, and evaluation UUID, without
+using the label as a tie-breaker. Coverage is the distinct labeled-root count
+divided by the distinct attempted-root count.
+
+Shadow retains and materializes evidence when a pool has a complete learning
+policy, which provides a warm-up path before a mode-only switch to `recommend`.
+Recommend itself performs zero replay calls and schedules no new Shadow or
+Judge work. Refer to [Router Recommendation
+Confidence](/router/recommendation-confidence) for radius weighting, decay,
+effective sample size, candidate correction, and the immutable audit.
+
+## Dependency Cool-Off
+
+Operational provider failures update durable cool-off for only the affected
+dependency:
+
+- A candidate key identifies the API family, replay transport, candidate model,
+  and candidate revision.
+- A Judge key identifies the API family, replay transport, Judge model and
+  revision, and prompt, rubric, and schema policy. It does not include the
+  candidate model.
+
+Consecutive operational failures use the following capped exponential delay:
+
+```text
+cooloff_n = min(
+  max_cooloff_seconds,
+  base_cooloff_seconds * 2^(n - 1)
+)
+```
+
+The exponent saturates safely. While a key is cooling off, Router records new
+work for that key as `skipped_cooloff`; unrelated candidates, judges, and pools
+continue. A successful matching operation resets its failure count. A valid
+Judge result, including `Ambiguous`, resets Judge cool-off.
+
+Deterministic quality failures, local queue or evidence pressure, database
+failures, and shutdown cancellation do not increment provider cool-off.
+
+## Durable and Private Evidence
+
+The ledger records versioned, bounded evidence needed to reproduce an
+evaluation. This includes immutable project, configuration, policy, and learning
+generation identities; safe request and routing projections; normalized anchor
+and candidate responses; ordered trajectory events; attempt states; evaluation
+scores and labels; stable operational classes; and canonical hashes.
+
+The ledger does not persist the following data:
+
+- Request headers, cookies, authentication headers, or bearer material.
+- Replay transport state, callbacks, endpoint credentials, or environment
+  values.
+- The original lossless request envelope.
+- Raw tenant or agent identifiers and unselected metadata.
+- Secret or write-only schema properties removed by the sanitizer.
+- Raw provider error strings, response bodies, SQL, or filesystem paths in
+  durable error records.
+
+Sanitization removes recognized credential-shaped fields and enforces depth,
+node, string, array, and byte bounds. It does not claim to discover credentials
+embedded in ordinary free-form prompt or response text, retained event data or
+metadata values, scope attributes, event names, or owner-path scope names.
+Treat the project-local Router database as sensitive application data even
+though its filesystem permissions are restricted.
+
+When a pool enables vectorization, canonical System and Developer
+instructions, the selected User task, and bounded context are retained while a
+job, embedding, or evidence link references their canonical query. Every
+embedding call sends that canonical document to the configured endpoint,
+including a loopback endpoint.
+
+## Run Opt-In Live-Provider Validation
+
+The source tree includes one ignored test that sends real candidate and Judge
+requests for all three API families. It is not part of the default test suite
+and can incur provider charges. The test configuration contains endpoint,
+model, revision, and credential environment-variable names only. Do not put a
+credential value in the JSON file.
+
+Use the following strict version 1 shape and replace every placeholder:
+
+```json
+{
+  "version": 1,
+  "profiles": [
+    {
+      "family": "openai_chat_completions",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "transport_identity": "live-openai-chat-v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "candidate_model": "PINNED_MODEL",
+      "candidate_model_revision": "PINNED_REVISION",
+      "judge_model": "PINNED_MODEL",
+      "judge_model_revision": "PINNED_REVISION"
+    },
+    {
+      "family": "openai_responses",
+      "endpoint": "https://api.openai.com/v1/responses",
+      "transport_identity": "live-openai-responses-v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "candidate_model": "PINNED_MODEL",
+      "candidate_model_revision": "PINNED_REVISION",
+      "judge_model": "PINNED_MODEL",
+      "judge_model_revision": "PINNED_REVISION"
+    },
+    {
+      "family": "anthropic_messages",
+      "endpoint": "https://api.anthropic.com/v1/messages",
+      "transport_identity": "live-anthropic-v1",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "candidate_model": "PINNED_MODEL",
+      "candidate_model_revision": "PINNED_REVISION",
+      "judge_model": "PINNED_MODEL",
+      "judge_model_revision": "PINNED_REVISION",
+      "anthropic_version": "PINNED_API_VERSION"
+    }
+  ]
+}
+```
+
+Omitting `provider` selects the official provider audience above. To validate
+all three wire families against NVIDIA Inference with the umbrella acceptance
+models, use this profile instead:
+
+```json
+{
+  "version": 1,
+  "profiles": [
+    {
+      "provider": "nvidia_inference",
+      "family": "openai_chat_completions",
+      "endpoint": "https://inference-api.nvidia.com/v1/chat/completions",
+      "transport_identity": "nvidia-inference-chat-v1",
+      "api_key_env": "INFERENCE_API_KEY",
+      "candidate_model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "candidate_model_revision": "nvidia-inference-2026-07-11",
+      "judge_model": "openai/openai/gpt-5.5",
+      "judge_model_revision": "nvidia-inference-2026-07-11",
+      "judge_temperature": 1.0
+    },
+    {
+      "provider": "nvidia_inference",
+      "family": "openai_responses",
+      "endpoint": "https://inference-api.nvidia.com/v1/responses",
+      "transport_identity": "nvidia-inference-responses-v1",
+      "api_key_env": "INFERENCE_API_KEY",
+      "candidate_model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "candidate_model_revision": "nvidia-inference-2026-07-11",
+      "judge_model": "openai/openai/gpt-5.5",
+      "judge_model_revision": "nvidia-inference-2026-07-11",
+      "judge_temperature": 1.0
+    },
+    {
+      "provider": "nvidia_inference",
+      "family": "anthropic_messages",
+      "endpoint": "https://inference-api.nvidia.com/v1/messages",
+      "transport_identity": "nvidia-inference-messages-v1",
+      "api_key_env": "INFERENCE_API_KEY",
+      "candidate_model": "nvidia/deepseek-ai/deepseek-v4-pro",
+      "candidate_model_revision": "nvidia-inference-2026-07-11",
+      "judge_model": "openai/openai/gpt-5.5",
+      "judge_model_revision": "nvidia-inference-2026-07-11",
+      "judge_temperature": 1.0,
+      "anthropic_version": "2023-06-01"
+    }
+  ]
+}
+```
+
+The file must contain exactly one profile for each family. Official OpenAI
+profiles are pinned to `api.openai.com` and `OPENAI_API_KEY`; the official
+Anthropic profile is pinned to `api.anthropic.com` and `ANTHROPIC_API_KEY`.
+NVIDIA Inference profiles are pinned to `inference-api.nvidia.com`, the exact
+family path, bearer authentication, and `INFERENCE_API_KEY`. Every endpoint
+must use its exact `/v1` family path and contain no user information, query, or
+fragment. Arbitrary endpoints and credential-variable aliases are deliberately
+rejected. Unknown fields are rejected. The named credential values remain
+host-owned environment state. `judge_temperature` is copied into the Router
+Judge policy; omit it to retain `0.0`, or use `1.0` for the pinned NVIDIA
+Inference GPT-5.5 profile shown above.
+
+Run the ignored test explicitly from the repository root:
+
+```bash
+NEMO_RELAY_RUN_ROUTER_LIVE_PROVIDER_TESTS=1 \
+NEMO_RELAY_ROUTER_LIVE_PROVIDER_CONFIG=/absolute/path/providers.json \
+cargo test -p nemo-relay-router --all-features \
+  'scheduler::tests::live_provider_tests::live_three_family_provider_evidence_is_correlated_and_secret_free' \
+  -- --ignored --exact --test-threads=1
+```
+
+The test permits exactly one candidate call and one initial Judge call per
+family. Its transport refuses a third start before creating network work, so an
+invalid initial Judge result cannot spend a repair call. The success assertion
+still requires the initial Judge result to be valid. The test checks the durable
+correlation graph, SQLite integrity and foreign keys, unchanged frozen anchor
+evidence, and absence of credential bytes from every readable database, WAL,
+shared-memory, and journal artifact; a missing sidecar is allowed, but any other
+read failure fails the audit. It maps provider errors to fixed text and does not
+print request or response bodies. Avoid `--nocapture` when running it with real
+credentials.
+
+Embedding requests, derived vector indexing, and recommendation-time strict
+neighbor lookup are part of this rollout for associated pools. Active mode can
+use that evidence for bounded candidate treatment, protected production
+outcomes, and Rust operator controls; refer to [Active Canary and
+Outcomes](/router/active-canary-and-outcomes). Use [Inspect and Control
+Router](/router/inspection-and-control) to read verified evidence and
+neighborhoods or export redacted records.

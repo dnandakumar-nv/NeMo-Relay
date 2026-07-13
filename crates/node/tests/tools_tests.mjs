@@ -294,21 +294,22 @@ describe('Tool execute', () => {
         /tool status failure/,
       );
 
-      await waitForSubscriberCallbacks(() =>
-        events.some(
-          (e) =>
-            e.name === 'exec_status_ok_tool' &&
-            e.kind === 'scope' &&
-            e.category === 'tool' &&
-            e.scope_category === 'end',
-        ) &&
-        events.some(
-          (e) =>
-            e.name === 'exec_status_error_tool' &&
-            e.kind === 'scope' &&
-            e.category === 'tool' &&
-            e.scope_category === 'end',
-        ),
+      await waitForSubscriberCallbacks(
+        () =>
+          events.some(
+            (e) =>
+              e.name === 'exec_status_ok_tool' &&
+              e.kind === 'scope' &&
+              e.category === 'tool' &&
+              e.scope_category === 'end',
+          ) &&
+          events.some(
+            (e) =>
+              e.name === 'exec_status_error_tool' &&
+              e.kind === 'scope' &&
+              e.category === 'tool' &&
+              e.scope_category === 'end',
+          ),
       );
       const okEnd = events.find(
         (e) =>
@@ -659,8 +660,7 @@ describe('Tool intercepts', () => {
       await waitForSubscriberCallbacks(
         () =>
           events.some(
-            (event) =>
-              event.name === 'replaced_tool' && event.kind === 'scope' && event.scope_category === 'end',
+            (event) => event.name === 'replaced_tool' && event.kind === 'scope' && event.scope_category === 'end',
           ) && events.some((event) => event.name === 'node.tool.execution'),
       );
       const start = events.find(

@@ -18,6 +18,7 @@ fn request(messages: Vec<Message>, tools: Option<Vec<ToolDefinition>>) -> Annota
         params: None,
         tools,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -42,6 +43,7 @@ fn sample_tool(name: &str) -> ToolDefinition {
             name: name.to_string(),
             description: Some("desc".to_string()),
             parameters: Some(json!({"type":"object","properties":{"a":{"type":"string"}}})),
+            strict: None,
         },
     }
 }
@@ -156,6 +158,31 @@ fn acg_profile_image_parts_contribute_stable_fingerprint_signal() {
         learning_seed_fingerprint(&with_image_a),
         learning_seed_fingerprint(&with_image_b)
     );
+}
+
+#[test]
+fn acg_profile_tracks_developer_role_and_instruction_fingerprint() {
+    let developer_only = request(
+        vec![Message::Developer {
+            content: MessageContent::Text("Return JSON.".to_string()),
+            name: None,
+        }],
+        None,
+    );
+    let changed_developer = request(
+        vec![Message::Developer {
+            content: MessageContent::Text("Return YAML.".to_string()),
+            name: None,
+        }],
+        None,
+    );
+
+    assert!(derive_acg_profile_key("agent", &developer_only).contains("roles=developer"));
+    assert_ne!(
+        system_prompt_fingerprint(&developer_only),
+        system_prompt_fingerprint(&changed_developer)
+    );
+    assert_eq!(learning_seed_fingerprint(&developer_only), "no-seed");
 }
 
 #[test]

@@ -20,6 +20,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 nemo-relay = { workspace = true, features = ["atof-streaming", "otel", "openinference"] }
 nemo-relay-adaptive = { workspace = true, features = ["redis-backend"] }
 nemo-relay-pii-redaction.workspace = true
+nemo-relay-router.workspace = true
 chrono = "0.4"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -30,3 +31,6 @@ tokio-stream = "0.1"
 
 [build-dependencies]
 cbindgen = "0.29.2"
+
+[dev-dependencies]
+tempfile = "3"

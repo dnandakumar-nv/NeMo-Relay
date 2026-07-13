@@ -113,7 +113,12 @@ export interface LlmOptimizationContribution {
   token_impact?: LlmOptimizationTokenImpact;
   payload_schema?: LlmOptimizationDataSchema;
   payload?: Json;
-  [key: string]: Json | undefined;
+  [key: string]:
+    | Json
+    | LlmOptimizationModelTransition
+    | LlmOptimizationTokenImpact
+    | LlmOptimizationDataSchema
+    | undefined;
 }
 
 /** Canonical result returned by an LLM request intercept. */
@@ -308,6 +313,19 @@ export declare function initialize(config: PluginConfig): Promise<ConfigReport>;
  * cleared.
  */
 export declare function clear(): void;
+/**
+ * Drain and clear the active plugin configuration.
+ *
+ * Stops component intake, flushes queued subscriber callbacks, and gives all
+ * hook-bearing component resources one shared drain deadline before removing
+ * their registrations.
+ *
+ * @param timeoutMillis - Finite non-negative integer timeout in milliseconds.
+ * @returns A promise that resolves after teardown completes.
+ * @remarks Failed or timed-out drains are aborted before deregistration. Use
+ * `clear()` when immediate abort semantics are required.
+ */
+export declare function clearAsync(timeoutMillis: number): Promise<void>;
 /**
  * Return the last successfully activated plugin report.
  *

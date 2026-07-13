@@ -48,7 +48,16 @@ live OTLP spans.
 
 ## Important Semantics
 
-- ATIF exports the full event buffer collected so far.
+- The exporter retains the full raw event buffer, but the default ATIF
+  projection includes only legacy or explicitly `primary` LLM lifecycle pairs.
+  `shadow`, `judge`, malformed-role, and mismatched-role pairs stay available
+  to raw ATOF subscribers without contaminating evaluation trajectories.
+- The default projection also removes complete `Evaluator` and `Embedder`
+  subtrees, including descendants that arrive before their internal scope start
+  event. Raw ATOF subscribers retain those events.
+- Rust callers that need a diagnostic trajectory can use
+  `export_with_options` with `include_non_primary_llm_calls` enabled. Do not use
+  that opt-in trajectory as an ordinary evaluation input.
 - Consecutive tool observations can be merged into one system observation step.
 - Trajectories reflect sanitized event payloads, not raw secrets that
   sanitize guardrails removed before event emission.
@@ -61,6 +70,7 @@ live OTLP spans.
 - [ ] Exporter registered before the relevant run
 - [ ] Scope boundaries are correct so ancestry is meaningful
 - [ ] Export timing is clear: whole buffer vs clear-between-runs
+- [ ] Export policy is clear: Primary-only default vs diagnostic role-inclusive
 - [ ] LLM responses include `tool_calls` if ATIF tool-call entries are expected
 
 ## Related Skills

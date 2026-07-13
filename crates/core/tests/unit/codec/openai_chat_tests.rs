@@ -572,6 +572,45 @@ fn test_decode_request_full() {
 }
 
 #[test]
+fn test_tool_strictness_round_trips() {
+    let codec = OpenAIChatCodec;
+
+    for strict in [Some(true), Some(false), None] {
+        let mut function = json!({
+            "name": "lookup",
+            "description": "Look up data",
+            "parameters": {"type": "object"}
+        });
+        if let Some(strict) = strict {
+            function["strict"] = json!(strict);
+        }
+        let native_tools = json!([{"type": "function", "function": function}]);
+        let request = make_request(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": native_tools.clone()
+        }));
+
+        let annotated = codec.decode(&request).unwrap();
+        assert_eq!(annotated.tools.as_ref().unwrap()[0].function.strict, strict);
+
+        let encoded = codec.encode(&annotated, &request).unwrap();
+        assert_eq!(encoded.content["tools"], native_tools);
+    }
+
+    assert!(
+        codec
+            .decode(&make_request(json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "lookup", "strict": null}
+                }]
+            })))
+            .is_err()
+    );
+}
+
+#[test]
 fn test_decode_request_max_completion_tokens() {
     let codec = OpenAIChatCodec;
     let request = make_request(json!({
@@ -598,9 +637,166 @@ fn test_decode_request_extra_fields() {
     assert_eq!(annotated.stream, Some(true));
     assert_eq!(annotated.extra.get("seed"), Some(&json!(42)));
     assert_eq!(
-        annotated.extra.get("response_format"),
-        Some(&json!({"type": "json_object"}))
+        annotated
+            .response_format
+            .as_ref()
+            .map(|format| &format.kind),
+        Some(&StructuredResponseFormatKind::JsonObject)
     );
+    assert!(!annotated.extra.contains_key("response_format"));
+}
+
+#[test]
+fn test_chat_developer_and_json_schema_round_trip_losslessly() {
+    let codec = OpenAIChatCodec;
+    let original = make_request(json!({
+        "messages": [
+            {"role": "system", "content": "system fact"},
+            {"role": "developer", "content": "developer fact", "name": "policy"},
+            {"role": "user", "content": "hello"}
+        ],
+        "model": "gpt-4.1",
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                "strict": true,
+                "description": "future descriptor field"
+            },
+            "future_wrapper": 7
+        },
+        "future_request_field": {"keep": true}
+    }));
+
+    let annotated = codec.decode(&original).unwrap();
+    assert!(matches!(annotated.messages[0], Message::System { .. }));
+    assert!(matches!(annotated.messages[1], Message::Developer { .. }));
+    assert!(matches!(annotated.messages[2], Message::User { .. }));
+    let format = annotated.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, StructuredResponseFormatKind::JsonSchema);
+    assert_eq!(format.name.as_deref(), Some("answer"));
+    assert_eq!(
+        format.schema,
+        Some(json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}}
+        }))
+    );
+    assert_eq!(format.strict, Some(true));
+    assert_eq!(
+        format.extra.get("native_wrapper"),
+        Some(&json!({"future_wrapper": 7}))
+    );
+    assert_eq!(
+        format.extra.get("native_format"),
+        Some(&json!({"description": "future descriptor field"}))
+    );
+    assert!(!annotated.extra.contains_key("response_format"));
+
+    let encoded = codec.encode(&annotated, &original).unwrap();
+    assert_eq!(encoded, original);
+}
+
+#[test]
+fn test_chat_model_rewrite_preserves_null_content_and_native_message_fields() {
+    let codec = OpenAIChatCodec;
+    let original = make_request(json!({
+        "messages": [{
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }],
+            "provider_message_field": true
+        }],
+        "model": "gpt-4.1"
+    }));
+
+    let mut annotated = codec.decode(&original).unwrap();
+    annotated.model = Some("gpt-4.1-mini".into());
+    let encoded = codec.encode(&annotated, &original).unwrap();
+
+    let mut expected = original;
+    expected.content["model"] = json!("gpt-4.1-mini");
+    assert_eq!(encoded, expected);
+    assert!(encoded.content["messages"][0]["content"].is_null());
+    assert_eq!(
+        encoded.content["messages"][0]["provider_message_field"],
+        json!(true)
+    );
+}
+
+#[test]
+fn test_chat_json_object_and_unknown_format_round_trip() {
+    let codec = OpenAIChatCodec;
+    let json_object = make_request(json!({
+        "messages": [{"role": "user", "content": "hello"}],
+        "model": "gpt-4.1",
+        "response_format": {"type": "json_object", "future": "kept"}
+    }));
+    let annotated = codec.decode(&json_object).unwrap();
+    let format = annotated.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, StructuredResponseFormatKind::JsonObject);
+    assert_eq!(
+        format.extra.get("native_format"),
+        Some(&json!({"future": "kept"}))
+    );
+    assert_eq!(codec.encode(&annotated, &json_object).unwrap(), json_object);
+
+    let unknown = make_request(json!({
+        "messages": [{"role": "user", "content": "hello"}],
+        "model": "gpt-4.1",
+        "response_format": {"type": "grammar", "grammar": "root ::= 'ok'"}
+    }));
+    let annotated = codec.decode(&unknown).unwrap();
+    assert!(annotated.response_format.is_none());
+    assert_eq!(
+        annotated.extra.get("response_format"),
+        unknown.content.get("response_format")
+    );
+    assert_eq!(codec.encode(&annotated, &unknown).unwrap(), unknown);
+}
+
+#[test]
+fn test_chat_strict_request_and_structured_format_errors() {
+    let codec = OpenAIChatCodec;
+    let bad_messages = make_request(json!({
+        "messages": [{"role": "unknown", "content": "hello"}],
+        "model": "gpt-4.1"
+    }));
+    let error = codec.decode(&bad_messages).unwrap_err().to_string();
+    assert!(error.contains("OpenAI Chat messages decode"));
+
+    let bad_format = make_request(json!({
+        "messages": [],
+        "model": "gpt-4.1",
+        "response_format": {"type": "json_schema", "json_schema": {"name": "answer"}}
+    }));
+    let error = codec.decode(&bad_format).unwrap_err().to_string();
+    assert!(error.contains("json_schema.schema is required"));
+
+    let ambiguous = make_request(json!({
+        "messages": [],
+        "model": "gpt-4.1",
+        "response_format": {"type": "json_object", "schema": {"type": "object"}}
+    }));
+    let error = codec.decode(&ambiguous).unwrap_err().to_string();
+    assert!(error.contains("json_object contains json_schema-only fields"));
+
+    let original = make_request(json!({"messages": [], "model": "gpt-4.1"}));
+    let mut annotated = codec.decode(&original).unwrap();
+    annotated.response_format = Some(StructuredResponseFormat {
+        kind: StructuredResponseFormatKind::JsonObject,
+        name: None,
+        schema: Some(json!({"type": "object"})),
+        strict: None,
+        extra: serde_json::Map::new(),
+    });
+    let error = codec.encode(&annotated, &original).unwrap_err().to_string();
+    assert!(error.contains("json_object cannot include name, schema, or strict"));
 }
 
 #[test]
@@ -875,9 +1071,11 @@ fn test_helper_and_error_paths_cover_remaining_chat_branches() {
                 name: "lookup".into(),
                 description: Some("Look up data".into()),
                 parameters: Some(json!({"type": "object"})),
+                strict: None,
             },
         }]),
         tool_choice: Some(ToolChoice::Required),
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -934,6 +1132,7 @@ fn test_encode_injects_stream_options_on_streaming_request() {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -979,6 +1178,7 @@ fn test_encode_preserves_caller_stream_options() {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -1022,6 +1222,7 @@ fn test_encode_does_not_inject_stream_options_on_non_streaming() {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

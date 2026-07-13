@@ -586,6 +586,7 @@ fn test_stream_request_event_and_handle_wrappers_cover_remaining_methods() {
             params: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
             store: None,
             previous_response_id: None,
             truncation: None,
@@ -1041,23 +1042,38 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
             &json!({"temperature": 0.2, "max_tokens": 64, "top_p": 0.9, "stop": ["DONE"]}),
         )
         .unwrap();
-        let tools = json_to_py(
-            py,
-            &json!([{
+        let expected_tools = json!([
+            {
                 "type": "function",
                 "function": {
-                    "name": "lookup",
-                    "description": "Look up weather",
+                    "name": "strict_true",
+                    "parameters": {"type": "object"},
+                    "strict": true
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "strict_false",
+                    "parameters": {"type": "object"},
+                    "strict": false
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "strict_omitted",
                     "parameters": {"type": "object"}
                 }
-            }]),
-        )
-        .unwrap();
+            }
+        ]);
+        let tools = json_to_py(py, &expected_tools).unwrap();
         let tool_choice = json_to_py(
             py,
             &json!({"type": "function", "function": {"name": "lookup"}}),
         )
         .unwrap();
+        let response_format = json_to_py(py, &json!({"kind": "json_object"})).unwrap();
         let extra = json_to_py(py, &json!({"provider": "test"})).unwrap();
 
         let mut annotated = PyAnnotatedLLMRequest::new(
@@ -1066,6 +1082,7 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
             Some(params.bind(py)),
             Some(tools.bind(py)),
             Some(tool_choice.bind(py)),
+            Some(response_format.bind(py)),
             Some(extra.bind(py)),
         )
         .unwrap();
@@ -1086,12 +1103,16 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
             json!(64)
         );
         assert_eq!(
-            py_to_json(annotated.tools(py).unwrap().bind(py)).unwrap()[0]["function"]["name"],
-            json!("lookup")
+            py_to_json(annotated.tools(py).unwrap().bind(py)).unwrap(),
+            expected_tools
         );
         assert_eq!(
             py_to_json(annotated.tool_choice(py).unwrap().bind(py)).unwrap()["function"]["name"],
             json!("lookup")
+        );
+        assert_eq!(
+            py_to_json(annotated.response_format(py).unwrap().bind(py)).unwrap()["kind"],
+            json!("json_object")
         );
         assert_eq!(
             py_to_json(annotated.extra(py).unwrap().bind(py)).unwrap()["provider"],
@@ -1117,15 +1138,37 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
         annotated.set_model(Some("updated-model".into()));
         let updated_params = json_to_py(py, &json!({"temperature": 0.7})).unwrap();
         annotated.set_params(updated_params.bind(py)).unwrap();
-        let updated_tools = json_to_py(
-            py,
-            &json!([{
+        let expected_updated_tools = json!([
+            {
                 "type": "function",
-                "function": {"name": "updated", "parameters": {"type": "object"}}
-            }]),
-        )
-        .unwrap();
+                "function": {
+                    "name": "updated_false",
+                    "parameters": {"type": "object"},
+                    "strict": false
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "updated_omitted",
+                    "parameters": {"type": "object"}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "updated_true",
+                    "parameters": {"type": "object"},
+                    "strict": true
+                }
+            }
+        ]);
+        let updated_tools = json_to_py(py, &expected_updated_tools).unwrap();
         annotated.set_tools(updated_tools.bind(py)).unwrap();
+        assert_eq!(
+            py_to_json(annotated.tools(py).unwrap().bind(py)).unwrap(),
+            expected_updated_tools
+        );
         let updated_choice = json_to_py(py, &json!("auto")).unwrap();
         annotated.set_tool_choice(updated_choice.bind(py)).unwrap();
         annotated.set_store(Some(true));
@@ -1184,6 +1227,7 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
         annotated.set_params(py.None().bind(py)).unwrap();
         annotated.set_tools(py.None().bind(py)).unwrap();
         annotated.set_tool_choice(py.None().bind(py)).unwrap();
+        annotated.set_response_format(py.None().bind(py)).unwrap();
         annotated.set_truncation(py.None().bind(py)).unwrap();
         annotated.set_reasoning(py.None().bind(py)).unwrap();
         annotated.set_include(py.None().bind(py)).unwrap();
@@ -1191,15 +1235,17 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
         assert!(annotated.params(py).unwrap().bind(py).is_none());
         assert!(annotated.tools(py).unwrap().bind(py).is_none());
         assert!(annotated.tool_choice(py).unwrap().bind(py).is_none());
+        assert!(annotated.response_format(py).unwrap().bind(py).is_none());
         assert!(annotated.truncation(py).unwrap().bind(py).is_none());
         assert!(annotated.reasoning(py).unwrap().bind(py).is_none());
         assert!(annotated.include(py).unwrap().bind(py).is_none());
         assert!(annotated.metadata(py).unwrap().bind(py).is_none());
 
         let bad_messages = json_to_py(py, &json!([{"content": "missing role"}])).unwrap();
-        let err = PyAnnotatedLLMRequest::new(bad_messages.bind(py), None, None, None, None, None)
-            .err()
-            .unwrap();
+        let err =
+            PyAnnotatedLLMRequest::new(bad_messages.bind(py), None, None, None, None, None, None)
+                .err()
+                .unwrap();
         assert!(err.to_string().contains("invalid messages"));
         let bad_params = json_to_py(py, &json!({"temperature": "hot"})).unwrap();
         assert!(annotated.set_params(bad_params.bind(py)).is_err());
@@ -1207,6 +1253,12 @@ fn test_annotated_llm_types_and_builtin_codecs_cover_mutators_and_codecs() {
         assert!(annotated.set_tools(bad_tools.bind(py)).is_err());
         let bad_choice = json_to_py(py, &json!({"bad": true})).unwrap();
         assert!(annotated.set_tool_choice(bad_choice.bind(py)).is_err());
+        let bad_response_format = json_to_py(py, &json!({"kind": "xml"})).unwrap();
+        assert!(
+            annotated
+                .set_response_format(bad_response_format.bind(py))
+                .is_err()
+        );
         let bad_extra = PyList::empty(py);
         assert!(annotated.set_extra(&bad_extra.into_any()).is_err());
 
@@ -1487,9 +1539,17 @@ fn test_forced_serialization_error_hooks_cover_unreachable_wrappers() {
                         name: "lookup".into(),
                         description: None,
                         parameters: Some(json!({"type": "object"})),
+                        strict: None,
                     },
                 }]),
                 tool_choice: Some(nemo_relay::codec::request::ToolChoice::Auto),
+                response_format: Some(nemo_relay::codec::request::StructuredResponseFormat {
+                    kind: nemo_relay::codec::request::StructuredResponseFormatKind::JsonObject,
+                    name: None,
+                    schema: None,
+                    strict: None,
+                    extra: serde_json::Map::new(),
+                }),
                 store: None,
                 previous_response_id: None,
                 truncation: None,
@@ -1583,6 +1643,11 @@ fn test_forced_serialization_error_hooks_cover_unreachable_wrappers() {
                 FORCE_ANNOTATED_REQUEST_TOOL_CHOICE_SERIALIZATION_ERROR,
                 "forced serialization failure",
                 |py, _, annotated, _| annotated.tool_choice(py).map(|_| ()),
+            ),
+            (
+                FORCE_ANNOTATED_REQUEST_RESPONSE_FORMAT_SERIALIZATION_ERROR,
+                "forced serialization failure",
+                |py, _, annotated, _| annotated.response_format(py).map(|_| ()),
             ),
             (
                 FORCE_ANNOTATED_RESPONSE_MESSAGE_SERIALIZATION_ERROR,

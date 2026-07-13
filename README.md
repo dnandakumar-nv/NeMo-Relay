@@ -30,6 +30,7 @@ shared runtime for scopes, policy, plugins, and lifecycle events.
 | Use LangChain, LangGraph, Deep Agents, or OpenClaw | [Supported Integrations](https://docs.nvidia.com/nemo/relay/supported-integrations/about) |
 | Build a framework or provider integration | [Integrate into Frameworks](https://docs.nvidia.com/nemo/relay/integrate-into-frameworks/about) |
 | Export ATOF, ATIF, OpenTelemetry, or OpenInference | [Observability Plugin](https://docs.nvidia.com/nemo/relay/configure-plugins/observability/about) |
+| Evaluate candidates, inspect evidence in a local dashboard, control rollout, or run bounded Active canaries | [NeMo Relay Router](docs/router/about.mdx) |
 | Package reusable middleware or exporters | [Build Plugins](https://docs.nvidia.com/nemo/relay/v0.5.0/build-plugins/about) |
 | Develop or test this repository from source | [CONTRIBUTING.md](CONTRIBUTING.md) |
 

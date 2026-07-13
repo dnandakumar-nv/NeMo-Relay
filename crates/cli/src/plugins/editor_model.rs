@@ -14,6 +14,7 @@ use nemo_relay::plugins::nemo_guardrails::component::{
 use nemo_relay_adaptive::AdaptiveConfig;
 use nemo_relay_adaptive::plugin_component::ADAPTIVE_PLUGIN_KIND;
 use nemo_relay_pii_redaction::component::{PII_REDACTION_PLUGIN_KIND, PiiRedactionConfig};
+use nemo_relay_router::{ROUTER_PLUGIN_KIND, RouterConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -38,6 +39,7 @@ pub(super) enum EditableComponent {
     Adaptive(Box<ComponentEditorState<AdaptiveConfig>>),
     NemoGuardrails(Box<ComponentEditorState<NeMoGuardrailsConfig>>),
     PiiRedaction(Box<ComponentEditorState<PiiRedactionConfig>>),
+    Router(Box<ComponentEditorState<RouterConfig>>),
 }
 
 impl EditableComponent {
@@ -47,6 +49,7 @@ impl EditableComponent {
             Self::Adaptive(_) => "Adaptive",
             Self::NemoGuardrails(_) => "NeMo Guardrails",
             Self::PiiRedaction(_) => "PII Redaction",
+            Self::Router(_) => "Router",
         }
     }
 
@@ -56,6 +59,7 @@ impl EditableComponent {
             Self::Adaptive(_) => AdaptiveConfig::editor_schema().fields,
             Self::NemoGuardrails(_) => NeMoGuardrailsConfig::editor_schema().fields,
             Self::PiiRedaction(_) => PiiRedactionConfig::editor_schema().fields,
+            Self::Router(_) => RouterConfig::editor_schema().fields,
         }
     }
 
@@ -65,6 +69,7 @@ impl EditableComponent {
             Self::Adaptive(state) => state.enabled,
             Self::NemoGuardrails(state) => state.enabled,
             Self::PiiRedaction(state) => state.enabled,
+            Self::Router(state) => state.enabled,
         }
     }
 
@@ -74,6 +79,7 @@ impl EditableComponent {
             Self::Adaptive(state) => state.toggle_enabled(),
             Self::NemoGuardrails(state) => state.toggle_enabled(),
             Self::PiiRedaction(state) => state.toggle_enabled(),
+            Self::Router(state) => state.toggle_enabled(),
         }
     }
 
@@ -83,6 +89,7 @@ impl EditableComponent {
             Self::Adaptive(state) => state.set_enabled(enabled),
             Self::NemoGuardrails(state) => state.set_enabled(enabled),
             Self::PiiRedaction(state) => state.set_enabled(enabled),
+            Self::Router(state) => state.set_enabled(enabled),
         }
     }
 
@@ -92,6 +99,7 @@ impl EditableComponent {
             Self::Adaptive(state) => state.reset_enabled(),
             Self::NemoGuardrails(state) => state.reset_enabled(),
             Self::PiiRedaction(state) => state.reset_enabled(),
+            Self::Router(state) => state.reset_enabled(),
         }
     }
 
@@ -101,6 +109,7 @@ impl EditableComponent {
             Self::Adaptive(state) => adaptive_summary(state),
             Self::NemoGuardrails(state) => nemo_guardrails_summary(state),
             Self::PiiRedaction(state) => pii_redaction_summary(state),
+            Self::Router(state) => router_summary(state),
         }
     }
 
@@ -114,6 +123,7 @@ impl EditableComponent {
             Self::PiiRedaction(state) => {
                 config_field_configured(&state.config, field).unwrap_or(false)
             }
+            Self::Router(state) => config_field_configured(&state.config, field).unwrap_or(false),
         }
     }
 
@@ -132,6 +142,10 @@ impl EditableComponent {
                 state.mark_config_touched();
             }
             Self::PiiRedaction(state) => {
+                reset_config_field(&mut state.config, field)?;
+                state.mark_config_touched();
+            }
+            Self::Router(state) => {
                 reset_config_field(&mut state.config, field)?;
                 state.mark_config_touched();
             }
@@ -160,6 +174,10 @@ impl EditableComponent {
                 remove_struct_field(&mut state.config, field.name)?;
                 state.mark_config_touched();
             }
+            Self::Router(state) => {
+                remove_struct_field(&mut state.config, field.name)?;
+                state.mark_config_touched();
+            }
         }
         Ok(true)
     }
@@ -170,6 +188,7 @@ impl EditableComponent {
             Self::Adaptive(state) => store_adaptive_state(config, state),
             Self::NemoGuardrails(state) => store_nemo_guardrails_state(config, state),
             Self::PiiRedaction(state) => store_pii_redaction_state(config, state),
+            Self::Router(state) => store_router_state(config, state),
         }
     }
 }
@@ -198,6 +217,7 @@ pub(super) fn editable_components(
         EditableComponent::Adaptive(Box::new(component_adaptive_state(config)?)),
         EditableComponent::NemoGuardrails(Box::new(component_nemo_guardrails_state(config)?)),
         EditableComponent::PiiRedaction(Box::new(component_pii_redaction_state(config)?)),
+        EditableComponent::Router(Box::new(component_router_state(config)?)),
     ])
 }
 
@@ -403,6 +423,12 @@ pub(super) fn component_pii_redaction_state(
     component_editor_state(config, PII_REDACTION_PLUGIN_KIND, false)
 }
 
+pub(super) fn component_router_state(
+    config: &PluginConfig,
+) -> Result<ComponentEditorState<RouterConfig>, CliError> {
+    component_editor_state(config, ROUTER_PLUGIN_KIND, false)
+}
+
 pub(super) fn store_observability_state(
     config: &mut PluginConfig,
     state: &ComponentEditorState<ObservabilityConfig>,
@@ -462,6 +488,22 @@ pub(super) fn store_pii_redaction_state(
             state.enabled,
             pii_redaction_config_map(&state.config)?,
             merge_pii_redaction_editor_config,
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn store_router_state(
+    config: &mut PluginConfig,
+    state: &ComponentEditorState<RouterConfig>,
+) -> Result<(), CliError> {
+    if state.should_store(true) {
+        store_component_editor_config(
+            config,
+            ROUTER_PLUGIN_KIND,
+            state.enabled,
+            router_config_map(&state.config)?,
+            merge_router_editor_config,
         );
     }
     Ok(())
@@ -815,6 +857,16 @@ pub(super) fn pii_redaction_config_map(
     }
 }
 
+pub(super) fn router_config_map(config: &RouterConfig) -> Result<Map<String, Value>, CliError> {
+    let value = serde_json::to_value(config).map_err(serde_error)?;
+    match value {
+        Value::Object(map) => Ok(map),
+        _ => Err(CliError::Config(
+            "Router config must serialize to an object".into(),
+        )),
+    }
+}
+
 pub(super) fn merge_observability_editor_config(
     existing: &mut Map<String, Value>,
     edited: Map<String, Value>,
@@ -869,6 +921,18 @@ pub(super) fn merge_pii_redaction_editor_config(
         edited,
         &nested_editor_keys(PiiRedactionConfig::editor_schema()),
         PiiRedactionConfig::editor_schema(),
+    );
+}
+
+pub(super) fn merge_router_editor_config(
+    existing: &mut Map<String, Value>,
+    edited: Map<String, Value>,
+) {
+    merge_known_editor_object(
+        existing,
+        edited,
+        &nested_editor_keys(RouterConfig::editor_schema()),
+        RouterConfig::editor_schema(),
     );
 }
 
@@ -1053,5 +1117,14 @@ pub(super) fn pii_redaction_summary(state: &ComponentEditorState<PiiRedactionCon
         } else {
             configured_fields.join(", ")
         }
+    )
+}
+
+pub(super) fn router_summary(state: &ComponentEditorState<RouterConfig>) -> String {
+    format!(
+        "component {}, mode {:?}, pools {}",
+        if state.enabled { "enabled" } else { "disabled" },
+        state.config.mode,
+        state.config.pools.len()
     )
 }

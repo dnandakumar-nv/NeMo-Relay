@@ -103,6 +103,21 @@ ATOF is the raw-event export path. It preserves the canonical event shape; it
 does not add semantic extraction, replay policy, scope-owner resolution, or
 exporter projection rules.
 
+### LLM Call Roles
+
+Core-created LLM start and end events include
+`category_profile.call_role`. The supported wire values are `primary`,
+`shadow`, and `judge`. This field is an additive profile key, so the ATOF
+version remains `0.1`.
+
+The raw exporter preserves events for every role. It does not hide Shadow or
+Judge calls. For typed readers, an LLM event created before the role field was
+added is Primary. A present malformed value has no typed role and is not
+silently interpreted as Primary.
+
+Embedding work uses `ScopeType::Embedder`. Embedder lifecycle events do not
+fabricate an LLM API family or `category_profile.call_role`.
+
 Register the plugin before instrumented work starts and clear it during
 shutdown so file handles flush.
 

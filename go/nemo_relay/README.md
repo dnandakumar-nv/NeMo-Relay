@@ -120,3 +120,14 @@ func main() {
 	fmt.Println(string(result))
 }
 ```
+
+## Router Boundary
+
+The underlying FFI library recognizes `router` through the existing generic
+JSON plugin configuration APIs. Go can list, validate, initialize, report, and
+clear that component without a separate Go Router package.
+
+The source-first Go binding deliberately has no typed Router package, Active
+control or inspection API, or V2 replay factory. Go-managed LLM calls are not
+eligible Router Primary calls. Use the CLI, Python, Node.js, or a custom Rust
+host for Router execution.

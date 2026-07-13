@@ -1,0 +1,249 @@
+---
+title: "Inspect and Control Router"
+sidebar-title: "Inspection and Control"
+description: "Use the typed Rust inspection service to read Router state, inspect evidence and decisions, export records, and apply operator mutations."
+position: 9
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+Router exposes a stable typed Rust inspection service over its private SQLite
+ledger. Use this service, the CLI, or the optional HTTP adapter instead of
+querying Router tables directly. Every read verifies the stored authority and
+immutable record graph before returning public data.
+
+The service does not activate Router, run migrations, start schedulers, or
+expose replay credentials. It opens an existing ledger with capabilities fixed
+by the host.
+
+## Construct the Service
+
+Enable the capabilities that the host grants when it creates
+`InspectionServiceOptions`. Defaults are read-only, redacted, and
+provider-free.
+
+```rust
+use nemo_relay_router::RouterConfig;
+use nemo_relay_router::inspection::{
+    ContentPolicy, InspectionError, InspectionService, InspectionServiceOptions,
+    PageRequest,
+};
+
+async fn inspect_router(config: RouterConfig) -> Result<(), InspectionError> {
+    let service = InspectionService::open(
+        config,
+        InspectionServiceOptions {
+            content_policy: ContentPolicy::Redacted,
+            allow_request_embedding: false,
+            allow_operations: false,
+            ..InspectionServiceOptions::default()
+        },
+    )
+    .await?;
+
+    let status = service.status().await?;
+    let pools = service.list_pools(PageRequest::default()).await?;
+    println!("{} pools at {}", pools.items.len(), status.snapshot_time_unix_ms);
+
+    service.close().await
+}
+```
+
+The host-fixed options are:
+
+| Option | Default | Contract |
+|---|---:|---|
+| `content_policy` | `redacted` | Returns secret-filtered hashes, byte lengths, and previews. `full` can also return larger allowed values, but it still removes secret fields and values. |
+| `allow_request_embedding` | `false` | Permits the request-based neighborhood form to call one configured embedder on a cache miss. |
+| `allow_operations` | `false` | Permits control, reset, and cohort mutations. The capability cannot be enabled after construction. |
+| `request_timeout_ms` | `5000` | Bounds one request. Hosts can configure `1..=30000`. |
+| `export_chunk_bytes` | `65536` | Bounds one export chunk. Hosts can configure `4096..=1048576`. |
+
+### Service-Opening Matrix
+
+`InspectionService::open` classifies the configured database before it opens
+the current-schema backend.
+
+| Database State | `status()` | Current Reads | Operations |
+|---|---|---|---|
+| `current`, with matching project, config, policies, and generation authority | Complete report | Available | Available only when `allow_operations` is `true` |
+| `missing` or `empty` | Fail-closed status-only report | `storage_unavailable` | Unavailable |
+| `upgrade_required` or `newer` | Status-only migration report | Unavailable | Unavailable |
+| `incompatible` or `unreadable` | Status-only failure classification | Unavailable | Unavailable |
+| Current schema with mismatched or invalid authority | Open fails | Unavailable | Unavailable |
+
+Opening a noncurrent database does not create or migrate it. Opening a current
+database verifies the configured project and policy authority and creates only
+bounded read connections. An operations-capable service attaches to a matching
+writer in the same process or starts one narrow standalone writer. Only one
+standalone operations process is admitted at a time; a contender receives
+`busy`.
+
+## Read Router State
+
+The service exposes the following public methods:
+
+| Method | Result and Order | Filters |
+|---|---|---|
+| `status()` | One `StatusReportV1` snapshot | None |
+| `overview()` | One exact 24-hour `OverviewReportV1` snapshot | None |
+| `list_pools(page)` | `PoolSummaryV1`, pool ID in lexical order | None |
+| `get_pool(pool_id)` | One complete `PoolDetailV1` | Exact pool ID |
+| `list_evidence(filter, page)` | `EvidenceSummaryV1`, newest first | Pool, candidate, terminal class, quality label, learning generation |
+| `get_evidence(evidence_id)` | One complete `EvidenceDetailV1` | UUIDv7 evidence ID |
+| `list_decisions(filter, page)` | `DecisionSummaryV1`, newest first | Pool, `recommend` or `active` mode, candidate, final reason |
+| `tail_decisions(filter, page)` | Latest window, then new decisions oldest first | Same decision filters |
+| `get_decision(decision_id)` | One `DecisionDetailV1` with candidate and neighbor audit rows | UUIDv7 decision ID |
+| `get_decision_exposure(decision_id)` | One `DecisionExposureV1` with optional Active assignment and outcome | UUIDv7 decision ID |
+| `list_outcomes(filter, page)` | `OutcomeSummaryV1`, newest first | Pool, arm, label, attribution status |
+| `list_controls(page)` | Unified control, reset, and rotation history, newest first | None |
+| `list_health(page)` | Verified health events, newest first | None |
+| `list_migrations(page)` | Embedded migration receipts, newest first | None |
+| `inspect_neighborhood(lookup)` | One `NeighborhoodReportV1` | Exactly one lookup variant |
+
+`StatusReportV1` includes the configured and effective modes, current config
+and cohort generations, global controls, database classification, queue and
+lease counts, vector-index state, latest durable record times, aggregate
+health, and the snapshot time. It never returns the database path, cohort salt,
+provider credentials, or request headers.
+
+`OverviewReportV1` contains exact decision, exposure, and outcome counts over
+the inclusive 24-hour window ending at its snapshot, plus the verified status
+snapshot. `PoolDetailV1` adds the selector, concurrency, learning policy, and
+support prerequisites to a pool summary. `DecisionExposureV1` distinguishes a
+Recommend decision with no exposure from an Active assignment and joins its
+optional protected outcome.
+
+### Schemas and Pages
+
+Version 1 uses these public schema identifiers:
+
+| Payload | Schema |
+|---|---|
+| Status | `nemo.relay.router.status@1` |
+| Overview | `nemo.relay.router.overview@1` |
+| Pool detail | `nemo.relay.router.pool-detail@1` |
+| Decision exposure | `nemo.relay.router.decision-exposure@1` |
+| Request-file inspection input | `nemo.relay.router.inspection-input@1` |
+| Neighborhood report | `nemo.relay.router.neighborhood-report@1` |
+| JSON Lines evidence record | `nemo.relay.router.evidence-export-record@1` |
+
+List methods return `Page<T>` with `items`, `next`,
+`snapshot_time_unix_ms`, and the effective `content_policy`. The default page
+size is 100 and the maximum is 500.
+
+Cursors are opaque and can contain up to 4 KiB. A cursor is bound to the
+project, schema, endpoint, filters, sort, first-page snapshot, and cohort
+authority. Reusing it with another endpoint or filter, altering it, or using it
+after its authority becomes stale returns `invalid_cursor`. New writes do not
+appear inside an existing newest-first page sequence. Decision follow cursors
+are a distinct forward-only cursor type and cannot be reused for ordinary
+decision pages.
+
+## Inspect Evidence and Content
+
+An evidence summary contains:
+
+- `evidence_id`, `pool_id`, and `candidate_id`
+- `terminal_class` and optional `quality_label`
+- `canonical_query_hash` and `learning_generation_id`
+- current `vector_state` and `created_at_unix_ms`
+- a secret-filtered `content` object
+
+Evidence detail adds the exact strict partition, `anchor_id`,
+`shadow_attempt_id`, optional `evaluation_id`, and immutable `record_hash`.
+Decision detail returns its summary, ranked candidate confidence facts,
+persisted neighbor audit in stable order, and parent record hash.
+
+Every `InspectionContentV1` contains `sha256`, `byte_length`, and an optional
+preview. Redacted previews contain at most 256 Unicode scalar values. Under
+`ContentPolicy::Full`, `value` can contain the larger allowed value. Both
+policies remove secret fields and values. They do not promise that ordinary
+application text contains no sensitive data, so protect inspection output as
+application data.
+
+## Inspect a Neighborhood
+
+`NeighborhoodLookupV1` accepts exactly one source:
+
+- `Evidence { evidence_id }` resolves the persisted canonical query and exact
+  partition from one evidence record.
+- `QueryHash { canonical_query_hash, partition }` requires both the SHA-256
+  query hash and the complete strict partition. A hash alone is insufficient.
+- `Request { input }` accepts one versioned sanitized
+  `RoutingInspectionInputV1` with a pool ID, partition, request projection, and
+  routing-context projection.
+
+The evidence and query-hash forms are provider-free. The request form uses a
+persisted exact-space vector on a cache hit. On a cache miss, it calls an
+embedder only when the host set `allow_request_embedding = true` and the Router
+egress policy permits that endpoint. The service does not persist an ephemeral
+request vector or neighborhood report.
+
+`NeighborhoodReportV1` returns the exact pool, query hash, partition, ordered
+neighbors, support counts, credible lower bound, named confidence gates,
+recommendation or anchor fallback, and snapshot time. Its optional `pca_2`
+projection is deterministic and diagnostic-only; it has no routing authority.
+
+## Export Evidence
+
+Call `export_evidence(EvidenceExportRequestV1)` to receive an
+`EvidenceExportStream`. Repeatedly call `next_chunk()` until it returns `None`.
+The stream supports:
+
+- `jsonl`: one `nemo.relay.router.evidence-export-record@1` object per line.
+- `csv`: deterministic scalar summary columns with standard CSV quoting.
+
+The stream uses the same evidence filters and content policy as list reads.
+Each chunk respects `export_chunk_bytes`. Dropping the stream cancels its
+producer, and no export path exposes cohort salt, credentials, provider
+headers, SQL, or replay transport.
+
+## Apply Operator Mutations
+
+Construct the service with `allow_operations = true` before calling:
+
+- `apply_control(InspectionControlRequestV1)` for global or per-pool pause and
+  force-anchor changes.
+- `reset(LearningResetRequestV1)` for one pool or every configured pool.
+- `rotate_cohort(CohortRotationRequestV1)` for project-wide cohort rotation.
+
+Each request carries one UUIDv7 mutation ID, the current expected generation,
+a bounded actor, and a bounded nonblank reason. Reset and rotation also require
+the exact configured `project_id`. The service uses a fixed 2,000 ms
+transaction-start budget and never retries a generation conflict.
+
+Pause and force-anchor are independent fields. Resume clears only pause.
+Force-anchor preserves allowed Shadow learning, while pause stops substitution
+and new learning admission. A pool reset advances only that pool's learning
+generation. An all-pool reset records every expected generation and advances
+the full set atomically. Cohort rotation advances protected cohort authority
+without returning its salt.
+
+Exact mutation-ID replay returns the stored result. Reusing an ID with another
+payload, presenting a stale generation, or presenting the wrong project
+confirmation fails without partially advancing authority. Read the unified
+operator history with `list_controls()` to reconcile the durable result after
+an interrupted caller.
+
+## Handle Errors and Lifecycle
+
+`InspectionError::code()` returns a stable snake-case code:
+
+| Class | Codes |
+|---|---|
+| Request or lookup | `invalid_argument`, `invalid_cursor`, `not_found`, `incompatible_api` |
+| Capability | `unauthorized`, `forbidden`, `egress_denied` |
+| Concurrency or history | `conflict`, `busy`, `mutation_expired`, `capacity_exhausted` |
+| Ledger | `storage_unavailable`, `migration_required`, `integrity_error` |
+
+Errors do not contain paths, SQL text, credentials, cohort salt, or provider
+payloads. Call `close().await` to stop a standalone operations writer and drain
+readers under the configured deadline. Call `abort()` for synchronous
+nonblocking cancellation; durable process leases and startup reconciliation
+handle an interrupted process.
+
+Refer to [Use Router CLI and HTTP](/router/cli-and-http) for command syntax and
+the optional Axum adapter. Refer to [Router Ledger Migrations and
+Recovery](/router/ledger-migrations-and-recovery) for schema and recovery
+details.

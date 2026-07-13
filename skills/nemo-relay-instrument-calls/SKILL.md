@@ -22,6 +22,16 @@ needs to run them through NeMo Relay correctly.
   - Go: `tools.Execute(...)`, `llm.Execute(...)` or the top-level wrappers
 - Use manual lifecycle APIs only when the host framework cannot be wrapped by the
   managed execute helpers.
+- Use Rust `llm_call_execute_v2(LlmCallExecuteV2Params::builder()...)` only when
+  a host needs frozen execution context or explicit replay authority. Supply an
+  explicit API family, call role, and owned sanitized metadata; do not infer
+  them from request JSON.
+- Router requires a V2 managed call with a `Primary` role, an exact API family,
+  and a host-owned replay factory. The CLI, Python, and Node.js packages bundle
+  and register Router and expose configuration through their existing package
+  surfaces. A custom Rust host must link `nemo-relay-router` and register it
+  explicitly. Go and the C FFI recognize generic Router plugin configuration
+  but expose no eligible V2 replay bridge or typed Router API.
 
 ## Embedded Runtime Semantics
 
@@ -34,6 +44,18 @@ needs to run them through NeMo Relay correctly.
   not rewrite the caller-visible request or arguments.
 - Execution intercepts wrap the callback with the middleware `next` pattern and
   may short-circuit by returning their own result.
+- A V2 `next` continuation belongs only to the current physical call. Invoke it
+  at most once while the intercept future is active and never retain it for
+  delayed work.
+- Delayed or repeated non-streaming work uses the optional host-owned replay
+  transport. Each `start` creates an independent call whose pending drop
+  cancels only that invocation.
+- Replay capability failure is fail-open for the `Primary` anchor. Diagnose
+  ineligibility with the stable `nemo_relay.replay_ineligible` reason code; do
+  not expose factory error text, endpoint policy, or credentials.
+- `Shadow` and `Judge` calls require an immediate `Evaluator` parent and a valid
+  string `anchor_uuid` in sanitized metadata. Give internal calls no replay
+  factory so they cannot recursively acquire replay authority.
 - Sanitize-response guardrails affect emitted end-event payloads only. The value
   returned to application code remains the raw callback or execution-intercept
   result.
@@ -61,6 +83,10 @@ needs to run them through NeMo Relay correctly.
 - [ ] Existing LLM/provider call wrapped at the right abstraction layer
 - [ ] Optional metadata, attributes, or model name attached where useful
 - [ ] Context propagation handled if the call hops threads or async tasks
+- [ ] V2 hosts keep endpoint, authentication, TLS, and proxy state inside the
+      opaque replay factory or transport
+- [ ] Delayed work retains context, request, and replay transport only, never
+      `next` or the initiating provider callback
 
 ## Use Another Skill When
 

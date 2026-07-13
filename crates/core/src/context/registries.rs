@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 
 use crate::api::registry::{ExecutionIntercept, Guardrail, Intercept};
+use crate::api::runtime::callbacks::LlmExecutionInterceptFn;
 use crate::api::runtime::{
-    EventSanitizeFn, EventSubscriberFn, LlmConditionalFn, LlmExecutionFn, LlmRequestInterceptFn,
+    EventSanitizeFn, EventSubscriberFn, LlmConditionalFn, LlmRequestInterceptFn,
     LlmSanitizeRequestFn, LlmSanitizeResponseFn, LlmStreamExecutionFn, ToolConditionalFn,
     ToolExecutionFn, ToolInterceptFn, ToolSanitizeFn,
 };
@@ -49,7 +50,8 @@ pub(crate) struct ScopeLocalRegistries {
     /// LLM request intercepts that can rewrite or annotate requests.
     pub(crate) llm_request_intercepts: SortedRegistry<Intercept<LlmRequestInterceptFn>>,
     /// Non-streaming LLM execution intercepts that wrap callback execution.
-    pub(crate) llm_execution_intercepts: SortedRegistry<ExecutionIntercept<LlmExecutionFn>>,
+    pub(crate) llm_execution_intercepts:
+        SortedRegistry<ExecutionIntercept<LlmExecutionInterceptFn>>,
     /// Streaming LLM execution intercepts that wrap stream-producing callbacks.
     pub(crate) llm_stream_execution_intercepts:
         SortedRegistry<ExecutionIntercept<LlmStreamExecutionFn>>,
@@ -162,4 +164,33 @@ pub(crate) fn merge_execution_intercept_callables<F: Clone>(
     }
     all.sort_by_key(|(_, priority)| *priority);
     all
+}
+
+/// Collect execution intercept callables in priority/name order.
+///
+/// V2 LLM calls use this merge so global and scope-local V1/V2 entries behave
+/// as one deterministic registry without changing legacy chain tie ordering.
+pub(crate) fn merge_execution_intercept_callables_by_name<F: Clone>(
+    global: &SortedRegistry<ExecutionIntercept<F>>,
+    scope_locals: &[&SortedRegistry<ExecutionIntercept<F>>],
+) -> Vec<(F, i32)> {
+    let mut all = Vec::new();
+    for entry in global.sorted_values() {
+        all.push((entry.payload.clone(), entry.priority, entry.name.clone()));
+    }
+    for registry in scope_locals {
+        for entry in registry.sorted_values() {
+            all.push((entry.payload.clone(), entry.priority, entry.name.clone()));
+        }
+    }
+    all.sort_by(
+        |(_, left_priority, left_name), (_, right_priority, right_name)| {
+            left_priority
+                .cmp(right_priority)
+                .then_with(|| left_name.cmp(right_name))
+        },
+    );
+    all.into_iter()
+        .map(|(callable, priority, _)| (callable, priority))
+        .collect()
 }

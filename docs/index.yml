@@ -49,6 +49,10 @@ navigation:
       - page: "Plugin Configuration Files"
         path: ./configure-plugins/plugin-configuration-files.mdx
         slug: plugin-configuration-files
+  - folder: ./router
+    title: "NeMo Relay Router"
+    slug: router
+    title-source: frontmatter
   - folder: ./integrate-into-frameworks
     title: "Integrate into Frameworks"
     slug: integrate-into-frameworks

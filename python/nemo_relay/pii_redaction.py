@@ -187,7 +187,7 @@ def validate_config(config: PiiRedactionConfig | JsonObject) -> ConfigReport:
             components=[ComponentSpec(config)],
         )
     )
-    return cast(ConfigReport, report)
+    return report
 
 
 __all__ = [

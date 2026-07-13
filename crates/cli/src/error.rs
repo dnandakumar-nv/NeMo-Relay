@@ -36,6 +36,8 @@ pub(crate) enum CliError {
     PayloadTooLarge(String),
     #[error("gateway upstream error: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("upstream_response_too_large")]
+    UpstreamResponseTooLarge,
     #[error("http error: {0}")]
     Http(#[from] http::Error),
     #[error("io error: {0}")]
@@ -96,7 +98,7 @@ impl IntoResponse for CliError {
             (true, _) => StatusCode::FORBIDDEN,
             (false, Self::PayloadTooLarge(_)) => StatusCode::PAYLOAD_TOO_LARGE,
             (false, Self::InvalidPayload(_)) => StatusCode::BAD_REQUEST,
-            (false, Self::Upstream(_)) => StatusCode::BAD_GATEWAY,
+            (false, Self::Upstream(_) | Self::UpstreamResponseTooLarge) => StatusCode::BAD_GATEWAY,
             (
                 false,
                 Self::Http(_)

@@ -1,0 +1,504 @@
+---
+title: "Router Configuration"
+description: "Configure Router in bundled hosts or register it in a custom Rust host."
+position: 2
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+Router uses the Core plugin lifecycle, but the Core crate does not depend on
+Router. The CLI, Python wheel, and Node.js npm package link and register Router
+before plugin validation. A custom Rust host must link the Router crate and
+register it explicitly.
+
+## Use a Bundled Host
+
+The CLI discovers a `router` component through the normal `plugins.toml`
+layers. Use `nemo-relay plugins edit` for typed fields and `nemo-relay doctor`
+to check registration, V2 route coverage, the native vector extension,
+database readiness, and mode-specific configuration without provider calls.
+
+Python helpers ship in the main `nemo-relay` wheel:
+
+```python
+import asyncio
+
+from nemo_relay import plugin, router
+
+
+async def main() -> None:
+    config = router.RouterConfig(mode="off")
+    assert router.validate_config(config)["diagnostics"] == []
+    await plugin.initialize(
+        plugin.PluginConfig(components=[router.ComponentSpec(config)])
+    )
+    await plugin.clear_async(timeout=30.0)
+
+
+asyncio.run(main())
+```
+
+Node.js builders ship in the main `nemo-relay-node` npm package:
+
+```javascript
+const plugin = require('nemo-relay-node/plugin');
+const router = require('nemo-relay-node/router');
+
+async function main() {
+  const config = router.defaultConfig({ mode: 'off' });
+  if (router.validateConfig(config).diagnostics.length !== 0) {
+    throw new Error('invalid Router configuration');
+  }
+  await plugin.initialize({
+    version: 1,
+    components: [router.ComponentSpec(config)],
+  });
+  await plugin.clearAsync(30000);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+```
+
+These helpers apply the Rust defaults and serialize the canonical plugin JSON
+shape. There is no separate Router wheel or npm package.
+
+## Register a Custom Rust Host
+
+The following example registers Router in `off` mode:
+
+```rust
+use std::time::Duration;
+
+use nemo_relay::plugin::{
+    PluginConfig, clear_plugin_configuration_async, initialize_plugins,
+};
+use nemo_relay_router::{
+    ComponentSpec, RouterConfig, RouterMode, deregister_router_component,
+    register_router_component,
+};
+
+register_router_component()?;
+
+let mut router = RouterConfig::default();
+router.mode = RouterMode::Off;
+
+let mut plugins = PluginConfig::default();
+plugins.components.push(ComponentSpec::new(router).into());
+initialize_plugins(plugins).await?;
+
+clear_plugin_configuration_async(Duration::from_secs(30)).await?;
+assert!(deregister_router_component());
+```
+
+Call `register_router_component()` before `validate_plugin_config` or plugin
+initialization. Repeated registration of this crate's same static
+implementation is idempotent. A foreign component that already uses kind
+`router` causes registration to fail. Initialization requires an active Tokio
+runtime.
+
+`deregister_router_component()` removes only this crate's pointer-identical
+plugin from the registry. It does not release an active component's resources.
+Clear or replace the Core plugin configuration first.
+
+## Configure Shadow Warm-Up
+
+After registration, a custom Rust host can activate file configuration by
+calling `initialize_plugins(PluginConfig::default())`. Bundled hosts use the
+same layered document automatically. The following `plugins.toml` example is
+complete for one `shadow` pool:
+
+```toml
+version = 1
+
+[[components]]
+kind = "router"
+enabled = true
+
+[components.config]
+version = 1
+mode = "shadow"
+project_id = "deployment-1"
+database_path = ".nemo-relay/router/router.db"
+retention_days = 30
+max_evidence_records = 100000
+allow_remote_embedding_egress = false
+
+[[components.config.pools]]
+id = "chat-default"
+api_family = "openai_chat_completions"
+anchor_models = ["anchor-large"]
+anchor_revision = "2026-07-01"
+sampling_probability = 0.25
+max_candidates_per_sample = 1
+
+[components.config.pools.selector]
+tenant_ids = ["tenant-a"]
+agent_ids = ["agent-a"]
+owner_scope_types = ["agent"]
+metadata_equals = { region = "us", tier = 2 }
+scope_path_patterns = ["agent/**"]
+
+[components.config.pools.lookahead]
+primary_llm_completions = 3
+deadline_seconds = 300
+lifecycle_presets = ["handoff", "compaction"]
+max_events_per_window = 512
+max_bytes_per_window = 4194304
+
+[components.config.pools.concurrency]
+shadow = 2
+judge = 1
+max_pending = 32
+
+[components.config.pools.judge]
+version = 1
+model = "judge-large"
+model_revision = "2026-07-01"
+prompt_version = "pairwise-equivalence-v1"
+rubric_version = "response-trajectory-equivalence-v1"
+output_schema_version = 1
+response_weight = 0.5
+trajectory_weight = 0.5
+response_floor = 0.8
+trajectory_floor = 0.8
+judge_confidence_floor = 0.7
+pass_threshold = 0.85
+max_rationale_bytes = 4096
+base_cooloff_seconds = 10
+max_cooloff_seconds = 300
+
+[[components.config.pools.candidates]]
+id = "small"
+model = "candidate-small"
+model_revision = "2026-06-15"
+cost_rank = 0
+
+[components.config.pools.candidates.capabilities]
+tools = true
+```
+
+The bundled CLI links and registers Router before loading this component. Its
+buffered Responses, Chat Completions, and Anthropic Messages routes provide the
+V2 replay capability that Router consumes. Streaming, model-list, and
+count-token routes remain replay-ineligible. Buffered non-success responses are
+reported as managed errors to Router while the CLI returns their bounded
+status, allowed headers, and body to the client.
+
+This example omits `learning`, so it collects Shadow evidence without vector
+materialization. To warm up evidence for `recommend`, add the complete policy
+from [Router Recommendation Confidence](/router/recommendation-confidence) and
+keep `mode = "shadow"` until the retained neighborhoods meet your policy.
+
+## Understand Activation Side Effects
+
+Configuration validation is pure. It does not access the filesystem, read an
+environment-variable value, resolve DNS, send network traffic, spawn tasks, or
+register middleware.
+
+Activation depends on the selected mode:
+
+- `off` validates the complete supplied configuration, including every pool's
+  required Judge policy, but opens no database, starts no task, and registers no
+  Router intercept or subscriber.
+- `shadow` secures and opens the configured SQLite ledger, verifies and applies
+  migrations, reconciles expired process work, starts the writer, scheduler,
+  embedding/index supervisor, heartbeat, and retention workers, and then
+  registers runtime behavior.
+- `recommend` requires a complete learning policy for every pool. It opens the
+  same ledger and owned workers, computes and records bounded recommendations,
+  and always serves the unchanged anchor without replay execution or Shadow
+  scheduling.
+- `active` requires a complete Active learning policy and outcome policy for
+  every pool. It opens the same owned runtime plus bounded foreground outcome
+  ownership and can serve only a durably authorized randomized canary.
+
+Migration, filesystem, project-identity, or recovery failure stops `shadow`,
+`recommend`, or `active` activation before Router middleware registration. Refer to
+[Ledger Migrations and Recovery](/router/ledger-migrations-and-recovery) for
+the operational contract.
+
+## Apply Configuration Layers
+
+`initialize_plugins` discovers `plugins.toml` files from lowest to highest
+precedence: system, project, then user. The code-supplied `PluginConfig` is the
+highest layer.
+
+Components pair by `kind` across layers. Tables merge recursively. Arrays and
+scalars are replaced by the higher-precedence value. For Router, that includes
+`embedders`, `pools`, `anchor_models`, `candidates`, every selector list,
+`lifecycle_presets`, and `position_features`. To extend a lower-layer Router
+array, repeat the complete effective array in the higher layer.
+
+A typed `ComponentSpec::new(RouterConfig)` serializes the complete typed
+configuration, including defaults. Those values override matching fields from
+files. Omitting the entire Router component from the code layer inherits the
+file component. Refer to
+[Plugin Configuration Files](/configure-plugins/plugin-configuration-files) for
+discovery paths and the general merge contract.
+
+## Configure Root Fields
+
+The root fields use the following defaults and rules:
+
+| Field | Default | Rule |
+|---|---:|---|
+| `version` | `1` | Only version 1 is accepted. |
+| `mode` | `off` | Accepts `off`, `shadow`, `recommend`, or `active`. |
+| `project_id` | omitted | Optional stable deployment identifier. A persisted mismatch refuses activation. |
+| `database_path` | `.nemo-relay/router/router.db` | Local SQLite file used in `shadow`, `recommend`, and `active` modes. |
+| `retention_days` | `30` | Must be positive. |
+| `max_evidence_records` | `100000` | Must be in `1..=1000000`. Bounds terminal anchors and decision parents as independent retention counts. |
+| `allow_remote_embedding_egress` | `false` | Opts in to remote HTTPS embedder endpoints. |
+| `embedders` | `[]` | Named embedder profiles. IDs must be unique; only profiles selected by pool `learning` are activated. |
+| `pools` | `[]` | Pool IDs must be unique and selectors must not overlap. |
+| `policy` | Core default | Controls diagnostics except strict Judge unknown fields. |
+
+`database_path` is validated lexically. Relative and local absolute file paths
+are accepted. Empty or control-bearing paths, URI and SQLite URI forms,
+UNC/device forms, root-only paths, trailing directory separators, and `.` or
+`..` components are rejected. Windows reserved device basenames and aliases
+are rejected in every path component. A relative path resolves from the host's
+working directory during activation.
+
+## Configure Pools and Candidates
+
+Every pool requires the following fields:
+
+- A unique stable `id` and one of `openai_chat_completions`,
+  `openai_responses`, or `anthropic_messages`.
+- A nonempty, unique `anchor_models` list and pinned `anchor_revision`.
+- A finite `sampling_probability` in the inclusive range `[0, 1]`.
+- A positive `max_candidates_per_sample` no greater than the candidate count.
+- Positive `concurrency.shadow` and `concurrency.judge` values.
+  `concurrency.max_pending` defaults to `32`.
+- At least one candidate and one complete Judge policy.
+
+Candidate IDs, models, and `cost_rank` values must be unique within the pool.
+A candidate model cannot also be an anchor model. Candidate revisions must be
+pinned. Values such as `latest`, `current`, `unversioned`, and `*` are rejected.
+`max_context_tokens` is optional and positive. Capabilities default to `false`
+for `tools`, `multimodal_input`, `structured_output`, and
+`reasoning_controls`.
+
+`max_candidates_per_sample` limits only the Shadow request-clone prefix.
+Recommend mode uses every capability-eligible candidate for the exact live
+candidate count, candidate-set hash, Bonferroni correction, and decision audit.
+
+Lookahead uses the following defaults:
+
+| Field | Default |
+|---|---:|
+| `primary_llm_completions` | `3` |
+| `deadline_seconds` | `300` |
+| `lifecycle_presets` | `[]` |
+| `max_events_per_window` | `512` |
+| `max_bytes_per_window` | `4194304` |
+
+`lifecycle_presets` accepts the unique exact values `handoff` and
+`compaction`. `handoff` counts only an Agent start whose normalized metadata
+contains `nemo_relay_scope_role = "subagent"`. `compaction` counts the exact
+owner-local mark name `compaction` or normalized hook name `precompact`,
+`postcompact`, or `compaction`.
+
+Canonicalizer version `1` defaults to `32768` instruction bytes, `16384` user
+task bytes, `8` context messages, `32768` canonical context bytes, and `4096`
+position-feature bytes. Every limit must be positive. `position_features` can
+be empty or contain the unique registered name `turn_index`. When enabled,
+eligible calls must supply a nonnegative `u64` JSON integer under that exact
+sanitized metadata key; Router does not infer it from event order.
+
+Omitted `learning` and an explicit empty table both disable vectorization for
+the pool. A minimal nonempty table contains exactly `version = 1` and an
+`embedder` ID that resolves to one configured profile. It enables Shadow
+embedding and vector materialization without confidence decisions. A complete
+policy adds every field in the next section. Supplying only some statistical
+fields is invalid in every mode. Active adds three all-or-none learning fields
+and requires a complete nonempty `outcome` section.
+
+## Configure Recommendation Confidence
+
+Shadow mode accepts a complete policy for evidence warm-up. Recommend mode
+requires this complete shape for every pool:
+
+```toml
+[components.config.pools.learning]
+version = 1
+embedder = "local-embedding-v1"
+top_k = 32
+radius = 0.35
+min_points = 12
+min_independent_roots = 8
+min_effective_samples = 6.0
+min_coverage = 0.8
+time_decay_half_life_seconds = 604800.0
+prior_success = 1.0
+prior_failure = 1.0
+familywise_credible_level = 0.95
+promotion_lower_bound = 0.9
+```
+
+The complete policy uses the following bounds:
+
+| Field | Rule |
+|---|---|
+| `top_k` | Integer in `[1, 4095]`. |
+| `radius` | Finite value in `(0, 2]`. |
+| `min_points` | Integer in `[1, top_k]`. |
+| `min_independent_roots` | Integer in `[1, top_k]`. |
+| `min_effective_samples` | Finite value in `(0, top_k]`. |
+| `min_coverage` | Finite value in `[0, 1]`. |
+| `time_decay_half_life_seconds` | Positive finite value. |
+| `prior_success`, `prior_failure` | Positive finite values. |
+| `familywise_credible_level` | Finite value in `(0.5, 1)`. |
+| `promotion_lower_bound` | Finite value in `[0, 1]`. |
+
+A complete policy permits at most 64 configured candidates. The checked
+product `candidate_count * top_k` must not exceed `4095`. Recommend also uses a
+fixed four-slot process-wide computation and audit-delivery bound and a 32 MiB
+maximum decision command. These limits fail closed without truncation. Refer
+to [Router Recommendation Confidence](/router/recommendation-confidence) for
+root selection, coverage, weighted confidence, candidate correction, reasons,
+and audit delivery.
+
+## Configure Active Learning and Outcomes
+
+Active mode requires the complete recommendation policy plus
+`retention_lower_bound`, `holdout_probability`, and
+`active_canary_fraction`. The retention bound must be nonnegative and lower
+than `promotion_lower_bound`. Holdout must be in `(0, 0.25]`, canary must be in
+`(0, 1)`, and their sum must be less than `1`.
+
+Every Active pool also requires a strict version-1 `outcome` policy. It defines
+bounded success and failure matchers, representative and Tool dispositions,
+attribution and decay horizons, treatment and control support minima,
+noninferiority and rollback probabilities, fixed look size, lifetime canary
+cap, authorization TTL, and relearning cool-off. Error and Tool failure
+dispositions must both be `failure`.
+
+Refer to [Active Canary and Outcomes](/router/active-canary-and-outcomes) for a
+complete configuration fragment, exact bounds, randomized arms, outcome
+attribution, operator controls, and rollout behavior.
+
+## Configure the Judge
+
+Every configured pool requires the Judge fields shown in the example,
+including pools supplied while mode is `off`. Judge fields are strict: an
+unknown field is always an error, independent of the root unknown-field policy.
+The optional `temperature` field defaults to the existing fixed value `0.0`.
+Set it explicitly when a pinned Judge model requires another value; for
+example, NVIDIA Inference GPT-5.5 requires `temperature = 1.0`.
+
+The version 1 contract enforces these rules:
+
+- `version` and `output_schema_version` equal `1`.
+- `prompt_version` equals `pairwise-equivalence-v1` and `rubric_version` equals
+  `response-trajectory-equivalence-v1`.
+- `model_revision` is pinned, and the model is usable through the same
+  family-specific replay transport as the pool.
+- `temperature`, when present, is finite and in the inclusive range `[0, 1]`.
+  A nondefault value is part of the Judge policy identity; explicit `0.0` and
+  omission normalize to the same legacy behavior.
+- `response_weight` and `trajectory_weight` are finite, nonnegative, and sum to
+  `1.0` within `1e-9`.
+- Score floors, confidence floor, and pass threshold are finite values in the
+  inclusive range `[0, 1]`.
+- `max_rationale_bytes` is in `[1, 16384]`. The provider output-token bound is
+  `512 + ceil(max_rationale_bytes / 4)` with checked integer arithmetic.
+- `base_cooloff_seconds` and `max_cooloff_seconds` are positive, and the maximum
+  is not less than the base.
+
+Refer to [Shadow Evaluation and Evidence](/router/shadow-evaluation-and-evidence)
+for scoring, repair, ambiguity, and cool-off behavior.
+
+## Understand Derived Capacity
+
+Each pool owns `max_pending` batch slots and
+`max_pending * max_candidates_per_sample` candidate slots. Candidate-slot
+capacity is shared across Shadow-ready and Judge-ready work because one
+candidate can occupy only one stage at a time. The sum of batch slots and the
+sum of candidate slots across all pools must each be at most `65536` and fit
+Tokio's semaphore limit.
+
+The sole-writer command capacity is derived as
+`clamp(256 + 4 * total_candidate_slots, 256, 65536)`. Configuration validation
+uses checked arithmetic and rejects values that cannot be represented.
+
+Recommend capacity is independent of Shadow scheduler slots. The process owns
+four recommendation and audit-delivery slots. Admission reserves one slot
+before preflight, so foreground computation and retained pending audits share
+the same fixed bound.
+
+Active foreground admission uses a separate process-wide four-slot bound. An
+admitted request owns one slot through durable arm admission, the single
+provider call, outcome staging, and terminal dispatch reporting. Each owner
+outcome window is also bounded by the configured lookahead event and byte
+limits; overflow terminalizes the window instead of truncating it.
+
+## Configure Embedders
+
+Each embedder profile requires `id`, `base_url`, `model`, a pinned
+`provider_revision`, positive `dimensions`, and positive `timeout_ms`.
+`api_key_env` is optional. `max_in_flight` defaults to `4`, and `batch_size`
+defaults to `16`. Dimensions must be at most `8192`, timeout at most `55000`
+milliseconds, `max_in_flight` at most `256`, and `batch_size` at most `128`.
+Across distinct referenced profile versions, the checked sum of
+`max_in_flight * batch_size` must be at most `65536`.
+
+For each profile, activation derives the configured-batch response ceiling as
+`1 MiB + batch_size * dimensions * 32` and rejects a result above the absolute
+64 MiB validation cap. Each provider call substitutes its actual input count
+(`expected_count`) for `batch_size` and uses that call-specific value as its
+streamed response ceiling.
+
+All referenced profiles share one conservative 256 MiB activation-wide byte
+governor. Before a durable claim or HTTP request, each admitted provider permit
+reserves three 32 MiB request-sized buffers, its configured-batch response
+ceiling, and 16 bytes per configured-batch vector component for decoded `f64`,
+normalized `f32`, and retained blob `f32` values. Request construction uses
+borrowed canonical-query references and a bounded JSON writer; the three-buffer
+reservation remains deliberately conservative. Therefore, `max_in_flight` is
+an upper bound. Byte saturation can admit fewer requests and uses the existing
+background defer or live `Unavailable` path. The per-call streamed response
+ceiling still uses the actual input count.
+
+Plain HTTP endpoints are accepted only for `localhost` or a literal loopback
+IP address. HTTPS loopback is accepted without opt-in. Remote HTTPS requires
+`allow_remote_embedding_egress = true`. Other schemes and URLs with userinfo,
+query, fragment data, or an existing `embeddings` suffix are rejected.
+`base_url` is a prefix; Router appends exactly one `embeddings` path segment.
+
+`api_key_env` validates and stores an environment-variable name, never a
+credential value. In `shadow`, `recommend`, or `active` mode, Router reads the
+named
+nonempty value only when activating a profile referenced by a pool. An
+unreferenced profile causes no credential read or provider traffic. `localhost`
+is resolved and pinned to loopback addresses during activation; remote DNS is
+resolved by the HTTPS client. Redirects and environment/system proxies are
+disabled.
+
+Refer to [Embeddings and Vector Store](/router/embeddings-and-vector-store) for
+pool association, canonical query content, cache and retry behavior, remote
+egress, and privacy implications.
+
+## Track Generation Identity
+
+For valid typed configuration, `config_generation_id()` returns lowercase
+SHA-256 over RFC 8785 canonical JSON. ID-keyed collections and selector sets
+are sorted, so insertion order does not affect the ID. Typed behavior changes
+do affect it. The generation includes mode, the Judge contract and compiled
+hashes, derived scheduler policy, sanitizer versions, candidate set, and
+lookahead. Ignored unknown fields and external credential values are excluded.
+
+Pool policy identity excludes mode. A mode-only transition from `shadow` to
+`recommend` or `active` with the same complete policy preserves the shared
+learning evidence partition. Active identity additionally includes its three
+learning fields, outcome policy, cohort salt, control generation, arm
+assignment algorithm, and authorization contract. Every statistical field
+and fixed version-1 algorithm identifier is part of the policy identity,
+including linear radius, root selection, coverage, time decay, future-skew
+handling, Neumaier summation, Kish effective sample size, weighted Beta
+approximation, Bonferroni candidate correction, pinned Beta inverse CDF, and
+candidate-set hashing.

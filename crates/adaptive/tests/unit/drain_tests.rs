@@ -13,8 +13,9 @@ use crate::types::metadata::MetadataEnvelope;
 use crate::types::plan::{ExecutionPlan, ParallelGroup};
 use crate::types::records::RunRecord;
 use nemo_relay::api::event::{
-    BaseEvent, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
+    BaseEvent, CategoryProfile, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
 };
+use nemo_relay::api::llm::LlmCallRole;
 use nemo_relay::api::scope::ScopeType;
 use serde_json::json;
 use std::future::Future;
@@ -115,6 +116,45 @@ fn make_event(
             None,
         )),
     }
+}
+
+fn with_llm_call_role_value(mut event: Event, value: serde_json::Value) -> Event {
+    let Event::Scope(scope) = &mut event else {
+        panic!("LLM role test fixture must be a scope event");
+    };
+    scope
+        .category_profile
+        .get_or_insert_with(CategoryProfile::default)
+        .extra
+        .insert("call_role".to_string(), value);
+    event
+}
+
+fn with_evaluator_identity(
+    mut event: Event,
+    role: LlmCallRole,
+    anchor_uuid: Uuid,
+    anchor_id: Uuid,
+) -> Event {
+    let Event::Scope(scope) = &mut event else {
+        panic!("evaluator LLM fixture must be a scope event");
+    };
+    scope.base.metadata = Some(json!({
+        "anchor_uuid": anchor_uuid.to_string(),
+        "anchor_id": anchor_id.to_string(),
+        "pool_id": "primary",
+        "candidate_id": scope.base.name,
+        "config_generation_id": "primary-generation",
+        "learning_generation_id": anchor_uuid.to_string(),
+        "call_role": "primary",
+        "name": "my-agent",
+    }));
+    let profile = scope
+        .category_profile
+        .get_or_insert_with(CategoryProfile::default);
+    profile.model_name = Some("hostile-primary-model".to_string());
+    profile.set_llm_call_role(role);
+    event
 }
 
 /// Helper: make an Agent Start event whose own uuid acts as the inferred root.
@@ -396,6 +436,166 @@ fn test_accumulator_collects_calls() {
         run.calls[1].ended_at.is_some(),
         "llm call should have ended_at"
     );
+}
+
+#[test]
+fn test_accumulator_ignores_evaluator_lifecycles_before_primary_progress() {
+    use nemo_relay::codec::response::AnnotatedLlmResponse;
+
+    let mut acc = RunAccumulator::new("agent-1".to_string());
+    let agent_start = make_agent_start();
+    let root_uuid = agent_start.uuid();
+    acc.process_event(&agent_start);
+
+    for (index, (role, name)) in [
+        (LlmCallRole::Shadow, "nemo_relay.router.shadow"),
+        (LlmCallRole::Judge, "nemo_relay.router.judge"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let primary_uuid = Uuid::now_v7();
+        let primary_start = with_llm_call_role_value(
+            make_event(
+                EventType::Start,
+                Some(ScopeType::Llm),
+                Some(name),
+                primary_uuid,
+                Some(root_uuid),
+            ),
+            json!(LlmCallRole::Primary),
+        );
+        acc.process_event(&primary_start);
+
+        let evaluator_uuid = Uuid::now_v7();
+        let evaluator_start = make_event(
+            EventType::Start,
+            Some(ScopeType::Evaluator),
+            Some("nemo_relay.router.evaluator"),
+            evaluator_uuid,
+            Some(root_uuid),
+        );
+        acc.process_event(&evaluator_start);
+
+        let internal_uuid = Uuid::now_v7();
+        let internal_start = with_evaluator_identity(
+            make_event(
+                EventType::Start,
+                Some(ScopeType::Llm),
+                Some(name),
+                internal_uuid,
+                Some(evaluator_uuid),
+            ),
+            role,
+            root_uuid,
+            primary_uuid,
+        );
+        let internal_end = with_evaluator_identity(
+            make_llm_end_with_annotated(
+                internal_uuid,
+                Some(evaluator_uuid),
+                name,
+                AnnotatedLlmResponse {
+                    id: None,
+                    model: Some("hostile-primary-model".to_string()),
+                    message: None,
+                    tool_calls: None,
+                    finish_reason: None,
+                    usage: None,
+                    optimization_summary: None,
+                    api_specific: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+            role,
+            root_uuid,
+            primary_uuid,
+        );
+
+        assert!(acc.process_event(&internal_start).is_none());
+        assert!(acc.process_event(&internal_end).is_none());
+        assert!(!acc.event_roots.contains_key(&internal_uuid));
+        assert_eq!(acc.event_roots.get(&evaluator_uuid), Some(&root_uuid));
+        assert_eq!(acc.event_roots.get(&primary_uuid), Some(&root_uuid));
+        assert_eq!(acc.open_run_count(), 1);
+
+        let open_run = acc.open_runs.get(&root_uuid).expect("run stays open");
+        assert_eq!(open_run.calls.len(), index + 1);
+        let primary_call = open_run.calls.last().expect("primary call is retained");
+        assert_eq!(primary_call.name, name);
+        assert!(primary_call.ended_at.is_none());
+        assert!(primary_call.annotated_response.is_none());
+        assert!(primary_call.model_name.is_none());
+
+        let primary_end = with_llm_call_role_value(
+            make_llm_end_with_annotated(
+                primary_uuid,
+                Some(root_uuid),
+                name,
+                AnnotatedLlmResponse {
+                    id: None,
+                    model: Some(format!("primary-model-{index}")),
+                    message: None,
+                    tool_calls: None,
+                    finish_reason: None,
+                    usage: None,
+                    optimization_summary: None,
+                    api_specific: None,
+                    extra: serde_json::Map::new(),
+                },
+            ),
+            json!(LlmCallRole::Primary),
+        );
+        acc.process_event(&primary_end);
+
+        let evaluator_end = make_event(
+            EventType::End,
+            Some(ScopeType::Evaluator),
+            Some("nemo_relay.router.evaluator"),
+            evaluator_uuid,
+            Some(root_uuid),
+        );
+        acc.process_event(&evaluator_end);
+        assert!(!acc.event_roots.contains_key(&evaluator_uuid));
+    }
+
+    let run = acc
+        .process_event(&make_agent_end(root_uuid))
+        .expect("should return completed run");
+    assert_eq!(run.calls.len(), 2);
+    assert!(run.calls.iter().all(|call| call.ended_at.is_some()));
+    assert_eq!(run.calls[0].model_name.as_deref(), Some("primary-model-0"));
+    assert_eq!(run.calls[1].model_name.as_deref(), Some("primary-model-1"));
+}
+
+#[test]
+fn test_accumulator_ignores_fresh_root_embedder_lifecycle() {
+    let mut acc = RunAccumulator::new("agent-1".to_string());
+    let implicit_root_uuid = Uuid::now_v7();
+    let embedder_uuid = Uuid::now_v7();
+    let embedder_start = make_event(
+        EventType::Start,
+        Some(ScopeType::Embedder),
+        Some("nemo_relay.router.embedder"),
+        embedder_uuid,
+        Some(implicit_root_uuid),
+    );
+    let embedder_end = make_event(
+        EventType::End,
+        Some(ScopeType::Embedder),
+        Some("nemo_relay.router.embedder"),
+        embedder_uuid,
+        Some(implicit_root_uuid),
+    );
+
+    assert!(event_to_call_record(&embedder_start).is_none());
+    assert!(acc.process_event(&embedder_start).is_none());
+    assert_eq!(acc.open_run_count(), 0);
+    assert!(acc.event_roots.is_empty());
+
+    assert!(acc.process_event(&embedder_end).is_none());
+    assert_eq!(acc.open_run_count(), 0);
+    assert!(acc.event_roots.is_empty());
 }
 
 #[test]

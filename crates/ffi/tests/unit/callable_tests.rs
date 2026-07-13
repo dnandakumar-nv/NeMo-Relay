@@ -414,6 +414,7 @@ fn test_wrap_llm_request_intercept_with_annotated_input() {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

@@ -7,13 +7,14 @@ use serde::de::DeserializeOwned;
 use super::core::PyLLMRequest;
 use super::{
     AnnotatedLLMRequest, AnnotatedLLMResponse, Arc, Bound, GenerationParams, LlmCodec,
-    LlmResponseCodec, Message, PyAny, PyResult, Python, ToolChoice, ToolDefinition, json_to_py,
-    py_to_json, to_python_json_value,
+    LlmResponseCodec, Message, PyAny, PyResult, Python, StructuredResponseFormat, ToolChoice,
+    ToolDefinition, json_to_py, py_to_json, to_python_json_value,
 };
 #[cfg(test)]
 use super::{
     FORCE_ANNOTATED_REQUEST_MESSAGES_SERIALIZATION_ERROR,
     FORCE_ANNOTATED_REQUEST_PARAMS_SERIALIZATION_ERROR,
+    FORCE_ANNOTATED_REQUEST_RESPONSE_FORMAT_SERIALIZATION_ERROR,
     FORCE_ANNOTATED_REQUEST_TOOL_CHOICE_SERIALIZATION_ERROR,
     FORCE_ANNOTATED_REQUEST_TOOLS_SERIALIZATION_ERROR,
     FORCE_ANNOTATED_RESPONSE_API_SPECIFIC_SERIALIZATION_ERROR,
@@ -39,6 +40,7 @@ use nemo_relay::codec::response::FinishReason;
 ///     params (dict | None): Normalized generation parameters.
 ///     tools (list | None): Tool definitions (function schemas).
 ///     tool_choice (Any | None): Tool choice control.
+///     response_format (dict | None): Normalized structured response format.
 ///     extra (dict): Provider-specific extra fields.
 ///
 /// Helper methods:
@@ -83,20 +85,22 @@ impl PyAnnotatedLLMRequest {
     ///     params: Optional generation parameters dict.
     ///     tools: Optional list of tool definition dicts.
     ///     tool_choice: Optional tool choice control.
+    ///     response_format: Optional normalized structured response format.
     ///     extra: Optional dict of provider-specific extra fields.
     #[new]
-    #[pyo3(signature = (messages, *, model=None, params=None, tools=None, tool_choice=None, extra=None))]
+    #[pyo3(signature = (messages, *, model=None, params=None, tools=None, tool_choice=None, response_format=None, extra=None))]
     pub(crate) fn new(
         messages: &Bound<'_, PyAny>,
         model: Option<String>,
         params: Option<&Bound<'_, PyAny>>,
         tools: Option<&Bound<'_, PyAny>>,
         tool_choice: Option<&Bound<'_, PyAny>>,
+        response_format: Option<&Bound<'_, PyAny>>,
         extra: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let msgs: Vec<Message> = pythonize::depythonize(messages).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid messages: each dict must include a 'role' key (user/system/assistant/tool): {e}"
+                "invalid messages: each dict must include a 'role' key (user/system/developer/assistant/tool): {e}"
             ))
         })?;
         let gen_params: Option<GenerationParams> = match params {
@@ -119,6 +123,14 @@ impl PyAnnotatedLLMRequest {
             }
             _ => None,
         };
+        let response_format: Option<StructuredResponseFormat> = match response_format {
+            Some(value) if !value.is_none() => {
+                Some(pythonize::depythonize(value).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("invalid response_format: {e}"))
+                })?)
+            }
+            _ => None,
+        };
         let extra_map: serde_json::Map<String, serde_json::Value> = match extra {
             Some(e) if !e.is_none() => pythonize::depythonize(e).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!("invalid extra: {e}"))
@@ -132,6 +144,7 @@ impl PyAnnotatedLLMRequest {
                 params: gen_params,
                 tools: tool_defs,
                 tool_choice: tc,
+                response_format,
                 store: None,
                 previous_response_id: None,
                 truncation: None,
@@ -165,7 +178,7 @@ impl PyAnnotatedLLMRequest {
     pub(crate) fn set_messages(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
         self.inner.messages = pythonize::depythonize(value).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "invalid messages: each dict must include a 'role' key (user/system/assistant/tool): {e}"
+                "invalid messages: each dict must include a 'role' key (user/system/developer/assistant/tool): {e}"
             ))
         })?;
         Ok(())
@@ -260,6 +273,34 @@ impl PyAnnotatedLLMRequest {
         } else {
             self.inner.tool_choice = Some(pythonize::depythonize(value).map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!("invalid tool_choice: {e}"))
+            })?);
+        }
+        Ok(())
+    }
+
+    #[getter]
+    pub(crate) fn response_format(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.inner.response_format {
+            Some(response_format) => {
+                let value = to_python_json_value(
+                    response_format,
+                    "serialization error",
+                    #[cfg(test)]
+                    FORCE_ANNOTATED_REQUEST_RESPONSE_FORMAT_SERIALIZATION_ERROR,
+                )?;
+                json_to_py(py, &value)
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    #[setter]
+    pub(crate) fn set_response_format(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if value.is_none() {
+            self.inner.response_format = None;
+        } else {
+            self.inner.response_format = Some(pythonize::depythonize(value).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid response_format: {e}"))
             })?);
         }
         Ok(())

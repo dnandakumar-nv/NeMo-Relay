@@ -95,8 +95,40 @@ class TestAnnotatedLLMRequestConstruction:
         assert annotated.params is None
         assert annotated.tools is None
         assert annotated.tool_choice is None
+        assert annotated.response_format is None
         # extra defaults to an empty dict (not None)
         assert annotated.extra == {} or annotated.extra is None
+
+    def test_developer_and_response_format_roundtrip(self):
+        messages = [
+            {"role": "developer", "content": "Return JSON.", "name": "policy"},
+            {"role": "user", "content": "Hello"},
+        ]
+        response_format = {
+            "kind": "json_schema",
+            "name": "answer",
+            "schema": {"type": "object", "properties": {"value": {"type": "string"}}},
+            "strict": True,
+            "extra": {"native_format": {"description": "Answer schema"}},
+        }
+
+        annotated = AnnotatedLLMRequest(
+            messages,
+            response_format=response_format,
+        )
+
+        assert annotated.messages == messages
+        assert annotated.response_format == response_format
+
+        annotated.response_format = {"kind": "json_object"}
+        assert annotated.response_format == {"kind": "json_object"}
+        annotated.response_format = None
+        assert annotated.response_format is None
+
+        with pytest.raises(ValueError, match="invalid response_format"):
+            AnnotatedLLMRequest(messages, response_format={"kind": "xml"})
+        with pytest.raises(ValueError, match="invalid response_format"):
+            setattr(annotated, "response_format", [])
 
     def test_annotated_llm_request_setter_roundtrip(self):
         """Construct, set messages to new value via setter, verify getter returns new value."""
@@ -115,6 +147,29 @@ class TestAnnotatedLLMRequestConstruction:
         assert annotated.model is None
         annotated.model = "gpt-4-turbo"
         assert annotated.model == "gpt-4-turbo"
+
+    def test_tool_strictness_constructor_and_setter_roundtrip(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "strict_true", "parameters": {"type": "object"}, "strict": True},
+            },
+            {
+                "type": "function",
+                "function": {"name": "strict_false", "parameters": {"type": "object"}, "strict": False},
+            },
+            {
+                "type": "function",
+                "function": {"name": "strict_omitted", "parameters": {"type": "object"}},
+            },
+        ]
+        annotated = AnnotatedLLMRequest([{"role": "user", "content": "hello"}], tools=tools)
+
+        assert annotated.tools == tools
+
+        updated_tools = [tools[1], tools[2], tools[0]]
+        annotated.tools = updated_tools
+        assert annotated.tools == updated_tools
 
     def test_annotated_llm_request_helpers(self):
         """Test system_prompt(), last_user_message(), has_tool_calls()."""
@@ -172,6 +227,7 @@ class TestAnnotatedLLMRequestConstruction:
             params=params,
             tools=tools_list,
             tool_choice="auto",
+            response_format={"kind": "json_object"},
             extra=extra,
         )
 
@@ -180,6 +236,7 @@ class TestAnnotatedLLMRequestConstruction:
         assert annotated.params == params
         assert annotated.tools == tools_list
         assert annotated.tool_choice == "auto"
+        assert annotated.response_format == {"kind": "json_object"}
         assert annotated.extra == extra
 
 

@@ -63,6 +63,7 @@ use nemo_relay::plugin::{
     initialize_plugins, list_plugin_kinds, register_plugin, validate_plugin_config,
 };
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
+use nemo_relay_router::register_router_component;
 use tokio::runtime::Runtime;
 
 mod adaptive;

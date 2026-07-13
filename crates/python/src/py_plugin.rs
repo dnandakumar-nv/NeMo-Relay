@@ -6,6 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[cfg(test)]
 use std::{collections::HashSet, sync::LazyLock};
 
@@ -32,9 +33,9 @@ use nemo_relay::api::subscriber::{deregister_subscriber, register_subscriber};
 use nemo_relay::error::Result as FlowResult;
 use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
-    PluginRegistrationContext, active_plugin_report, clear_plugin_configuration, deregister_plugin,
-    initialize_plugins, list_plugin_kinds, register_plugin, rollback_registrations,
-    validate_plugin_config,
+    PluginRegistrationContext, active_plugin_report, clear_plugin_configuration,
+    clear_plugin_configuration_async, deregister_plugin, initialize_plugins, list_plugin_kinds,
+    register_plugin, rollback_registrations, validate_plugin_config,
 };
 
 use crate::convert::{json_to_py, py_to_json};
@@ -705,6 +706,30 @@ fn clear_plugin_configuration_py() -> PyResult<()> {
     clear_plugin_configuration().map_err(to_py_err)
 }
 
+/// Drain and clear active plugin configuration within one shared timeout.
+#[pyfunction(name = "clear_plugin_configuration_async")]
+#[pyo3(signature = (timeout: "float"=30.0) -> "object", text_signature = "(timeout: float = 30.0) -> object")]
+fn clear_plugin_configuration_async_py<'py>(
+    py: Python<'py>,
+    timeout: f64,
+) -> PyResult<Bound<'py, PyAny>> {
+    if !timeout.is_finite() || timeout < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "timeout must be a finite non-negative number of seconds",
+        ));
+    }
+    let timeout = Duration::try_from_secs_f64(timeout).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
+            "timeout must be a finite non-negative number of seconds representable as a duration",
+        )
+    })?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        clear_plugin_configuration_async(timeout)
+            .await
+            .map_err(to_py_err)
+    })
+}
+
 #[pyfunction(name = "active_plugin_report")]
 #[pyo3(signature = () -> "object", text_signature = "() -> object")]
 fn active_plugin_report_py(py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -747,6 +772,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(validate_plugin_config_py, m)?)?;
     m.add_function(wrap_pyfunction!(initialize_plugins_py, m)?)?;
     m.add_function(wrap_pyfunction!(clear_plugin_configuration_py, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_plugin_configuration_async_py, m)?)?;
     m.add_function(wrap_pyfunction!(active_plugin_report_py, m)?)?;
     m.add_function(wrap_pyfunction!(list_plugin_kinds_py, m)?)?;
     m.add_function(wrap_pyfunction!(register_plugin_py, m)?)?;

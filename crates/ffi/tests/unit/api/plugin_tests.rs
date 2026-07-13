@@ -6,6 +6,111 @@
 use super::*;
 
 #[test]
+fn test_ffi_generic_router_config_is_registered_and_lifecycle_managed() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    reset_globals();
+    let _ = nemo_relay_clear_plugin_configuration();
+    let temporary = tempfile::tempdir().unwrap();
+    let database_path = temporary.path().join("router.sqlite3");
+    let config = cstring(
+        &json!({
+            "version": 1,
+            "components": [{
+                "kind": "router",
+                "enabled": true,
+                "config": {
+                    "version": 1,
+                    "mode": "shadow",
+                    "project_id": "ffi-router-test",
+                    "database_path": database_path,
+                    "pools": [{
+                        "id": "ffi-router-pool",
+                        "api_family": "openai_chat_completions",
+                        "anchor_models": ["anchor-model"],
+                        "anchor_revision": "2026-07-11",
+                        "sampling_probability": 1.0,
+                        "max_candidates_per_sample": 1,
+                        "selector": {},
+                        "concurrency": {"shadow": 1, "judge": 1, "max_pending": 2},
+                        "candidates": [{
+                            "id": "candidate",
+                            "model": "candidate-model",
+                            "model_revision": "2026-07-11",
+                            "cost_rank": 0
+                        }],
+                        "judge": {
+                            "version": 1,
+                            "model": "judge-model",
+                            "model_revision": "2026-07-11",
+                            "prompt_version": "pairwise-equivalence-v1",
+                            "rubric_version": "response-trajectory-equivalence-v1",
+                            "output_schema_version": 1,
+                            "response_weight": 0.5,
+                            "trajectory_weight": 0.5,
+                            "response_floor": 0.8,
+                            "trajectory_floor": 0.8,
+                            "judge_confidence_floor": 0.7,
+                            "pass_threshold": 0.85,
+                            "max_rationale_bytes": 4096,
+                            "base_cooloff_seconds": 10,
+                            "max_cooloff_seconds": 300
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+
+    unsafe {
+        let mut kinds_json = ptr::null_mut();
+        assert_eq!(
+            nemo_relay_list_plugin_kinds_json(&mut kinds_json),
+            NemoRelayStatus::Ok
+        );
+        let kinds = returned_json(kinds_json);
+        assert!(
+            kinds
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kind| kind == "router")
+        );
+
+        let mut validation_json = ptr::null_mut();
+        assert_eq!(
+            nemo_relay_validate_plugin_config(config.as_ptr(), &mut validation_json),
+            NemoRelayStatus::Ok
+        );
+        assert_eq!(returned_json(validation_json)["diagnostics"], json!([]));
+
+        let mut initialization_json = ptr::null_mut();
+        assert_eq!(
+            nemo_relay_initialize_plugins(config.as_ptr(), &mut initialization_json),
+            NemoRelayStatus::Ok
+        );
+        assert_eq!(returned_json(initialization_json)["diagnostics"], json!([]));
+        assert!(database_path.is_file());
+
+        let mut active_json = ptr::null_mut();
+        assert_eq!(
+            nemo_relay_active_plugin_report_json(&mut active_json),
+            NemoRelayStatus::Ok
+        );
+        assert_eq!(returned_json(active_json)["diagnostics"], json!([]));
+        assert_eq!(nemo_relay_clear_plugin_configuration(), NemoRelayStatus::Ok);
+    }
+}
+
+#[test]
+fn test_ffi_header_keeps_router_on_the_generic_plugin_boundary() {
+    let header = include_str!("../../../nemo_relay.h");
+    assert!(!header.contains("nemo_relay_router_"));
+    assert!(!header.contains("LlmReplayFactory"));
+    assert!(!header.contains("llm_execute_v2"));
+}
+
+#[test]
 fn test_ffi_plugin_registration_validation_and_cleanup() {
     let _guard = TEST_MUTEX.lock().unwrap();
     reset_globals();

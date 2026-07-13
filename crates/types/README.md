@@ -42,6 +42,61 @@ authoring SDKs.
 - **Optional `schema` feature**: `schemars` implementations for supported
   serializable types.
 
+## Normalized LLM Request Contracts
+
+`codec::request::Message` keeps `system` and `developer` as distinct
+instruction roles. `AnnotatedLlmRequest::response_format` represents the two
+provider-neutral structured-output modes: `json_object` and `json_schema`.
+Schema formats can carry a name, the complete JSON Schema, and an optional
+strictness flag.
+
+`StructuredResponseFormat::extra` reserves two object-valued entries for a
+lossless provider round trip:
+
+- `native_wrapper` contains unmodeled fields from the native object that owns
+  the format descriptor.
+- `native_format` contains unmodeled fields from the native format descriptor.
+
+An absent typed format preserves the legacy serialized request shape. A native
+`response_format` value that does not use a normalized `kind` remains in the
+flattened request `extra` map. Serializing both a typed format and a generic
+flattened `response_format` is rejected as ambiguous.
+
+## LLM Execution Context Contracts
+
+The `api::llm` module defines the router-neutral V2 context contracts:
+
+- `LlmApiFamily` identifies OpenAI Chat Completions, OpenAI Responses, or
+  Anthropic Messages with the stable wire values `openai_chat_completions`,
+  `openai_responses`, and `anthropic_messages`.
+- `LlmCallRole` identifies `primary`, `shadow`, or `judge` execution.
+- `LlmTrajectoryScopeSnapshot` freezes one scope's UUID, name, and type.
+- `LlmExecutionContextSnapshot` combines physical call identity, root and
+  parent identity, trajectory ownership, provider family, call role,
+  attributes, optional routing identities, and sanitized metadata.
+
+Present tenant and agent identities must be Unicode NFC, nonempty, no more
+than 256 UTF-8 bytes, free of control characters and credential syntax, and
+are preserved and compared case-sensitively. Credential syntax includes
+authorization labels and assignments, user information in URLs, private-key
+headers, JWTs, AWS access key IDs, and common provider token prefixes such as
+`nvapi-`, `sk-`, `ghp_`, `github_pat_`, `hf_`, and `xoxb-` when the value has a
+credential-like length.
+
+The V2 ownership contract uses the deepest active explicit Agent scope at or
+above the call's parent as `trajectory_owner_uuid`. It falls back to the
+implicit root and records the owner-to-parent path in ancestry order. The snapshot
+owns its data and remains stable after scopes close or asynchronous work yields.
+It never contains a request, response, header, endpoint, credential, callback,
+continuation, or runtime handle.
+
+Embedding work is not an LLM call. It uses `ScopeType::Embedder` and does not
+fabricate an `LlmApiFamily` or `LlmCallRole`.
+
+These DTOs are additive. Existing Rust V1 execution callbacks do not receive a
+snapshot, and the raw C FFI, native plugin ABI v1, and worker `grpc-v1` protocol
+gain no typed context fields.
+
 ## Installation
 
 Add the crate when implementing a Relay-adjacent SDK, protocol, or integration:

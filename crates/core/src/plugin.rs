@@ -12,12 +12,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::api::registry::{
     deregister_llm_conditional_execution_guardrail, deregister_llm_execution_intercept,
@@ -28,17 +32,18 @@ use crate::api::registry::{
     deregister_tool_execution_intercept, deregister_tool_request_intercept,
     deregister_tool_sanitize_request_guardrail, deregister_tool_sanitize_response_guardrail,
     register_llm_conditional_execution_guardrail, register_llm_execution_intercept,
-    register_llm_request_intercept, register_llm_sanitize_request_guardrail,
-    register_llm_sanitize_response_guardrail, register_llm_stream_execution_intercept,
-    register_mark_sanitize_guardrail, register_scope_sanitize_end_guardrail,
-    register_scope_sanitize_start_guardrail, register_tool_conditional_execution_guardrail,
-    register_tool_execution_intercept, register_tool_request_intercept,
-    register_tool_sanitize_request_guardrail, register_tool_sanitize_response_guardrail,
+    register_llm_execution_intercept_v2, register_llm_request_intercept,
+    register_llm_sanitize_request_guardrail, register_llm_sanitize_response_guardrail,
+    register_llm_stream_execution_intercept, register_mark_sanitize_guardrail,
+    register_scope_sanitize_end_guardrail, register_scope_sanitize_start_guardrail,
+    register_tool_conditional_execution_guardrail, register_tool_execution_intercept,
+    register_tool_request_intercept, register_tool_sanitize_request_guardrail,
+    register_tool_sanitize_response_guardrail,
 };
 use crate::api::runtime::{
-    EventSanitizeFn, EventSubscriberFn, LlmConditionalFn, LlmExecutionFn, LlmRequestInterceptFn,
-    LlmSanitizeRequestFn, LlmSanitizeResponseFn, LlmStreamExecutionFn, ToolConditionalFn,
-    ToolExecutionFn, ToolInterceptFn, ToolSanitizeFn,
+    EventSanitizeFn, EventSubscriberFn, LlmConditionalFn, LlmExecutionFn, LlmExecutionV2Fn,
+    LlmRequestInterceptFn, LlmSanitizeRequestFn, LlmSanitizeResponseFn, LlmStreamExecutionFn,
+    ToolConditionalFn, ToolExecutionFn, ToolInterceptFn, ToolSanitizeFn,
 };
 use crate::api::subscriber::{deregister_subscriber, register_subscriber};
 pub use nemo_relay_types::plugin::{ConfigDiagnostic, DiagnosticLevel};
@@ -51,7 +56,13 @@ type PluginMap = HashMap<String, Arc<dyn Plugin>>;
 static PLUGIN_HANDLERS: LazyLock<RwLock<PluginMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 static ACTIVE_PLUGIN_CONFIGURATION: LazyLock<Mutex<Option<ActivePluginConfiguration>>> =
     LazyLock::new(|| Mutex::new(None));
+static FAILED_PLUGIN_DEREGISTRATIONS: LazyLock<Mutex<Vec<PluginRegistration>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static PLUGIN_CONFIGURATION_TRANSITION: LazyLock<AsyncMutex<()>> =
+    LazyLock::new(|| AsyncMutex::new(()));
 static BUILTIN_PLUGIN_REGISTRATION: OnceLock<Result<()>> = OnceLock::new();
+
+const DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Error type for generic plugin operations.
 #[derive(Debug, Error)]
@@ -105,6 +116,22 @@ impl Default for PluginConfig {
             version: default_plugin_config_version(),
             components: vec![],
             policy: ConfigPolicy::default(),
+        }
+    }
+}
+
+/// Options that control replacement of an active plugin configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginInitializationOptions {
+    /// Shared timeout for draining the previous configuration.
+    pub shutdown_timeout: Duration,
+}
+
+impl Default for PluginInitializationOptions {
+    /// Uses a 30-second shared deadline for replacement teardown.
+    fn default() -> Self {
+        Self {
+            shutdown_timeout: DEFAULT_PLUGIN_SHUTDOWN_TIMEOUT,
         }
     }
 }
@@ -230,6 +257,22 @@ fn default_enabled() -> bool {
     true
 }
 
+/// Synchronous hook that closes a configured component to new background work.
+pub type PluginStopIntakeFn = Box<dyn FnMut() -> Result<()> + Send>;
+
+/// Future returned by a configured component's asynchronous drain hook.
+pub type PluginDrainFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+/// Asynchronous hook that drains a configured component by one absolute deadline.
+pub type PluginDrainFn = Box<dyn FnMut(Instant) -> PluginDrainFuture + Send>;
+
+/// Synchronous hook that immediately cancels a configured component's work.
+pub type PluginAbortFn = Box<dyn FnMut() -> Result<()> + Send>;
+
+/// Synchronous hook that marks component resources for failed-activation rollback.
+#[doc(hidden)]
+pub type PluginActivationRollbackFn = Box<dyn FnMut() -> Result<()> + Send>;
+
 /// Bookkeeping for one middleware/subscriber registration.
 pub struct PluginRegistration {
     /// Registration kind used for bookkeeping.
@@ -237,6 +280,10 @@ pub struct PluginRegistration {
     /// Runtime-qualified registration name.
     pub name: String,
     deregister: Box<dyn FnMut() -> Result<()> + Send>,
+    stop_intake: Option<PluginStopIntakeFn>,
+    drain: Option<PluginDrainFn>,
+    abort: Option<PluginAbortFn>,
+    activation_rollback: Option<PluginActivationRollbackFn>,
 }
 
 impl fmt::Debug for PluginRegistration {
@@ -250,6 +297,10 @@ impl fmt::Debug for PluginRegistration {
 
 impl PluginRegistration {
     /// Creates a new registration bookkeeping entry.
+    ///
+    /// The deregistration callback must make its behavior inert before it
+    /// returns, including when it reports a cleanup error. Core retains failed
+    /// callbacks for retry and blocks later activation until they succeed.
     pub fn new(
         kind: impl Into<String>,
         name: impl Into<String>,
@@ -259,7 +310,49 @@ impl PluginRegistration {
             kind: kind.into(),
             name: name.into(),
             deregister,
+            stop_intake: None,
+            drain: None,
+            abort: None,
+            activation_rollback: None,
         }
+    }
+
+    /// Creates a registration with component-owned shutdown hooks.
+    ///
+    /// Each hook is consumed on its first invocation. The hooks must also be
+    /// idempotent with respect to the component resources they own because a
+    /// process may be interrupted between lifecycle phases. `stop_intake` and
+    /// `abort` must establish their closed/inert boundary before returning,
+    /// including when they report a secondary cleanup or persistence error.
+    /// The deregistration callback has the same inert-before-error contract.
+    pub fn with_shutdown(
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        deregister: Box<dyn FnMut() -> Result<()> + Send>,
+        stop_intake: PluginStopIntakeFn,
+        drain: PluginDrainFn,
+        abort: PluginAbortFn,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+            deregister,
+            stop_intake: Some(stop_intake),
+            drain: Some(drain),
+            abort: Some(abort),
+            activation_rollback: None,
+        }
+    }
+
+    /// Adds a synchronous hook used only if the enclosing activation does not commit.
+    ///
+    /// The hook runs before ordinary stop, abort, and deregistration callbacks. A
+    /// successful configuration commit consumes it, so later clear or replacement
+    /// follows the component's normal shutdown contract.
+    #[doc(hidden)]
+    pub fn with_activation_rollback(mut self, rollback: PluginActivationRollbackFn) -> Self {
+        self.activation_rollback = Some(rollback);
+        self
     }
 }
 
@@ -267,7 +360,9 @@ impl PluginRegistration {
 ///
 /// Each `register_*` call both installs the middleware/subscriber into the
 /// NeMo Relay runtime and records the inverse deregistration closure so the host
-/// can roll back partial setup on failure.
+/// can roll back partial setup on failure. Dropping the context rolls back any
+/// registrations that have not been transferred with
+/// [`PluginRegistrationContext::into_registrations`].
 #[derive(Default)]
 pub struct PluginRegistrationContext {
     registrations: Vec<PluginRegistration>,
@@ -652,6 +747,35 @@ impl PluginRegistrationContext {
         Ok(())
     }
 
+    /// Registers a context-aware LLM execution intercept and records its rollback closure.
+    pub fn register_llm_execution_intercept_v2(
+        &mut self,
+        name: &str,
+        priority: i32,
+        callback: LlmExecutionV2Fn,
+    ) -> Result<()> {
+        let qualified_name = self.qualify_name(name);
+        register_llm_execution_intercept_v2(&qualified_name, priority, callback).map_err(
+            |err| PluginError::RegistrationFailed(format!("llm V2 execution intercept: {err}")),
+        )?;
+
+        let name_owned = qualified_name;
+        self.registrations.push(PluginRegistration::new(
+            "plugin",
+            name_owned.clone(),
+            Box::new(move || {
+                deregister_llm_execution_intercept(&name_owned)
+                    .map(|_| ())
+                    .map_err(|err| {
+                        PluginError::RegistrationFailed(format!(
+                            "llm V2 execution intercept deregistration failed: {err}"
+                        ))
+                    })
+            }),
+        ));
+        Ok(())
+    }
+
     /// Registers an LLM stream execution intercept and records its rollback closure.
     pub fn register_llm_stream_execution_intercept(
         &mut self,
@@ -750,9 +874,18 @@ impl PluginRegistrationContext {
         self.registrations.extend(registrations);
     }
 
-    /// Consumes the context and returns the recorded registrations.
-    pub fn into_registrations(self) -> Vec<PluginRegistration> {
-        self.registrations
+    /// Consumes the context and transfers ownership of recorded registrations.
+    ///
+    /// The returned registrations become the caller's teardown responsibility;
+    /// they are not rolled back when this context is dropped.
+    pub fn into_registrations(mut self) -> Vec<PluginRegistration> {
+        std::mem::take(&mut self.registrations)
+    }
+}
+
+impl Drop for PluginRegistrationContext {
+    fn drop(&mut self) {
+        rollback_registrations(&mut self.registrations);
     }
 }
 
@@ -872,6 +1005,34 @@ pub fn deregister_plugin(plugin_kind: &str) -> bool {
         .ok()
         .and_then(|mut guard| guard.remove(plugin_kind))
         .is_some()
+}
+
+/// Removes a plugin only when the registry still contains the same instance.
+///
+/// This compare-and-remove operation is useful for independently registered
+/// singleton components. It prevents a component from removing an unrelated
+/// implementation that acquired the same kind between a lookup and cleanup.
+///
+/// # Parameters
+/// - `plugin`: Exact plugin instance expected in the registry.
+///
+/// # Returns
+/// `true` when that exact [`Arc`] instance was removed. Returns `false` when
+/// the kind is absent, a different instance is registered, or the registry
+/// lock is poisoned.
+///
+/// # Notes
+/// Active component registrations created by previous initialization calls are
+/// not removed by this function.
+pub fn deregister_plugin_if(plugin: &Arc<dyn Plugin>) -> bool {
+    let Ok(mut guard) = PLUGIN_HANDLERS.write() else {
+        return false;
+    };
+    let plugin_kind = plugin.plugin_kind();
+    let is_same = guard
+        .get(plugin_kind)
+        .is_some_and(|registered| Arc::ptr_eq(registered, plugin));
+    is_same && guard.remove(plugin_kind).is_some()
 }
 
 /// Lists registered plugin kinds in sorted order.
@@ -1106,10 +1267,29 @@ pub fn plugin_config_schema() -> Json {
 /// is removed before the new configuration is activated.
 #[doc(hidden)]
 pub async fn initialize_plugins_exact(config: PluginConfig) -> Result<ConfigReport> {
+    initialize_plugins_exact_with_options(config, PluginInitializationOptions::default()).await
+}
+
+/// Configures the active global plugin components with replacement options.
+///
+/// An active configuration is stopped and drained before the replacement is
+/// registered. A teardown failure leaves the runtime without an active plugin
+/// configuration. A registration failure restores the previous configuration
+/// when possible.
+#[doc(hidden)]
+pub async fn initialize_plugins_exact_with_options(
+    config: PluginConfig,
+    options: PluginInitializationOptions,
+) -> Result<ConfigReport> {
     let report = validate_plugin_config(&config);
     if report.has_errors() {
         return Err(PluginError::InvalidConfig(join_error_messages(&report)));
     }
+
+    reject_subscriber_dispatcher_transition()?;
+    let _transition = PLUGIN_CONFIGURATION_TRANSITION.lock().await;
+    retry_failed_plugin_deregistrations()?;
+    let deadline = shutdown_deadline(options.shutdown_timeout)?;
 
     let previous = {
         let mut guard = ACTIVE_PLUGIN_CONFIGURATION.lock().map_err(|err| {
@@ -1119,26 +1299,38 @@ pub async fn initialize_plugins_exact(config: PluginConfig) -> Result<ConfigRepo
     };
 
     if let Some(mut previous_state) = previous {
-        rollback_registrations(&mut previous_state.registrations);
-        match initialize_plugin_components(&config).await {
-            Ok(registrations) => {
-                store_active_plugin_configuration(config, report.clone(), registrations)?;
-                Ok(report)
-            }
-            Err(err) => match initialize_plugin_components(&previous_state.config).await {
-                Ok(registrations) => {
-                    let previous_report = validate_plugin_config(&previous_state.config);
-                    store_active_plugin_configuration(
-                        previous_state.config,
-                        previous_report,
-                        registrations,
-                    )?;
-                    Err(err)
+        let previous_config = previous_state.config.clone();
+        let previous_report = previous_state.report.clone();
+        let mut previous_registrations =
+            TakenPluginRegistrations::new(std::mem::take(&mut previous_state.registrations));
+        let teardown =
+            teardown_registrations_async(&mut previous_registrations.registrations, deadline).await;
+        previous_registrations.finish_cleanup();
+        teardown?;
+        let activation = initialize_plugin_components(&config)
+            .await
+            .and_then(|registrations| {
+                store_active_plugin_configuration(config, report.clone(), registrations)
+            });
+        match activation {
+            Ok(()) => Ok(report),
+            Err(err) => {
+                let restoration = initialize_plugin_components(&previous_config)
+                    .await
+                    .and_then(|registrations| {
+                        store_active_plugin_configuration(
+                            previous_config,
+                            previous_report,
+                            registrations,
+                        )
+                    });
+                match restoration {
+                    Ok(()) => Err(err),
+                    Err(restore_err) => Err(PluginError::RegistrationFailed(format!(
+                        "{err}; previous plugin configuration could not be restored: {restore_err}"
+                    ))),
                 }
-                Err(restore_err) => Err(PluginError::RegistrationFailed(format!(
-                    "{err}; previous plugin configuration could not be restored: {restore_err}"
-                ))),
-            },
+            }
         }
     } else {
         let registrations = initialize_plugin_components(&config).await?;
@@ -1153,10 +1345,22 @@ pub async fn initialize_plugins_exact(config: PluginConfig) -> Result<ConfigRepo
 /// default `version`/`policy`/`enabled` override the file, while `config` bodies
 /// merge field-by-field. Delegates to [`initialize_plugins_exact`].
 pub async fn initialize_plugins(config: PluginConfig) -> Result<ConfigReport> {
+    initialize_plugins_with_options(config, PluginInitializationOptions::default()).await
+}
+
+/// Validates and activates `config` with replacement options.
+///
+/// File-based configuration discovery and layering are identical to
+/// [`initialize_plugins`]. `options.shutdown_timeout` bounds teardown of an
+/// existing configuration.
+pub async fn initialize_plugins_with_options(
+    config: PluginConfig,
+    options: PluginInitializationOptions,
+) -> Result<ConfigReport> {
     let mut base = resolve_default_file_plugin_config()?;
     layer_config(&mut base, serde_json::to_value(config)?);
     let config: PluginConfig = serde_json::from_value(base)?;
-    initialize_plugins_exact(config).await
+    initialize_plugins_exact_with_options(config, options).await
 }
 
 /// Resolves the default `plugins.toml` layering into one JSON document, or an
@@ -1288,15 +1492,20 @@ pub fn user_config_dir() -> Option<PathBuf> {
 /// has been cleared.
 ///
 /// # Errors
-/// Returns an error when the active configuration lock is poisoned.
+/// Returns an error when another configuration transition is active, when the
+/// function is called reentrantly from a subscriber callback, or when any
+/// flush, abort, or deregistration operation fails. A failed deregistration is
+/// retained for retry before the next configuration mutation.
 ///
 /// # Notes
 /// Clearing active configuration does not remove plugin kinds from the global
-/// registry.
+/// registry. This synchronous API stops intake, flushes queued subscribers,
+/// aborts component work, and deregisters without awaiting drain hooks.
 pub fn clear_plugin_configuration() -> Result<()> {
-    let flush_error = crate::api::runtime::flush_subscribers()
-        .err()
-        .map(|error| error.to_string());
+    reject_subscriber_dispatcher_transition()?;
+    let _transition = PLUGIN_CONFIGURATION_TRANSITION.try_lock().map_err(|_| {
+        PluginError::Conflict("plugin configuration transition is already in progress".into())
+    })?;
     let previous = {
         let mut guard = ACTIVE_PLUGIN_CONFIGURATION.lock().map_err(|err| {
             PluginError::Internal(format!("active plugin configuration lock poisoned: {err}"))
@@ -1304,12 +1513,47 @@ pub fn clear_plugin_configuration() -> Result<()> {
         guard.take()
     };
     if let Some(mut previous_state) = previous {
-        rollback_registrations(&mut previous_state.registrations);
+        let mut registrations =
+            TakenPluginRegistrations::new(std::mem::take(&mut previous_state.registrations));
+        let result = teardown_registrations_immediate(&mut registrations.registrations, true);
+        registrations.finish_cleanup();
+        result
+    } else {
+        let mut errors = Vec::new();
+        flush_subscriber_dispatcher(&mut errors);
+        teardown_result(errors)
     }
-    if let Some(message) = flush_error {
-        return Err(PluginError::Internal(message));
+}
+
+/// Drains and clears all configured plugin components by one shared deadline.
+///
+/// Intake closes before queued subscribers are flushed. Components then drain
+/// in reverse registration order. Failed, timed-out, and unattempted drains are
+/// aborted before every registration is deregistered in reverse order. The
+/// active configuration remains empty even when teardown returns an error;
+/// failed deregistration callbacks are retained for retry before the next
+/// configuration mutation.
+pub async fn clear_plugin_configuration_async(timeout: Duration) -> Result<()> {
+    reject_subscriber_dispatcher_transition()?;
+    let _transition = PLUGIN_CONFIGURATION_TRANSITION.lock().await;
+    let deadline = shutdown_deadline(timeout)?;
+    let previous = {
+        let mut guard = ACTIVE_PLUGIN_CONFIGURATION.lock().map_err(|err| {
+            PluginError::Internal(format!("active plugin configuration lock poisoned: {err}"))
+        })?;
+        guard.take()
+    };
+    if let Some(mut previous_state) = previous {
+        let mut registrations =
+            TakenPluginRegistrations::new(std::mem::take(&mut previous_state.registrations));
+        let result = teardown_registrations_async(&mut registrations.registrations, deadline).await;
+        registrations.finish_cleanup();
+        result
+    } else {
+        let mut errors = Vec::new();
+        flush_subscriber_dispatcher(&mut errors);
+        teardown_result(errors)
     }
-    Ok(())
 }
 
 /// Returns the last successfully configured plugin report.
@@ -1330,15 +1574,307 @@ pub fn active_plugin_report() -> Option<ConfigReport> {
         .and_then(|guard| guard.as_ref().map(|state| state.report.clone()))
 }
 
-/// Rolls back registrations in reverse order, ignoring rollback failures.
+/// Rolls back registrations in reverse order.
 ///
 /// This is used internally during failed initialization and by
-/// [`clear_plugin_configuration`].
+/// [`clear_plugin_configuration`]. Failed inverse callbacks are quarantined
+/// for retry before another configuration can activate.
 pub fn rollback_registrations(registrations: &mut Vec<PluginRegistration>) {
+    rollback_activation_hooks(registrations);
+    let _ = teardown_registrations_immediate(registrations, false);
+    quarantine_failed_plugin_deregistrations(registrations);
+}
+
+fn rollback_activation_hooks(registrations: &mut [PluginRegistration]) {
     for registration in registrations.iter_mut().rev() {
-        let _ = (registration.deregister)();
+        if let Some(rollback) = registration.activation_rollback.take() {
+            let _ = catch_unwind(AssertUnwindSafe(rollback));
+        }
     }
-    registrations.clear();
+}
+
+fn commit_activation_hooks(registrations: &mut [PluginRegistration]) {
+    for registration in registrations {
+        registration.activation_rollback.take();
+    }
+}
+
+fn reject_subscriber_dispatcher_transition() -> Result<()> {
+    if crate::api::runtime::subscriber_dispatcher::is_subscriber_dispatcher_thread() {
+        return Err(PluginError::Conflict(
+            "plugin configuration cannot change from a subscriber callback".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn shutdown_deadline(timeout: Duration) -> Result<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| PluginError::InvalidConfig("plugin shutdown timeout is too large".into()))
+}
+
+fn teardown_registrations_immediate(
+    registrations: &mut Vec<PluginRegistration>,
+    flush_subscribers: bool,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    stop_registration_intake(registrations, &mut errors);
+    if flush_subscribers {
+        flush_subscriber_dispatcher(&mut errors);
+    }
+    abort_registrations(registrations, None, &mut errors);
+    deregister_registrations(registrations, &mut errors);
+    teardown_result(errors)
+}
+
+async fn teardown_registrations_async(
+    registrations: &mut Vec<PluginRegistration>,
+    deadline: Instant,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    let stop_failed = stop_registration_intake(registrations, &mut errors);
+    flush_subscriber_dispatcher(&mut errors);
+
+    let mut unfinished = registrations
+        .iter()
+        .map(|registration| registration.abort.is_some())
+        .collect::<Vec<_>>();
+
+    for index in (0..registrations.len()).rev() {
+        let Some(mut drain) = registrations[index].drain.take() else {
+            continue;
+        };
+        if Instant::now() >= deadline {
+            errors.push(registration_error(
+                &registrations[index],
+                "drain",
+                "shared deadline expired",
+            ));
+            break;
+        }
+
+        let future = match catch_unwind(AssertUnwindSafe(|| drain(deadline))) {
+            Ok(future) => future,
+            Err(_) => {
+                errors.push(registration_error(
+                    &registrations[index],
+                    "drain",
+                    "hook panicked",
+                ));
+                continue;
+            }
+        };
+        let result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            PanicSafeDrainFuture {
+                future: Some(future),
+            },
+        )
+        .await;
+        match result {
+            Ok(Ok(Ok(()))) => unfinished[index] = stop_failed[index],
+            Ok(Ok(Err(error))) => errors.push(registration_error(
+                &registrations[index],
+                "drain",
+                &error.to_string(),
+            )),
+            Ok(Err(())) => errors.push(registration_error(
+                &registrations[index],
+                "drain",
+                "future panicked",
+            )),
+            Err(_) => {
+                errors.push(registration_error(
+                    &registrations[index],
+                    "drain",
+                    "shared deadline expired",
+                ));
+                break;
+            }
+        }
+    }
+
+    abort_registrations(registrations, Some(&unfinished), &mut errors);
+    deregister_registrations(registrations, &mut errors);
+    teardown_result(errors)
+}
+
+fn stop_registration_intake(
+    registrations: &mut [PluginRegistration],
+    errors: &mut Vec<String>,
+) -> Vec<bool> {
+    let mut failed = vec![false; registrations.len()];
+    for (index, registration) in registrations.iter_mut().enumerate() {
+        let Some(stop_intake) = registration.stop_intake.take() else {
+            continue;
+        };
+        match catch_unwind(AssertUnwindSafe(stop_intake)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                failed[index] = true;
+                errors.push(registration_error(
+                    registration,
+                    "stop_intake",
+                    &error.to_string(),
+                ));
+            }
+            Err(_) => {
+                failed[index] = true;
+                errors.push(registration_error(
+                    registration,
+                    "stop_intake",
+                    "hook panicked",
+                ));
+            }
+        }
+    }
+    failed
+}
+
+fn abort_registrations(
+    registrations: &mut [PluginRegistration],
+    unfinished: Option<&[bool]>,
+    errors: &mut Vec<String>,
+) {
+    for (index, registration) in registrations.iter_mut().enumerate().rev() {
+        if unfinished.is_some_and(|unfinished| !unfinished[index]) {
+            continue;
+        }
+        let Some(abort) = registration.abort.take() else {
+            continue;
+        };
+        match catch_unwind(AssertUnwindSafe(abort)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(registration_error(
+                registration,
+                "abort",
+                &error.to_string(),
+            )),
+            Err(_) => errors.push(registration_error(registration, "abort", "hook panicked")),
+        }
+    }
+}
+
+fn deregister_registrations(registrations: &mut Vec<PluginRegistration>, errors: &mut Vec<String>) {
+    for index in (0..registrations.len()).rev() {
+        let result = {
+            let registration = &mut registrations[index];
+            catch_unwind(AssertUnwindSafe(|| (registration.deregister)()))
+        };
+        match result {
+            Ok(Ok(())) => {
+                registrations.remove(index);
+            }
+            Ok(Err(error)) => errors.push(registration_error(
+                &registrations[index],
+                "deregister",
+                &error.to_string(),
+            )),
+            Err(_) => errors.push(registration_error(
+                &registrations[index],
+                "deregister",
+                "hook panicked",
+            )),
+        }
+    }
+}
+
+fn retry_failed_plugin_deregistrations() -> Result<()> {
+    let mut pending = {
+        let mut guard = FAILED_PLUGIN_DEREGISTRATIONS.lock().map_err(|error| {
+            PluginError::Internal(format!(
+                "failed plugin deregistration lock poisoned: {error}"
+            ))
+        })?;
+        std::mem::take(&mut *guard)
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut errors = Vec::new();
+    deregister_registrations(&mut pending, &mut errors);
+    quarantine_failed_plugin_deregistrations(&mut pending);
+    teardown_result(errors)
+}
+
+fn quarantine_failed_plugin_deregistrations(registrations: &mut Vec<PluginRegistration>) {
+    if registrations.is_empty() {
+        return;
+    }
+    for registration in registrations.iter_mut() {
+        registration.stop_intake.take();
+        registration.drain.take();
+        registration.abort.take();
+    }
+    FAILED_PLUGIN_DEREGISTRATIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .append(registrations);
+}
+
+fn flush_subscriber_dispatcher(errors: &mut Vec<String>) {
+    if let Err(error) = crate::api::runtime::flush_subscribers() {
+        errors.push(format!("subscriber flush failed: {error}"));
+    }
+}
+
+fn registration_error(registration: &PluginRegistration, phase: &str, message: &str) -> String {
+    format!(
+        "{} registration '{}' {phase} failed: {message}",
+        registration.kind, registration.name
+    )
+}
+
+fn teardown_result(errors: Vec<String>) -> Result<()> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(PluginError::Internal(format!(
+            "plugin teardown failed: {}",
+            errors.join("; ")
+        )))
+    }
+}
+
+struct PanicSafeDrainFuture {
+    future: Option<PluginDrainFuture>,
+}
+
+impl PanicSafeDrainFuture {
+    fn drop_future(&mut self) -> std::result::Result<(), ()> {
+        let Some(future) = self.future.take() else {
+            return Ok(());
+        };
+        catch_unwind(AssertUnwindSafe(|| drop(future))).map_err(|_| ())
+    }
+}
+
+impl Future for PanicSafeDrainFuture {
+    type Output = std::result::Result<Result<()>, ()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let polled = {
+            let future = self
+                .future
+                .as_mut()
+                .expect("drain future polled after completion");
+            catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx)))
+        };
+        match polled {
+            Ok(Poll::Ready(result)) if self.drop_future().is_ok() => Poll::Ready(Ok(result)),
+            Ok(Poll::Ready(_)) => Poll::Ready(Err(())),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(())),
+        }
+    }
+}
+
+impl Drop for PanicSafeDrainFuture {
+    fn drop(&mut self) {
+        let _ = self.drop_future();
+    }
 }
 
 struct ActivePluginConfiguration {
@@ -1347,11 +1883,60 @@ struct ActivePluginConfiguration {
     registrations: Vec<PluginRegistration>,
 }
 
+struct TakenPluginRegistrations {
+    registrations: Vec<PluginRegistration>,
+    cleanup_on_drop: bool,
+}
+
+impl TakenPluginRegistrations {
+    fn new(registrations: Vec<PluginRegistration>) -> Self {
+        Self {
+            registrations,
+            cleanup_on_drop: true,
+        }
+    }
+
+    fn finish_cleanup(&mut self) {
+        quarantine_failed_plugin_deregistrations(&mut self.registrations);
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for TakenPluginRegistrations {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop && !self.registrations.is_empty() {
+            rollback_registrations(&mut self.registrations);
+        }
+    }
+}
+
+struct PendingPluginRegistrationContext(PluginRegistrationContext);
+
+impl PendingPluginRegistrationContext {
+    fn new(namespace: String) -> Self {
+        Self(PluginRegistrationContext::with_namespace(namespace))
+    }
+
+    fn context(&mut self) -> &mut PluginRegistrationContext {
+        &mut self.0
+    }
+
+    fn take_registrations(&mut self) -> Vec<PluginRegistration> {
+        std::mem::take(&mut self.0.registrations)
+    }
+}
+
+impl Drop for PendingPluginRegistrationContext {
+    fn drop(&mut self) {
+        rollback_registrations(&mut self.0.registrations);
+    }
+}
+
 async fn initialize_plugin_components(config: &PluginConfig) -> Result<Vec<PluginRegistration>> {
     ensure_builtin_plugins_registered()?;
     let totals = plugin_component_totals(config);
     let mut ordinals: HashMap<&str, usize> = HashMap::new();
-    let mut registrations = vec![];
+    let mut registrations = TakenPluginRegistrations::new(vec![]);
 
     for component in config
         .components
@@ -1359,7 +1944,6 @@ async fn initialize_plugin_components(config: &PluginConfig) -> Result<Vec<Plugi
         .filter(|component| component.enabled)
     {
         let Some(plugin) = lookup_plugin(&component.kind) else {
-            rollback_registrations(&mut registrations);
             return Err(PluginError::NotFound(format!(
                 "plugin component '{}' is not registered",
                 component.kind
@@ -1376,32 +1960,64 @@ async fn initialize_plugin_components(config: &PluginConfig) -> Result<Vec<Plugi
             totals.get(component.kind.as_str()).copied().unwrap_or(1),
         );
 
-        let mut ctx = PluginRegistrationContext::with_namespace(namespace);
-        if let Err(err) = plugin.register(&component.config, &mut ctx).await {
-            let mut just_registered = ctx.into_registrations();
-            rollback_registrations(&mut just_registered);
-            rollback_registrations(&mut registrations);
-            return Err(err);
-        }
-        registrations.extend(ctx.into_registrations());
+        let mut ctx = PendingPluginRegistrationContext::new(namespace);
+        plugin.register(&component.config, ctx.context()).await?;
+        registrations.registrations.extend(ctx.take_registrations());
     }
 
-    Ok(registrations)
+    Ok(std::mem::take(&mut registrations.registrations))
 }
 
 fn store_active_plugin_configuration(
     config: PluginConfig,
     report: ConfigReport,
-    registrations: Vec<PluginRegistration>,
+    mut registrations: Vec<PluginRegistration>,
 ) -> Result<()> {
-    let mut guard = ACTIVE_PLUGIN_CONFIGURATION.lock().map_err(|err| {
-        PluginError::Internal(format!("active plugin configuration lock poisoned: {err}"))
-    })?;
-    *guard = Some(ActivePluginConfiguration {
+    // Quarantine is the activation commit gate. Acquire it before active state
+    // so failed cleanup append and candidate commit have one total order.
+    let quarantine = match FAILED_PLUGIN_DEREGISTRATIONS.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let message = format!("failed plugin deregistration lock poisoned: {error}");
+            drop(error.into_inner());
+            rollback_registrations(&mut registrations);
+            return Err(PluginError::Internal(message));
+        }
+    };
+    if !quarantine.is_empty() {
+        drop(quarantine);
+        rollback_registrations(&mut registrations);
+        return Err(PluginError::Conflict(
+            "plugin activation blocked by failed deregistration cleanup".to_string(),
+        ));
+    }
+
+    let mut active = match ACTIVE_PLUGIN_CONFIGURATION.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let message = format!("active plugin configuration lock poisoned: {error}");
+            drop(error.into_inner());
+            drop(quarantine);
+            rollback_registrations(&mut registrations);
+            return Err(PluginError::Internal(message));
+        }
+    };
+    if active.is_some() {
+        drop(active);
+        drop(quarantine);
+        rollback_registrations(&mut registrations);
+        return Err(PluginError::Conflict(
+            "active plugin configuration changed during activation".to_string(),
+        ));
+    }
+    commit_activation_hooks(&mut registrations);
+    *active = Some(ActivePluginConfiguration {
         config,
         report,
         registrations,
     });
+    drop(active);
+    drop(quarantine);
     Ok(())
 }
 

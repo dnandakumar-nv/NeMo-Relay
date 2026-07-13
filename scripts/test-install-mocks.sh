@@ -8,6 +8,7 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 installer="${repo_root}/install.sh"
 test_root=$(mktemp -d)
 original_path=$PATH
+host_machine=$(uname -m)
 tests_run=0
 
 cleanup() {
@@ -100,7 +101,11 @@ case "$url" in
         printf '%s  %s\n' "$MOCK_EXPECTED_CHECKSUM" "${url##*/}" >"$output"
         ;;
     *)
-        printf '#!/bin/sh\nprintf "mock nemo-relay\\n"\n' >"$output"
+        if [ -n "${MOCK_BINARY_PATH:-}" ]; then
+            cp "$MOCK_BINARY_PATH" "$output"
+        else
+            printf '#!/bin/sh\nprintf "mock nemo-relay\\n"\n' >"$output"
+        fi
         ;;
 esac
 EOF
@@ -149,6 +154,7 @@ new_case() {
     MOCK_ACTUAL_CHECKSUM=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     MOCK_CHECKSUM_MISSING=0
     MOCK_GH_TOKEN=mock-github-token
+    MOCK_BINARY_PATH=""
     NEMO_RELAY_VERSION=0.5.0
     HOME=$home_dir
     PATH="${mock_bin}:${original_path}"
@@ -157,6 +163,7 @@ new_case() {
     GH_TOKEN=$MOCK_GH_TOKEN
     export MOCK_UNAME_S MOCK_UNAME_M MOCK_API_RESPONSE
     export MOCK_EXPECTED_CHECKSUM MOCK_ACTUAL_CHECKSUM MOCK_CHECKSUM_MISSING MOCK_GH_TOKEN
+    export MOCK_BINARY_PATH
     export GH_TOKEN NEMO_RELAY_VERSION HOME PATH MOCK_CURL_LOG MOCK_POWERSHELL_LOG
     return 0
 }
@@ -269,6 +276,26 @@ test_checksum_mismatch_preserves_existing_binary() {
     return 0
 }
 
+test_current_router_binary_installs_and_passes_package_probe() {
+    [ -n "${NEMO_RELAY_ROUTER_TEST_BINARY:-}" ] || return 0
+    new_case
+    case "$host_machine" in
+        arm64|aarch64) MOCK_UNAME_M=aarch64 ;;
+        x86_64|amd64) MOCK_UNAME_M=x86_64 ;;
+        *) fail "unsupported Router mock-test host architecture: $host_machine" ;;
+    esac
+    MOCK_BINARY_PATH=$NEMO_RELAY_ROUTER_TEST_BINARY
+    export MOCK_UNAME_M MOCK_BINARY_PATH
+    install_dir="${HOME}/router-bin"
+    run_installer --install-dir "$install_dir"
+    assert_success
+    python_command=python3
+    command -v "$python_command" >/dev/null 2>&1 || python_command=python
+    "$python_command" "${repo_root}/scripts/test-support/router_cli_package_smoke.py" \
+        "${install_dir}/nemo-relay" || fail "mock-installed Router package probe failed"
+    return 0
+}
+
 test_linux_arm64_mapping
 test_macos_arm64_mapping
 test_git_bash_windows_x86_64_mapping_and_path_update
@@ -277,5 +304,6 @@ test_unsupported_platform
 test_malformed_release_response
 test_missing_checksum_fails_closed
 test_checksum_mismatch_preserves_existing_binary
+test_current_router_binary_installs_and_passes_package_probe
 
 printf 'PASS: %s mock-only installer scenarios\n' "$tests_run"

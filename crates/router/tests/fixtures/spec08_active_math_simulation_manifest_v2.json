@@ -1,0 +1,453 @@
+{
+  "schema": "nemo.relay.router.active-math-simulation-manifest@2",
+  "normative": true,
+  "generated": false,
+  "bounds_locked_before_execution": true,
+  "supersedes": {
+    "schema": "nemo.relay.router.active-math-simulation-manifest@1",
+    "sha256": "9e1abd267485858e134d7b710c06e9ced4821a927723ba9c6ca4a4b4830a430a",
+    "status": "failed_acceptance",
+    "failed_scenario": "drift",
+    "trial_count": 10000,
+    "rollback_count": 9062,
+    "rollback_fraction_bits": "3fecff972474538f",
+    "required_minimum_bits": "3fee666666666666",
+    "rule": "the failed v1 bound was not lowered; v2 strengthens the drift input before new results"
+  },
+  "trial_seed_semantics": "one distinct unsigned-64 seed per trial",
+  "prng": {
+    "id": "splitmix64_v1",
+    "source_utf8": "state=state.wrapping_add(0x9e3779b97f4a7c15);z=state;z=(z^(z>>30)).wrapping_mul(0xbf58476d1ce4e5b9);z=(z^(z>>27)).wrapping_mul(0x94d049bb133111eb);output=z^(z>>31)",
+    "source_sha256": "9f74793114b5d7cd649316fbc3ae8857191a28e137b81e1c28af42e45aef7d35",
+    "blocked_assignment_initial_labels": "64 treatment labels followed by 64 control labels",
+    "blocked_assignment_draw_order": "for each tranche consume Fisher-Yates indices i=127 down to 1, then consume outcome, attribution, and latency draws in cap-ordinal order",
+    "fisher_yates_index_rule": "in u128 compute bound=i+1;limit=2^64-(2^64 mod bound);consume draws until u128(draw)<limit;j=draw mod bound;swap labels[i] and labels[j]",
+    "fisher_yates_rejections_consume_stream": true,
+    "assignment_calibration_draw_order": "consume holdout then conditional-treatment draw for every root",
+    "u64_probability_rule": "draw < floor(binary64_probability * 2^64)"
+  },
+  "production_algorithms": [
+    "root_outcome_reducer_v1",
+    "libm_0_2_16_exp2_force_soft_v1",
+    "future_skew_300000ms_v1",
+    "neumaier_f64_no_fma_v1",
+    "monotone_beta_quantile_bounds_isotonic_1e-11_v1",
+    "statrs_beta_cdf_0_18_0_v1",
+    "posterior_resolution_4096_4e-9_v1",
+    "bonferroni_max_looks_v1",
+    "outcome_attribution_gate_v1",
+    "noninferiority_math_v1"
+  ],
+  "shared_policy": {
+    "outcome_evaluation_batch_size": 128,
+    "max_canary_roots": 256,
+    "max_looks": 2,
+    "min_treatment_roots": 32,
+    "min_control_roots": 32,
+    "min_treatment_effective_weight_bits": "4040000000000000",
+    "min_control_effective_weight_bits": "4040000000000000",
+    "actual_outcome_half_life_seconds": 3600,
+    "noninferiority_margin_bits": "3fb999999999999a",
+    "noninferiority_probability_bits": "3fefae147ae147ae",
+    "per_look_noninferiority_threshold_bits": "3fefd70a3d70a3d7",
+    "rollback_probability_bits": "3fee666666666666",
+    "posterior_resolution_bits": "3f3000112e0be827",
+    "authorization_ttl_seconds": 3600,
+    "assignment_rule": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+    "assignment_order": "splitmix64 Fisher-Yates permutation of 64 treatment and 64 control labels",
+    "admission_rule": "exactly 128 nonholdout cap ordinals per full tranche",
+    "look_targets": [128, 256]
+  },
+  "probabilities": {
+    "p_0_10": {
+      "bits": "3fb999999999999a",
+      "threshold_hex": "1999999999999a00"
+    },
+    "p_0_20": {
+      "bits": "3fc999999999999a",
+      "threshold_hex": "3333333333333400"
+    },
+    "p_0_35": {
+      "bits": "3fd6666666666666",
+      "threshold_hex": "5999999999999800"
+    },
+    "p_0_40": {
+      "bits": "3fd999999999999a",
+      "threshold_hex": "6666666666666800"
+    },
+    "p_0_60": {
+      "bits": "3fe3333333333333",
+      "threshold_hex": "9999999999999800"
+    },
+    "p_0_65": {
+      "bits": "3fe4cccccccccccd",
+      "threshold_hex": "a666666666666800"
+    },
+    "p_0_70": {
+      "bits": "3fe6666666666666",
+      "threshold_hex": "b333333333333000"
+    },
+    "p_0_75": {
+      "bits": "3fe8000000000000",
+      "threshold_hex": "c000000000000000"
+    },
+    "p_0_80": {
+      "bits": "3fe999999999999a",
+      "threshold_hex": "ccccccccccccd000"
+    },
+    "p_0_90": {
+      "bits": "3feccccccccccccd",
+      "threshold_hex": "e666666666666800"
+    },
+    "p_0_95": {
+      "bits": "3fee666666666666",
+      "threshold_hex": "f333333333333000"
+    },
+    "p_0_98": {
+      "bits": "3fef5c28f5c28f5c",
+      "threshold_hex": "fae147ae147ae000"
+    }
+  },
+  "simulation_cache": {
+    "key_fields": [
+      "treatment_success_weight_bits",
+      "treatment_failure_weight_bits",
+      "control_success_weight_bits",
+      "control_failure_weight_bits",
+      "noninferiority_margin_bits"
+    ],
+    "cache_hit_semantics": "reuse only a result previously produced by the production posterior engine for an exactly equal key",
+    "state_transition_semantics": "every potential look invokes the production boundary reducer, including cache hits",
+    "hard_distinct_key_upper_bound": 20872,
+    "derivation": "4225 keys for 64/64 first looks plus 16641 keys for cumulative 128/128 second looks plus at most six fixed attrition/recovery keys",
+    "expected_fixed_manifest_key_count_max": 8192,
+    "rounded_or_approximate_keys_permitted": false,
+    "cache_miss_engine": "production monotone_beta_quantile_bounds_isotonic_1e-11_v1 posterior only",
+    "required_profile": "release",
+    "preflight_one_key_wall_seconds_max": "2.0",
+    "conservative_worst_case_wall_seconds_max": "41744",
+    "estimate_rule": "hard_distinct_key_upper_bound * preflight_one_key_wall_seconds_max",
+    "raw_beta_cdf_call_upper_bound": 45918400000,
+    "seed_shard_rule": "seed modulo 32",
+    "seed_shard_count": 32,
+    "parallel_exact_key_plan": {
+      "phase_one": "each seed shard emits a sorted transition log and full-bit exact-key requests without posterior decisions",
+      "merge": "coordinator lexicographically deduplicates complete five-field keys without rounding",
+      "worker_process_count": 16,
+      "worker_assignment": "sorted unique key ordinal modulo 16",
+      "worker_max_keys_at_hard_bound": 1305,
+      "worker_rule": "one serial production posterior evaluation at a time per process",
+      "phase_two": "coordinator verifies one complete production audit per requested key and replays every transition through the production reducer",
+      "hard_wall_seconds_max": 3600
+    },
+    "on_preflight_or_wall_failure": "stop without changing inputs, acceptance bounds, cache identity, or math"
+  },
+  "scenarios": [
+    {
+      "id": "assignment_calibration",
+      "seed_start": 0,
+      "seed_end_inclusive": 9999,
+      "trial_count": 10000,
+      "assignment": {
+        "kind": "unconditional_holdout_then_conditional_treatment_v1",
+        "roots_per_trial": 256,
+        "holdout_probability_bits": "3fb999999999999a",
+        "holdout_threshold_hex": "1999999999999a00",
+        "active_canary_fraction_bits": "3fc999999999999a",
+        "conditional_treatment_probability_bits": "3fcc71c71c71c71d",
+        "conditional_treatment_threshold_hex": "38e38e38e38e3a00"
+      },
+      "outcomes": "not_generated",
+      "timing": "not_applicable",
+      "attrition": "not_applicable",
+      "acceptance": {
+        "absolute_arm_frequency_error_max": "0.02",
+        "clopper_pearson_confidence": "0.99",
+        "each_discrete_effective_arm_probability_must_be_contained": true
+      }
+    },
+    {
+      "id": "null_boundary",
+      "seed_start": 10000,
+      "seed_end_inclusive": 49999,
+      "trial_count": 40000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "treatment_success_probability": "p_0_60",
+      "control_success_probability": "p_0_70",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": "complete",
+      "acceptance": {
+        "false_pass_clopper_pearson_confidence": "0.99",
+        "false_pass_upper_max": "0.012"
+      }
+    },
+    {
+      "id": "degraded",
+      "seed_start": 50000,
+      "seed_end_inclusive": 64999,
+      "trial_count": 15000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "treatment_success_probability": "p_0_40",
+      "control_success_probability": "p_0_75",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": "complete",
+      "acceptance": {
+        "rollback_by_cap_fraction_min": "0.95"
+      }
+    },
+    {
+      "id": "equal",
+      "seed_start": 65000,
+      "seed_end_inclusive": 74999,
+      "trial_count": 10000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "treatment_success_probability": "p_0_65",
+      "control_success_probability": "p_0_65",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": "complete",
+      "acceptance": {
+        "pass_by_cap_fraction_min": "0.10",
+        "pass_by_cap_fraction_max": "0.60",
+        "rollback_by_cap_fraction_max": "0.05"
+      }
+    },
+    {
+      "id": "improved",
+      "seed_start": 75000,
+      "seed_end_inclusive": 84999,
+      "trial_count": 10000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "treatment_success_probability": "p_0_75",
+      "control_success_probability": "p_0_60",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": "complete",
+      "acceptance": {
+        "pass_by_cap_fraction_min": "0.95",
+        "rollback_by_cap_fraction_max": "0.001"
+      }
+    },
+    {
+      "id": "drift",
+      "seed_start": 85000,
+      "seed_end_inclusive": 94999,
+      "trial_count": 10000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "policy_overrides": {
+        "actual_outcome_half_life_seconds": 1
+      },
+      "treatment_success_probability_by_tranche": [
+        "p_0_80",
+        "p_0_20"
+      ],
+      "control_success_probability_by_tranche": [
+        "p_0_60",
+        "p_0_80"
+      ],
+      "timing": {
+        "first_admission_unix_ms": 1800000000000,
+        "tranche_spacing_ms": 3600000,
+        "look_as_of_is_boundary_tranche_admission": true,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": "complete",
+      "acceptance": {
+        "rollback_by_cap_fraction_min": "0.95"
+      }
+    },
+    {
+      "id": "arm_latency",
+      "seed_start": 95000,
+      "seed_end_inclusive": 104999,
+      "trial_count": 10000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "outcomes": "alternating_labeled_arm_ordinal_start_success_v1",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "treatment_latency_ms": {
+          "kind": "draw_modulo_inclusive",
+          "max": 60000
+        },
+        "control_latency_ms": {
+          "kind": "draw_modulo_inclusive",
+          "max": 5000
+        },
+        "paired_baseline_latency_ms": 0,
+        "membership": "all assignments in each fully drained tranche ordered by cap ordinal"
+      },
+      "attrition": "complete",
+      "acceptance": {
+        "paired_state_mismatch_count_max": 0,
+        "paired_sufficient_statistic_mismatch_count_max": 0
+      }
+    },
+    {
+      "id": "equal_attrition",
+      "seed_start": 105000,
+      "seed_end_inclusive": 114999,
+      "trial_count": 10000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "outcomes": "alternating_labeled_arm_ordinal_start_success_v1",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": {
+        "kind": "fixed_lowest_attribution_draw_quota_per_arm_per_tranche_v1",
+        "selection_order": "ascending (attribution_draw, arm_ordinal)",
+        "treatment_labeled_per_64": 58,
+        "control_labeled_per_64": 58,
+        "outcome_pattern": "alternating_labeled_arm_ordinal_start_success_v1"
+      },
+      "acceptance": {
+        "final_attribution_gate_pass_fraction_min": "0.95",
+        "pass_with_failed_attribution_gate_count_max": 0
+      }
+    },
+    {
+      "id": "differential_attrition",
+      "seed_start": 115000,
+      "seed_end_inclusive": 124999,
+      "trial_count": 10000,
+      "assignment": "blocked_randomized_64_treatment_64_control_per_tranche_v1",
+      "outcomes": "alternating_labeled_arm_ordinal_start_success_v1",
+      "timing": {
+        "admission_unix_ms": 1800000000000,
+        "look_as_of_unix_ms": 1800000000000,
+        "terminal_latency": "ignored_for_membership"
+      },
+      "attrition": {
+        "kind": "fixed_lowest_attribution_draw_quota_per_arm_per_tranche_v1",
+        "selection_order": "ascending (attribution_draw, arm_ordinal)",
+        "treatment_labeled_per_64": 63,
+        "control_labeled_per_64": 45,
+        "outcome_pattern": "alternating_labeled_arm_ordinal_start_success_v1"
+      },
+      "acceptance": {
+        "final_attribution_gate_rejection_fraction_min": "0.98",
+        "pass_with_failed_attribution_gate_count_max": 0
+      }
+    }
+  ],
+  "deterministic_cases": [
+    {
+      "id": "effective_weight_floor",
+      "input": "both arms meet raw minima but all labels are four half-lives old",
+      "expected_state": "collecting"
+    },
+    {
+      "id": "nonzero_dyadic_decay_drift",
+      "first_tranche": {
+        "admission_unix_ms": 1800000000000,
+        "treatment_successes": 64,
+        "treatment_failures": 0,
+        "control_successes": 0,
+        "control_failures": 64
+      },
+      "second_tranche": {
+        "admission_unix_ms": 1800000600000,
+        "treatment_successes": 0,
+        "treatment_failures": 64,
+        "control_successes": 64,
+        "control_failures": 0
+      },
+      "as_of_unix_ms": 1800000600000,
+      "actual_outcome_half_life_seconds": 600,
+      "first_tranche_decay_weight_bits": "3fe0000000000000",
+      "second_tranche_decay_weight_bits": "3ff0000000000000",
+      "expected_treatment_success_weight_bits": "4040000000000000",
+      "expected_treatment_failure_weight_bits": "4050000000000000",
+      "expected_control_success_weight_bits": "4050000000000000",
+      "expected_control_failure_weight_bits": "4040000000000000",
+      "expected_state": "rollback"
+    },
+    {
+      "id": "authorization_expiry_exact_boundary",
+      "passed_as_of_unix_ms": 1800000000000,
+      "authorization_ttl_seconds": 3600,
+      "observed_at_unix_ms": 1800003600000,
+      "expected_state": "expired"
+    },
+    {
+      "id": "final_cap_without_current_pass",
+      "unresolved_assignment_count": 0,
+      "all_targets_processed": true,
+      "current_authorizing_pass": false,
+      "expected_state": "exhausted"
+    },
+    {
+      "id": "final_cap_with_current_pass",
+      "unresolved_assignment_count": 0,
+      "all_targets_processed": true,
+      "current_authorizing_pass": true,
+      "expected_state": "closed_passed"
+    },
+    {
+      "id": "future_skew_inclusive",
+      "delta_ms": -300000,
+      "expected_age_ms": 0
+    },
+    {
+      "id": "future_skew_exceeded",
+      "delta_ms": -300001,
+      "expected_error": "future_skew"
+    },
+    {
+      "id": "rollback_precedes_pass",
+      "injected_gates": "both comparison predicates true",
+      "expected_state": "rollback"
+    },
+    {
+      "id": "expired_claim_recovery",
+      "frozen_input": {
+        "as_of_unix_ms": 1800000000000,
+        "treatment_successes": 32,
+        "treatment_failures": 32,
+        "control_successes": 32,
+        "control_failures": 32,
+        "all_admission_unix_ms": 1800000000000,
+        "noninferiority_margin_bits": "3fb999999999999a"
+      },
+      "claim": {
+        "claimed_at_unix_ms": 1800000001000,
+        "lease_expires_at_unix_ms": 1800000031000,
+        "recovered_at_unix_ms": 1800000031001,
+        "old_owner_token": "00000000-0000-7000-8000-000000000001",
+        "new_owner_token": "00000000-0000-7000-8000-000000000002"
+      },
+      "expected_state_while_recomputing": "evaluating",
+      "expected_authorizing_while_recomputing": false,
+      "expected_recomputed_state": "collecting",
+      "acceptance": {
+        "old_owner_commit_accepted": false,
+        "recovered_audit_must_equal_fresh_recomputation_bits": true,
+        "recovered_cdf_call_count_must_equal_fresh_recomputation": true
+      }
+    }
+  ],
+  "allocation": {
+    "scenario_count": 9,
+    "total_trial_count": 125000,
+    "first_seed": 0,
+    "last_seed": 124999,
+    "ranges_must_be_disjoint": true,
+    "ranges_must_be_contiguous": true
+  }
+}

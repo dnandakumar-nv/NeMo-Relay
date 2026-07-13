@@ -1,0 +1,299 @@
+---
+title: "Use Router CLI and HTTP"
+sidebar-title: "CLI and HTTP"
+description: "Inspect and operate Router with the NeMo Relay CLI or the optional authenticated Axum adapter."
+position: 10
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+The NeMo Relay CLI provides local Router inspection, export, and operator
+commands. Rust hosts can also mount the same typed service through the optional
+Axum adapter. Both surfaces use the public DTOs described in [Inspect and
+Control Router](/router/inspection-and-control). The CLI also hosts the
+embedded application described in [Use the Local Router
+Dashboard](/router/dashboard).
+
+## Resolve Router Configuration
+
+Every CLI command resolves the normal merged `plugins.toml` layers and requires
+exactly one enabled component with `kind = "router"`. It rejects a missing,
+disabled, duplicate, or invalid Router component before opening the inspection
+service.
+
+Read commands open a redacted, provider-free, read-only service. Mutation
+commands validate the audit actor and reason first, then open an
+operations-capable service. The CLI does not migrate or activate Router.
+
+## Run Read Commands
+
+The exact read command tree is:
+
+```text
+nemo-relay router status [--json]
+nemo-relay router pools [--limit 1..500] [--cursor CURSOR] [--json]
+
+nemo-relay router evidence list [FILTERS] [--limit 1..500] [--cursor CURSOR] [--json]
+nemo-relay router evidence show EVIDENCE_ID [--json]
+nemo-relay router evidence export OUTPUT [--format jsonl|csv] [--force] [FILTERS]
+
+nemo-relay router neighborhood inspect --evidence-id EVIDENCE_ID [--json]
+nemo-relay router neighborhood inspect --query-hash SHA256 --partition-file FILE|- [--json]
+nemo-relay router neighborhood inspect --request-file FILE|- [--json]
+
+nemo-relay router decisions tail [FILTERS] [--limit 1..500] [--cursor CURSOR] [--follow] [--json]
+```
+
+Launch the read-only browser application with:
+
+```text
+nemo-relay router dashboard [--bind ADDRESS] [--allow-remote] [--full-content]
+    [--token-file PATH] [--tls-cert PATH --tls-key PATH] [--no-open]
+    [--idle-timeout 60..86400]
+```
+
+Evidence filters are:
+
+```text
+--pool POOL
+--candidate CANDIDATE
+--terminal-class CLASS
+--quality-label pass|fail
+--learning-generation-id UUID
+```
+
+Decision filters are:
+
+```text
+--pool POOL
+--mode recommend|active
+--candidate CANDIDATE
+--final-reason REASON
+```
+
+The CLI has no free-form query flag. Neighborhood inspection requires one of
+the three exact forms. `--partition-file -` and `--request-file -` read one
+strict JSON value from standard input. Files and standard input are limited to
+16 MiB before decoding. The CLI request-file form remains provider-free; a
+cache miss does not call an embedder.
+
+`decisions tail --follow` polls from its forward cursor until interrupted. With
+`--json`, it writes one compact JSON Lines record per decision with
+`schema_version`, `command`, `cursor`, and `decision`. A cursor-only checkpoint
+record can be written when an empty poll advances the cursor. Without
+`--follow`, `--json` returns one normal success envelope.
+
+### Export Files
+
+Use `-` as `OUTPUT` to stream export bytes to standard output:
+
+```bash
+nemo-relay router evidence export - --format jsonl --pool support
+```
+
+For a file destination, the default behavior creates a new file and refuses to
+replace an existing path. `--force` writes a temporary file in the destination
+directory and atomically replaces the destination after the stream completes.
+Any failed create-new export removes its partial file. `--force` is invalid
+with standard output. A broken output pipe exits successfully.
+
+## Run Mutation Commands
+
+The exact mutation tree is:
+
+```text
+nemo-relay router pause --reason TEXT [--actor TEXT] [--pool POOL] [--json]
+nemo-relay router resume --reason TEXT [--actor TEXT] [--pool POOL] [--json]
+
+nemo-relay router force-anchor set --reason TEXT [--actor TEXT] [--pool POOL] [--json]
+nemo-relay router force-anchor clear --reason TEXT [--actor TEXT] [--pool POOL] [--json]
+
+nemo-relay router reset --pool POOL --confirm PROJECT_ID --reason TEXT [--actor TEXT] [--json]
+nemo-relay router reset --all --confirm PROJECT_ID --reason TEXT [--actor TEXT] [--json]
+
+nemo-relay router cohort rotate --confirm PROJECT_ID --reason TEXT [--actor TEXT] [--json]
+```
+
+If `--actor` is absent, the CLI records the authenticated OS principal as
+`uid:<effective-uid>` on Unix or `sid:<process-token-sid>` on Windows. Actor and
+reason values must be bounded, nonblank, and free of control characters.
+Reset and rotation require the exact configured `project_id` through
+`--confirm`.
+
+Each command reads one current generation snapshot, creates one UUIDv7 mutation
+ID, submits one compare-and-swap request, and prints the durable audit ID and
+resulting generations. It never accepts a caller mutation ID or expected
+generation and never retries a conflict. Global pause and per-pool pause use
+the same generation authority. Resume changes only pause; it does not clear
+force-anchor.
+
+An all-pool reset is one atomic mutation. Use it to invalidate all learned
+neighborhood authority after a project-wide corpus or policy event. Use a pool
+reset when only one pool needs a fresh learning generation. Cohort rotation
+invalidates prior protected cohort authorization without exposing or accepting
+cohort salt.
+
+Only one standalone mutation process is admitted for a database at a time. A
+concurrent CLI contender can receive `busy`; rerun it only after inspecting the
+first command's durable receipt and current state. The CLI does not
+automatically retry.
+
+## Consume CLI Output
+
+Human output uses deterministic field and row order. `--json` wraps successful
+commands in this versioned shape:
+
+```json
+{
+  "schema_version": 1,
+  "ok": true,
+  "command": "router status",
+  "data": {}
+}
+```
+
+Failures under `--json` use:
+
+```json
+{
+  "schema_version": 1,
+  "ok": false,
+  "command": "router reset",
+  "error": {
+    "code": "conflict",
+    "message": "Router inspection failed: conflict"
+  }
+}
+```
+
+The exit-code contract is:
+
+| Exit | Meaning |
+|---:|---|
+| `0` | Command or export completed, or the output consumer closed a pipe. |
+| `2` | Input/configuration refusal, not found, invalid/stale cursor, forbidden capability, egress denial, expired mutation, or generation conflict. |
+| `1` | Busy or unavailable storage, migration/integrity failure, capacity exhaustion, I/O failure, or internal command failure. |
+
+Error messages use stable public codes and do not include the database path,
+SQL text, credentials, provider headers, or cohort salt.
+
+## Mount the HTTP Adapter
+
+Enable the Router crate's `http` feature to use `inspection_http_router`:
+
+```rust
+use std::sync::Arc;
+
+use nemo_relay_router::inspection::{
+    BearerTokenAuthGuard, InspectionHttpMode, InspectionService,
+    inspection_http_router,
+};
+
+fn read_only_routes(service: InspectionService) -> Result<axum::Router, nemo_relay_router::inspection::InspectionError> {
+    let auth = Arc::new(BearerTokenAuthGuard::new("host-provided-token")?);
+    inspection_http_router(service, auth, InspectionHttpMode::ReadOnly)
+}
+```
+
+The host must always provide an `InspectionHttpAuthGuard`. The generic bearer
+guard accepts one bounded visible-ASCII token and compares its digest in
+constant time. A custom guard receives the bounded method, exact path, headers,
+and an `operations` Boolean. Use that context to apply host identity and
+authorization policy.
+
+### Routes
+
+Read-only mode mounts these routes:
+
+| Method | Route | Typed Operation |
+|---|---|---|
+| `GET` | `/api/router/v1/status` | `status()` |
+| `GET` | `/api/router/v1/overview` | `overview()` |
+| `GET` | `/api/router/v1/pools` | `list_pools()` |
+| `GET` | `/api/router/v1/pools/{pool_id}` | `get_pool()` |
+| `GET` | `/api/router/v1/evidence` | `list_evidence()` |
+| `GET` | `/api/router/v1/evidence/{evidence_id}` | `get_evidence()` |
+| `POST` | `/api/router/v1/evidence/export` | `export_evidence()` |
+| `POST` | `/api/router/v1/neighborhood` | `inspect_neighborhood()` |
+| `GET` | `/api/router/v1/decisions` | `list_decisions()` |
+| `GET` | `/api/router/v1/decisions/tail` | `tail_decisions()` |
+| `GET` | `/api/router/v1/decisions/stream` | Resumable decision event stream |
+| `GET` | `/api/router/v1/decisions/{decision_id}` | `get_decision()` |
+| `GET` | `/api/router/v1/decisions/{decision_id}/exposure` | `get_decision_exposure()` |
+| `GET` | `/api/router/v1/outcomes` | `list_outcomes()` |
+| `GET` | `/api/router/v1/controls` | `list_controls()` |
+| `GET` | `/api/router/v1/health` | `list_health()` |
+| `GET` | `/api/router/v1/migrations` | `list_migrations()` |
+
+Operations mode adds these routes only when the service was constructed with
+`allow_operations = true`:
+
+| Method | Route | JSON Body |
+|---|---|---|
+| `POST` | `/api/router/v1/operations/control` | `InspectionControlRequestV1` |
+| `POST` | `/api/router/v1/operations/reset` | `LearningResetRequestV1` |
+| `POST` | `/api/router/v1/operations/cohort/rotate` | `CohortRotationRequestV1` |
+
+The read-only router does not contain mutation handlers. Request input cannot
+switch modes or enable a missing capability.
+
+List routes accept `limit` and `after`. Evidence additionally accepts
+`pool_id`, `candidate_id`, `terminal_class`, `quality_label`, and
+`learning_generation_id`. Decisions accept `pool_id`, `mode`, `candidate_id`,
+and `final_reason`. Outcomes accept `pool_id`, `arm`, `label`, and
+`attribution_status`. Unknown query or JSON fields are rejected.
+
+Overview, pools, controls, health, and migrations return weak semantic ETags.
+An authenticated conditional request can return `304 Not Modified`. Decision
+tail and stream routes use the same forward cursor. The event stream accepts an
+`after` query value or `Last-Event-ID`, emits immutable `decision` events and
+`cursor` checkpoints, and reserves a bounded set of stream slots.
+
+### Content Policy and Limits
+
+The optional `x-nemo-relay-content-policy` header can require `redacted` or
+`full`. If it is present, it must exactly match the host-fixed service policy;
+the request cannot elevate content access.
+
+The adapter applies these fixed boundaries before handler work:
+
+- At most 64 headers and 32 KiB of aggregate header names and values.
+- At most 16 MiB for a JSON body.
+- At most 500 records per page and 4 KiB per cursor.
+- At most 32 in-flight requests per router.
+- One absolute deadline from `InspectionServiceOptions::request_timeout_ms`.
+- At most 4 KiB for a bearer token.
+
+Every response includes `Cache-Control: no-store`. Evidence export streams
+bounded chunks and cancels its producer if the client drops the body.
+
+HTTP errors use `{"error":{"code":"..."}}` and the following status mapping:
+
+| Status | Errors |
+|---:|---|
+| `400` | `invalid_argument`, `invalid_cursor` |
+| `401` | `unauthorized` |
+| `403` | `forbidden`, `egress_denied` |
+| `404` | `not_found` |
+| `409` | `conflict`, `migration_required` |
+| `410` | `mutation_expired` |
+| `413` | Body exceeds the adapter limit |
+| `426` | `incompatible_api` |
+| `500` | `integrity_error` |
+| `503` | `busy`, `storage_unavailable` |
+| `507` | `capacity_exhausted` |
+
+## Binding Boundary
+
+The stable inspection/control surfaces are Rust, CLI, and optional Rust HTTP.
+Python `nemo_relay.router` and Node.js `nemo-relay-node/router` provide typed
+configuration and V2 replay helpers, but they do not expose inspection or
+operator methods. The generic C FFI and Go APIs can recognize and activate a
+Router component, but their calls remain V2 replay-ineligible and they have no
+typed inspection/control surface.
+
+`nemo-relay router dashboard` is a CLI host over the same Rust inspection API.
+It embeds its static assets in the CLI package, fixes the service to read-only
+mode, and does not add Python, Node.js, C FFI, or Go inspection methods. Refer
+to [Use the Local Router Dashboard](/router/dashboard) for its host and browser
+contract.

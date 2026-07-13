@@ -12,9 +12,9 @@ use serde_json::json;
 use tokio_stream::StreamExt;
 
 use super::{
-    LlmCallExecuteParams, LlmCallParams, LlmHandle, LlmRequest, LlmStreamCallExecuteParams,
-    emit_optimization_marks_with, llm_call, llm_call_execute, llm_stream_call_execute,
-    project_llm_request_to_current_user_turn,
+    CreateLlmHandleParams, LlmCallExecuteParams, LlmCallParams, LlmCallRole, LlmHandle, LlmRequest,
+    LlmStreamCallExecuteParams, emit_optimization_marks_with, llm_call, llm_call_execute,
+    llm_stream_call_execute, project_llm_request_to_current_user_turn,
 };
 use crate::api::event::{Event, ScopeCategory};
 use crate::api::optimization::finalize_optimization_summary;
@@ -22,7 +22,9 @@ use crate::api::runtime::LlmJsonStream;
 use crate::api::runtime::{
     NemoRelayContextState, create_scope_stack, global_context, set_thread_scope_stack,
 };
-use crate::api::scope::{COMPACTION_EVENT_NAME, EmitMarkEventParams, event};
+use crate::api::scope::{
+    COMPACTION_EVENT_NAME, CreateScopeHandleParams, EmitMarkEventParams, event,
+};
 use crate::api::scope::{PopScopeParams, PushScopeParams, ScopeType, pop_scope, push_scope};
 use crate::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use crate::codec::openai_chat::OpenAIChatCodec;
@@ -793,6 +795,139 @@ fn llm_call_execute_adds_otel_status_metadata_to_end_events() {
             .unwrap()
             .contains("llm boom")
     );
+}
+
+#[test]
+fn managed_llm_success_and_error_events_share_primary_identity_and_role() {
+    let _guard = lock_global_runtime();
+    reset_global();
+
+    let captured_events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let subscriber_events = captured_events.clone();
+    register_subscriber(
+        "llm-call-role-lifecycle",
+        Arc::new(move |event| {
+            if event.category().map(|category| category.as_str()) == Some("llm") {
+                subscriber_events.lock().unwrap().push(event.clone());
+            }
+        }),
+    )
+    .unwrap();
+
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        llm_call_execute(
+            LlmCallExecuteParams::builder()
+                .name("llm-role-ok")
+                .request(request())
+                .func(Arc::new(|_request| {
+                    Box::pin(async { Ok(json!({"ok": true})) })
+                }))
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let error = llm_call_execute(
+            LlmCallExecuteParams::builder()
+                .name("llm-role-error")
+                .request(request())
+                .func(Arc::new(|_request| {
+                    Box::pin(async { Err(FlowError::Internal("expected".to_string())) })
+                }))
+                .build(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("expected"));
+    });
+
+    flush_subscribers().unwrap();
+    assert!(deregister_subscriber("llm-call-role-lifecycle").unwrap());
+
+    let events = captured_events.lock().unwrap();
+    for name in ["llm-role-ok", "llm-role-error"] {
+        let call_events = events
+            .iter()
+            .filter(|event| event.name() == name)
+            .collect::<Vec<_>>();
+        assert_eq!(call_events.len(), 2, "missing lifecycle pair for {name}");
+        assert_eq!(call_events[0].scope_category(), Some(ScopeCategory::Start));
+        assert_eq!(call_events[1].scope_category(), Some(ScopeCategory::End));
+        assert_eq!(call_events[0].uuid(), call_events[1].uuid());
+        assert_eq!(call_events[0].llm_call_role(), Some(LlmCallRole::Primary));
+        assert_eq!(call_events[1].llm_call_role(), Some(LlmCallRole::Primary));
+    }
+}
+
+#[test]
+fn state_builders_preserve_internal_roles_and_leave_embedder_role_free() {
+    let state = NemoRelayContextState::new();
+
+    for role in [LlmCallRole::Shadow, LlmCallRole::Judge] {
+        let handle =
+            state.create_llm_handle(CreateLlmHandleParams::builder().name("internal").build());
+        let start = state.build_llm_start_event_with_role(&handle, None, None, role);
+        let end = state.build_llm_end_event_with_role(
+            super::EndLlmHandleParams::builder().handle(&handle).build(),
+            role,
+        );
+        assert_eq!(start.uuid(), end.uuid());
+        assert_eq!(start.llm_call_role(), Some(role));
+        assert_eq!(end.llm_call_role(), Some(role));
+        assert_eq!(
+            start.category_profile().unwrap().extra["call_role"],
+            json!(role.as_str())
+        );
+    }
+
+    let embedder = state.create_scope_handle(
+        CreateScopeHandleParams::builder()
+            .name("embedder")
+            .scope_type(ScopeType::Embedder)
+            .build(),
+    );
+    let embedder_start = state.build_scope_start_event(&embedder, None);
+    let embedder_end = state.end_scope_handle(&embedder, None, None);
+    assert_eq!(embedder_start.llm_call_role(), None);
+    assert_eq!(embedder_end.llm_call_role(), None);
+    assert!(embedder_start.category_profile().is_none());
+    assert!(embedder_end.category_profile().is_none());
+}
+
+#[test]
+fn v1_llm_handle_and_creation_params_keep_the_pre_v2_shape() {
+    let handle = super::LlmHandle::builder().name("legacy").build();
+    let encoded = serde_json::to_value(&handle).unwrap();
+    assert_eq!(
+        encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "attributes",
+            "data",
+            "metadata",
+            "model_name",
+            "name",
+            "parent_uuid",
+            "started_at",
+            "uuid",
+        ])
+    );
+
+    let params = CreateLlmHandleParams {
+        name: "legacy",
+        parent_uuid: None,
+        attributes: super::LlmAttributes::empty(),
+        data: None,
+        metadata: None,
+        model_name: None,
+        timestamp: None,
+    };
+    let created = NemoRelayContextState::new().create_llm_handle(params);
+    assert_eq!(created.name, "legacy");
 }
 
 #[test]

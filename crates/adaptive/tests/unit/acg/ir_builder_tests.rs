@@ -23,6 +23,7 @@ fn sample_tool_definition(name: &str) -> ToolDefinition {
                     "query": {"type": "string"}
                 }
             })),
+            strict: None,
         },
     }
 }
@@ -71,6 +72,7 @@ fn build_prompt_ir_inserts_tools_before_first_non_system_message_and_preserves_a
         params: None,
         tools: Some(vec![sample_tool_definition("search")]),
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -123,6 +125,7 @@ fn build_prompt_ir_appends_tool_blocks_when_request_contains_only_system_message
             sample_tool_definition("lookup"),
         ]),
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -155,6 +158,53 @@ fn build_prompt_ir_appends_tool_blocks_when_request_contains_only_system_message
 }
 
 #[test]
+fn build_prompt_ir_preserves_developer_instruction_provenance() {
+    let request = AnnotatedLlmRequest {
+        messages: vec![
+            Message::Developer {
+                content: MessageContent::Text("Use the API contract.".to_string()),
+                name: Some("sdk".to_string()),
+            },
+            Message::User {
+                content: MessageContent::Text("Create a request.".to_string()),
+                name: None,
+            },
+        ],
+        model: Some("gpt-4o".to_string()),
+        params: None,
+        tools: Some(vec![sample_tool_definition("lookup")]),
+        tool_choice: None,
+        response_format: None,
+        store: None,
+        previous_response_id: None,
+        truncation: None,
+        reasoning: None,
+        include: None,
+        user: None,
+        metadata: None,
+        service_tier: None,
+        parallel_tool_calls: None,
+        max_output_tokens: None,
+        max_tool_calls: None,
+        top_logprobs: None,
+        stream: None,
+        extra: serde_json::Map::new(),
+    };
+
+    let prompt_ir = build_prompt_ir(&request).unwrap();
+
+    assert_eq!(prompt_ir.blocks.len(), 3);
+    assert_eq!(prompt_ir.blocks[0].role, PromptRole::System);
+    assert_eq!(prompt_ir.blocks[0].provenance, ProvenanceLabel::Developer);
+    assert_eq!(prompt_ir.blocks[0].span_id.0, "system-0-developer");
+    assert_eq!(
+        prompt_ir.blocks[1].content_type,
+        BlockContentType::ToolSchema
+    );
+    assert_eq!(prompt_ir.blocks[2].role, PromptRole::User);
+}
+
+#[test]
 fn build_prompt_ir_omits_tool_schema_hashes_when_no_tools_are_present() {
     let request = AnnotatedLlmRequest {
         messages: vec![Message::User {
@@ -165,6 +215,7 @@ fn build_prompt_ir_omits_tool_schema_hashes_when_no_tools_are_present() {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

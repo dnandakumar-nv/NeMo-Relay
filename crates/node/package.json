@@ -49,6 +49,10 @@
       "types": "./pii_redaction.d.ts",
       "default": "./pii_redaction.js"
     },
+    "./router": {
+      "types": "./router.d.ts",
+      "default": "./router.js"
+    },
     "./model_pricing": {
       "types": "./model_pricing.d.ts",
       "default": "./model_pricing.js"
@@ -62,8 +66,8 @@
     "triples": {}
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build-debug": "napi build --platform",
+    "build": "napi build --platform --release && node postprocess-types.js",
+    "build-debug": "napi build --platform && node postprocess-types.js",
     "check:docstrings": "node ../../scripts/lint/check_public_docstrings.mjs node",
     "check:docstrings:all": "node ../../scripts/lint/check_public_docstrings.mjs all",
     "format": "prettier --write \"*.{js,ts,d.ts}\" \"tests/**/*.{mjs,cjs,js,mts,cts,ts,tsx}\"",

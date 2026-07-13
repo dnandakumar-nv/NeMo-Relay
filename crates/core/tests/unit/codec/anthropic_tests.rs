@@ -424,12 +424,38 @@ fn test_decode_request_full() {
     assert_eq!(tools[0].function.name, "get_weather");
     assert_eq!(tools[0].function.description, Some("Get weather".into()));
     assert!(tools[0].function.parameters.is_some());
+    assert_eq!(tools[0].function.strict, None);
 
     assert_eq!(annotated.tool_choice, Some(ToolChoice::Auto));
 }
 
 #[test]
-fn test_decode_request_system_array() {
+fn test_decode_rejects_unsupported_tool_strictness() {
+    let codec = AnthropicMessagesCodec;
+
+    for strict in [json!(true), json!(false), Json::Null, json!("true")] {
+        let error = codec
+            .decode(&make_request(json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "name": "lookup",
+                    "input_schema": {"type": "object"},
+                    "strict": strict
+                }]
+            })))
+            .unwrap_err();
+        match error {
+            FlowError::Internal(message) => {
+                assert!(message.contains("Anthropic Messages tools decode"));
+                assert!(message.contains("strict is unsupported"));
+            }
+            other => panic!("unexpected decode error: {other}"),
+        }
+    }
+}
+
+#[test]
+fn test_decode_request_multiblock_system_is_marked_and_round_trips() {
     let codec = AnthropicMessagesCodec;
     let request = make_request(json!({
         "system": [
@@ -449,6 +475,13 @@ fn test_decode_request_system_array() {
         Message::System { content: MessageContent::Text(t), .. }
         if t == "First instruction.\nSecond instruction."
     ));
+    assert_eq!(
+        annotated
+            .extra
+            .get("_anthropic_messages_unsupported_system"),
+        Some(&json!(true))
+    );
+    assert_eq!(codec.encode(&annotated, &request).unwrap(), request);
 }
 
 #[test]
@@ -564,7 +597,7 @@ fn test_decode_request_vllm_tool_choice_none_and_extensions_preserved() {
 }
 
 #[test]
-fn test_decode_request_vllm_system_array_ignores_non_text_blocks() {
+fn test_decode_request_mixed_system_blocks_are_marked_and_round_trip() {
     let codec = AnthropicMessagesCodec;
     let request = make_request(json!({
         "model": "claude-sonnet-4-20250514",
@@ -583,6 +616,40 @@ fn test_decode_request_vllm_system_array_ignores_non_text_blocks() {
         annotated.system_prompt(),
         Some("Only answer in one sentence.")
     );
+    assert_eq!(
+        annotated
+            .extra
+            .get("_anthropic_messages_unsupported_system"),
+        Some(&json!(true))
+    );
+    assert_eq!(codec.encode(&annotated, &request).unwrap(), request);
+}
+
+#[test]
+fn test_decode_request_malformed_system_values_are_marked_and_round_trip() {
+    let codec = AnthropicMessagesCodec;
+    for system in [
+        json!([]),
+        json!([{"type": "text"}]),
+        json!([{"text": "missing type"}]),
+        json!({"type": "text", "text": "not an array"}),
+        Json::Null,
+    ] {
+        let request = make_request(json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "task"}],
+            "max_tokens": 100,
+            "system": system
+        }));
+        let annotated = codec.decode(&request).unwrap();
+        assert_eq!(
+            annotated
+                .extra
+                .get("_anthropic_messages_unsupported_system"),
+            Some(&json!(true))
+        );
+        assert_eq!(codec.encode(&annotated, &request).unwrap(), request);
+    }
 }
 
 #[test]
@@ -643,6 +710,140 @@ fn test_decode_request_litellm_cache_control_blocks_preserved() {
     assert_eq!(annotated.system_prompt(), Some("Be terse"));
     // `system` is a modeled key in Anthropic decode and should not live in extra.
     assert!(annotated.extra.get("system").is_none());
+    assert!(
+        !annotated
+            .extra
+            .contains_key("_anthropic_messages_unsupported_system")
+    );
+    assert_eq!(codec.encode(&annotated, &request).unwrap(), request);
+}
+
+#[test]
+fn test_anthropic_system_blocks_and_json_schema_round_trip_losslessly() {
+    let codec = AnthropicMessagesCodec;
+    let original = make_request(json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 128,
+        "system": [
+            {"type": "text", "text": "Be terse", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Use JSON"}
+        ],
+        "messages": [{"role": "user", "content": "hello"}],
+        "output_config": {
+            "effort": "low",
+            "format": {
+                "type": "json_schema",
+                "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                "future": "descriptor"
+            }
+        },
+        "future_request_field": true
+    }));
+
+    let annotated = codec.decode(&original).unwrap();
+    assert_eq!(annotated.system_prompt(), Some("Be terse\nUse JSON"));
+    let format = annotated.response_format.as_ref().unwrap();
+    assert_eq!(format.kind, StructuredResponseFormatKind::JsonSchema);
+    assert_eq!(format.name, None);
+    assert_eq!(format.strict, None);
+    assert_eq!(
+        format.extra.get("native_wrapper"),
+        Some(&json!({"effort": "low"}))
+    );
+    assert_eq!(
+        format.extra.get("native_format"),
+        Some(&json!({"future": "descriptor"}))
+    );
+    assert!(!annotated.extra.contains_key("output_config"));
+
+    let encoded = codec.encode(&annotated, &original).unwrap();
+    assert_eq!(encoded, original);
+}
+
+#[test]
+fn test_anthropic_unknown_format_remains_generic_and_lossless() {
+    let codec = AnthropicMessagesCodec;
+    let original = make_request(json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "hello"}],
+        "output_config": {
+            "effort": "low",
+            "format": {"type": "json_object", "future": true}
+        }
+    }));
+    let annotated = codec.decode(&original).unwrap();
+    assert!(annotated.response_format.is_none());
+    assert_eq!(
+        annotated.extra.get("output_config"),
+        original.content.get("output_config")
+    );
+    assert_eq!(codec.encode(&annotated, &original).unwrap(), original);
+}
+
+#[test]
+fn test_anthropic_rejects_invalid_message_roles_and_malformed_format() {
+    let codec = AnthropicMessagesCodec;
+    for role in ["system", "developer"] {
+        let error = codec
+            .decode(&make_request(json!({
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 128,
+                "messages": [{"role": role, "content": "invalid placement"}]
+            })))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("system and developer roles are unsupported"));
+    }
+
+    let error = codec
+        .decode(&make_request(json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 128,
+            "messages": [{"role": "unknown", "content": "invalid"}]
+        })))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Anthropic Messages messages decode"));
+
+    let error = codec
+        .decode(&make_request(json!({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hello"}],
+            "output_config": {"format": {"type": "json_schema"}}
+        })))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("schema is required"));
+}
+
+#[test]
+fn test_anthropic_encode_rejects_developer_and_late_system_messages() {
+    let codec = AnthropicMessagesCodec;
+    let original = make_request(json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "hello"}]
+    }));
+    let mut annotated = codec.decode(&original).unwrap();
+    annotated.messages.insert(
+        0,
+        Message::Developer {
+            content: MessageContent::Text("unsupported".into()),
+            name: None,
+        },
+    );
+    let error = codec.encode(&annotated, &original).unwrap_err().to_string();
+    assert!(error.contains("developer messages are unsupported"));
+
+    let mut annotated = codec.decode(&original).unwrap();
+    annotated.messages.push(Message::System {
+        content: MessageContent::Text("late".into()),
+        name: None,
+    });
+    let error = codec.encode(&annotated, &original).unwrap_err().to_string();
+    assert!(error.contains("system instructions must be first and unique"));
 }
 
 // ===================================================================
@@ -764,6 +965,32 @@ fn test_encode_tools_with_input_schema() {
     assert!(!tools[0].as_object().unwrap().contains_key("parameters"));
     assert!(!tools[0].as_object().unwrap().contains_key("type"));
     assert!(!tools[0].as_object().unwrap().contains_key("function"));
+    assert!(!tools[0].as_object().unwrap().contains_key("strict"));
+}
+
+#[test]
+fn test_encode_rejects_unsupported_tool_strictness() {
+    let codec = AnthropicMessagesCodec;
+    let original = make_request(json!({
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{
+            "name": "lookup",
+            "input_schema": {"type": "object"}
+        }]
+    }));
+    let baseline = codec.decode(&original).unwrap();
+
+    for strict in [true, false] {
+        let mut annotated = baseline.clone();
+        annotated.tools.as_mut().unwrap()[0].function.strict = Some(strict);
+        match codec.encode(&annotated, &original) {
+            Err(FlowError::Internal(message)) => {
+                assert!(message.contains("Anthropic Messages tools encode"));
+                assert!(message.contains("strict is unsupported"));
+            }
+            other => panic!("unexpected encode result: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -867,9 +1094,11 @@ fn test_helper_and_error_paths_cover_remaining_anthropic_branches() {
                 name: "lookup".into(),
                 description: None,
                 parameters: None,
+                strict: None,
             },
         }]),
         tool_choice: Some(ToolChoice::None),
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

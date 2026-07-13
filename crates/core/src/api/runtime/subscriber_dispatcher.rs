@@ -85,6 +85,10 @@ mod native {
         Ok(())
     }
 
+    pub(super) fn is_subscriber_dispatcher_thread() -> bool {
+        IN_DISPATCHER.with(Cell::get)
+    }
+
     fn dispatcher_sender() -> std::result::Result<Sender<DispatcherMessage>, String> {
         DISPATCHER.get_or_init(start_dispatcher).clone()
     }
@@ -163,4 +167,9 @@ pub(crate) fn dispatch_event(event: &Event, subscribers: &[EventSubscriberFn]) -
 /// Wait for all queued subscriber callbacks submitted before this call.
 pub fn flush_subscribers() -> Result<()> {
     native::flush_subscribers()
+}
+
+/// Return whether the caller is currently running a subscriber callback.
+pub(crate) fn is_subscriber_dispatcher_thread() -> bool {
+    native::is_subscriber_dispatcher_thread()
 }

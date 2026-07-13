@@ -10,6 +10,7 @@ use nemo_relay::plugin::dynamic::DynamicPluginManifest;
 use nemo_relay::plugin::{ConfigPolicy, PluginConfig, validate_plugin_config};
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_router::register_router_component;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -718,6 +719,8 @@ pub(crate) fn validate_config(config: &PluginConfig) -> Result<(), CliError> {
     register_pii_redaction_component().map_err(|error| {
         CliError::Config(format!("PII redaction plugin registration failed: {error}"))
     })?;
+    register_router_component()
+        .map_err(|error| CliError::Config(format!("Router plugin registration failed: {error}")))?;
     let report = validate_plugin_config(config);
     if report.has_errors() {
         let messages = report

@@ -185,6 +185,7 @@ impl LlmCodec for TrackingCodec {
             params: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
             store: None,
             previous_response_id: None,
             truncation: None,

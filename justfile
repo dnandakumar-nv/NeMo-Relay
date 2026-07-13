@@ -467,6 +467,7 @@ local_dependencies = (
     "nemo-relay",
     "nemo-relay-plugin",
     "nemo-relay-adaptive",
+    "nemo-relay-router",
     "nemo-relay-pii-redaction",
     "nemo-relay-ffi",
     "nemo-relay-cli",
@@ -726,6 +727,7 @@ published_cargo_packages() {
         nemo-relay-worker-proto \
         nemo-relay-worker \
         nemo-relay \
+        nemo-relay-router \
         nemo-relay-adaptive \
         nemo-relay-pii-redaction \
         nemo-relay-ffi \
@@ -898,6 +900,12 @@ build-rust:
     else
         cargo build --workspace
     fi
+
+build-router:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    cargo build -p nemo-relay-router --all-features
 
 # --set [ci=true|false]
 build-python:
@@ -1113,6 +1121,25 @@ test-rust:
     else
         cargo test --workspace
     fi
+
+test-router:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    cargo test -p nemo-relay-router --all-targets --all-features
+
+test-dashboard:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    cd "$NEMO_RELAY_REPO_ROOT"
+    cargo build -p nemo-relay-cli
+    if is_true "{{ ci }}"; then
+        npm ci --ignore-scripts --no-audit
+        npx --no-install playwright install --with-deps chromium
+    else
+        npm install --ignore-scripts --no-audit
+    fi
+    npx --no-install playwright test --config playwright.config.mjs
 
 # --set [output_dir=<path>] [ci=true|false]
 test-python:
@@ -1450,11 +1477,20 @@ package-rust:
             nemo-relay)
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-worker-proto.path="crates/worker-proto"')
                 ;;
             nemo-relay-adaptive)
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-worker-proto.path="crates/worker-proto"')
+                ;;
+            nemo-relay-router)
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-worker-proto.path="crates/worker-proto"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-adaptive.path="crates/adaptive"')
                 ;;
             nemo-relay-worker)
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
@@ -1467,13 +1503,16 @@ package-rust:
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-worker-proto.path="crates/worker-proto"')
                 ;;
             nemo-relay-ffi|nemo-relay-cli)
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-types.path="crates/types"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay.path="crates/core"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-plugin.path="crates/plugin"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-worker-proto.path="crates/worker-proto"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-adaptive.path="crates/adaptive"')
                 cargo_package_config+=(--config 'patch.crates-io.nemo-relay-pii-redaction.path="crates/pii-redaction"')
+                cargo_package_config+=(--config 'patch.crates-io.nemo-relay-router.path="crates/router"')
                 ;;
         esac
         if ((${#cargo_package_config[@]} == 0)); then
@@ -1489,6 +1528,18 @@ package-rust:
         echo "Error: No Cargo package artifacts found in $package_dir"
         exit 1
     fi
+    cli_packages=("$package_dir"/nemo-relay-cli-*.crate)
+    if ((${#cli_packages[@]} != 1)); then
+        echo "Error: Expected one NeMo Relay CLI Cargo package artifact"
+        exit 1
+    fi
+    cli_entries="$(tar -tzf "${cli_packages[0]}")"
+    for asset in index.html app.js styles.css; do
+        if [[ "$cli_entries" != *"/assets/router-dashboard/$asset"* ]]; then
+            echo "Error: CLI Cargo package is missing dashboard asset $asset"
+            exit 1
+        fi
+    done
 
 # --set [output_dir=<path>] [ref_name=<name>]
 package-node:
@@ -1587,12 +1638,22 @@ package-python:
     if [[ -z "{{ ref_name }}" ]]; then
         sha="$(head_git_sha)"
         version="$(read_workspace_version)"
+        package_version="${version}+${sha}"
         echo "Non-release build: appending commit hash to version"
-        set_python_package_version "${version}+${sha}" true
     else
+        package_version="{{ ref_name }}"
         echo "Using explicit version {{ ref_name }}"
-        set_python_package_version "{{ ref_name }}" true
     fi
+    restore_python_package_version() {
+        local status=$?
+        trap - EXIT
+        if ! set_python_package_version "$package_version" false && ((status == 0)); then
+            return 1
+        fi
+        return "$status"
+    }
+    trap restore_python_package_version EXIT
+    set_python_package_version "$package_version" true
     build_args=()
     while IFS= read -r -d '' arg; do
         build_args+=("$arg")

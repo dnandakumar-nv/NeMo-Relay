@@ -6,16 +6,20 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::stream;
 use http_body_util::BodyExt;
 use nemo_relay::api::event::ScopeCategory;
+use nemo_relay::api::llm::{LlmApiFamily, LlmCallRole};
 use nemo_relay::api::registry::{
-    deregister_tool_conditional_execution_guardrail, register_tool_conditional_execution_guardrail,
+    deregister_llm_execution_intercept, deregister_tool_conditional_execution_guardrail,
+    register_llm_execution_intercept_v2, register_tool_conditional_execution_guardrail,
 };
 use nemo_relay::api::subscriber::{deregister_subscriber, flush_subscribers, register_subscriber};
 use nemo_relay::plugin::dynamic::DynamicPluginKind;
@@ -23,6 +27,7 @@ use nemo_relay::plugin::{
     ConfigDiagnostic, Plugin, PluginRegistration, PluginRegistrationContext, deregister_plugin,
     register_plugin,
 };
+use nemo_relay_router::{ROUTER_PLUGIN_KIND, deregister_router_component};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -96,6 +101,14 @@ impl Drop for ToolGuardrailCleanup {
     }
 }
 
+struct LlmExecutionInterceptCleanup(&'static str);
+
+impl Drop for LlmExecutionInterceptCleanup {
+    fn drop(&mut self) {
+        let _ = deregister_llm_execution_intercept(self.0);
+    }
+}
+
 struct SubscriberCleanup(&'static str);
 
 impl Drop for SubscriberCleanup {
@@ -156,6 +169,66 @@ impl Drop for TestServer {
     }
 }
 
+struct RouterServerCleanup {
+    shutdown: Option<oneshot::Sender<()>>,
+    server: Option<JoinHandle<Result<(), CliError>>>,
+}
+
+impl RouterServerCleanup {
+    fn new() -> Self {
+        Self {
+            shutdown: None,
+            server: None,
+        }
+    }
+
+    fn attach_server(
+        &mut self,
+        shutdown: oneshot::Sender<()>,
+        server: JoinHandle<Result<(), CliError>>,
+    ) {
+        self.shutdown = Some(shutdown);
+        self.server = Some(server);
+    }
+
+    async fn finish(mut self) -> (nemo_relay::plugin::Result<()>, bool, Result<(), String>) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let server = match self.server.take() {
+            Some(mut server) => {
+                match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+                    Ok(Ok(result)) => result.map_err(|error| error.to_string()),
+                    Ok(Err(error)) => Err(format!("Router CLI server task failed: {error}")),
+                    Err(_) => {
+                        server.abort();
+                        let _ = server.await;
+                        Err("Router CLI server did not stop within five seconds".into())
+                    }
+                }
+            }
+            None => Ok(()),
+        };
+        let clear =
+            nemo_relay::plugin::clear_plugin_configuration_async(Duration::from_secs(5)).await;
+        let deregistered = deregister_router_component();
+        (clear, deregistered, server)
+    }
+}
+
+impl Drop for RouterServerCleanup {
+    fn drop(&mut self) {
+        let _ = nemo_relay::plugin::clear_plugin_configuration();
+        let _ = deregister_router_component();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(server) = self.server.take() {
+            server.abort();
+        }
+    }
+}
+
 fn test_config() -> GatewayConfig {
     GatewayConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -167,6 +240,72 @@ fn test_config() -> GatewayConfig {
         max_hook_payload_bytes: crate::config::DEFAULT_MAX_HOOK_PAYLOAD_BYTES,
         max_passthrough_body_bytes: crate::config::DEFAULT_MAX_PASSTHROUGH_BODY_BYTES,
     }
+}
+
+fn router_shadow_plugin_config() -> Value {
+    json!({
+        "version": 1,
+        "components": [{
+            "kind": ROUTER_PLUGIN_KIND,
+            "enabled": true,
+            "config": {
+                "version": 1,
+                "mode": "shadow",
+                "pools": [{
+                    "id": "cli-manual-router",
+                    "api_family": "openai_chat_completions",
+                    "anchor_models": ["anchor-model"],
+                    "anchor_revision": "2026-07-08",
+                    "sampling_probability": 1.0,
+                    "max_candidates_per_sample": 1,
+                    "selector": {},
+                    "concurrency": {"shadow": 1, "judge": 1},
+                    "judge": {
+                        "version": 1,
+                        "model": "judge-model",
+                        "model_revision": "2026-07-08",
+                        "prompt_version": "pairwise-equivalence-v1",
+                        "rubric_version": "response-trajectory-equivalence-v1",
+                        "output_schema_version": 1,
+                        "response_weight": 0.5,
+                        "trajectory_weight": 0.5,
+                        "response_floor": 0.8,
+                        "trajectory_floor": 0.8,
+                        "judge_confidence_floor": 0.7,
+                        "pass_threshold": 0.85,
+                        "max_rationale_bytes": 4096,
+                        "base_cooloff_seconds": 10,
+                        "max_cooloff_seconds": 300
+                    },
+                    "candidates": [{
+                        "id": "candidate",
+                        "model": "candidate-model",
+                        "model_revision": "2026-07-08",
+                        "cost_rank": 0
+                    }]
+                }]
+            }
+        }]
+    })
+}
+
+#[tokio::test]
+async fn router_package_probe_uses_normal_activation_and_async_clear() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _ = nemo_relay::plugin::clear_plugin_configuration();
+    let _ = deregister_router_component();
+    let temporary = tempfile::tempdir().unwrap();
+    let database_path = temporary.path().join("router.sqlite3");
+    let mut config = router_shadow_plugin_config();
+    config["components"][0]["config"]["project_id"] = json!("cli-package-probe");
+    config["components"][0]["config"]["database_path"] = json!(database_path);
+
+    probe_router_package_activation(config).await.unwrap();
+
+    assert!(database_path.is_file());
+    assert!(nemo_relay::plugin::active_plugin_report().is_none());
+    assert!(nemo_relay::plugin::lookup_plugin(ROUTER_PLUGIN_KIND).is_some());
+    assert!(deregister_router_component());
 }
 
 #[test]
@@ -1648,6 +1787,170 @@ async fn serve_listener_records_codex_stop_atof_contract() {
     assert_eq!(tool_start["metadata"]["agent_kind"], "codex");
     assert_eq!(tool_end["metadata"]["agent_kind"], "codex");
     assert_eq!(tool_end["metadata"]["status"], "success");
+}
+
+#[tokio::test]
+async fn serve_listener_auto_registers_router_before_activation() {
+    let _guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _ = nemo_relay::plugin::clear_plugin_configuration();
+    let _ = deregister_router_component();
+    assert!(nemo_relay::plugin::lookup_plugin(ROUTER_PLUGIN_KIND).is_none());
+
+    let router_ledger = tempfile::tempdir().unwrap();
+    let mut router_config = router_shadow_plugin_config();
+    router_config["components"][0]["config"]["project_id"] = json!("cli-auto-router-registration");
+    router_config["components"][0]["config"]["database_path"] =
+        json!(router_ledger.path().join("router.db"));
+    let mut config = test_config();
+    config.plugin_config = Some(router_config);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server =
+        tokio::spawn(async move { serve_listener(listener, config, Some(shutdown_rx)).await });
+    let mut cleanup = RouterServerCleanup::new();
+    cleanup.attach_server(shutdown_tx, server);
+    wait_for_gateway(&url).await;
+
+    assert!(nemo_relay::plugin::active_plugin_report().is_some());
+    assert!(nemo_relay::plugin::lookup_plugin(ROUTER_PLUGIN_KIND).is_some());
+    let (clear, deregistered, server) = cleanup.finish().await;
+    assert!(clear.is_ok());
+    assert!(deregistered);
+    assert!(
+        server.is_ok(),
+        "Router CLI server shutdown failed: {server:?}"
+    );
+}
+
+#[tokio::test]
+async fn serve_listener_uses_auto_registered_router_without_replaying_anchor() {
+    const WITNESS_INTERCEPT: &str = "cli-manual-router-v2-witness";
+
+    async fn anchor(
+        State((requests, response)): State<(Arc<Mutex<Vec<Value>>>, Value)>,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        requests
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&body).unwrap());
+        Json(response)
+    }
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let anchor_result = json!({
+        "id": "chatcmpl-anchor",
+        "model": "anchor-model",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "anchor result"},
+            "finish_reason": "stop"
+        }]
+    });
+    let upstream_app = Router::new()
+        .route("/v1/chat/completions", post(anchor))
+        .with_state((requests.clone(), anchor_result.clone()));
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_address = upstream_listener.local_addr().unwrap();
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_app).await.unwrap();
+    });
+    let upstream = TestServer {
+        url: format!("http://{upstream_address}"),
+        handle: upstream_handle,
+    };
+
+    let _global_guard = PLUGIN_CONFIG_TEST_LOCK.lock().await;
+    let _ = nemo_relay::plugin::clear_plugin_configuration();
+    let _ = deregister_router_component();
+    let mut cleanup = RouterServerCleanup::new();
+    let router_ledger = tempfile::tempdir().unwrap();
+    let mut router_config = router_shadow_plugin_config();
+    router_config["components"][0]["config"]["project_id"] = json!("cli-manual-router-project");
+    router_config["components"][0]["config"]["database_path"] =
+        json!(router_ledger.path().join("router.db"));
+
+    let mut config = test_config();
+    config.openai_base_url = upstream.url();
+    config.plugin_config = Some(router_config);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("http://{address}");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server =
+        tokio::spawn(async move { serve_listener(listener, config, Some(shutdown_rx)).await });
+    cleanup.attach_server(shutdown_tx, server);
+    wait_for_gateway(&url).await;
+
+    assert!(nemo_relay::plugin::active_plugin_report().is_some());
+    assert!(nemo_relay::plugin::lookup_plugin(ROUTER_PLUGIN_KIND).is_some());
+
+    let witnessed = Arc::new(Mutex::new(Vec::new()));
+    let witness_output = witnessed.clone();
+    register_llm_execution_intercept_v2(
+        WITNESS_INTERCEPT,
+        1,
+        Arc::new(move |_, context, request, replay, next| {
+            witness_output.lock().unwrap().push((
+                context.api_family,
+                context.call_role,
+                replay.is_some(),
+                request.content.clone(),
+            ));
+            next(request)
+        }),
+    )
+    .unwrap();
+    let witness_cleanup = LlmExecutionInterceptCleanup(WITNESS_INTERCEPT);
+
+    let anchor_request = json!({
+        "model": "anchor-model",
+        "messages": [{"role": "user", "content": "keep the anchor"}]
+    });
+    let response = test_http_client()
+        .post(format!("{url}/v1/chat/completions"))
+        .header("authorization", "Bearer test")
+        .header("x-nemo-relay-session-id", "manual-router-cli-session")
+        .json(&anchor_request)
+        .send()
+        .await
+        .unwrap();
+    let response_status = response.status();
+    let response_body = response.json::<Value>().await.unwrap();
+    let observed_requests = requests.lock().unwrap().clone();
+    let witnessed = witnessed.lock().unwrap().clone();
+
+    drop(witness_cleanup);
+    let (clear, deregistered, server) = cleanup.finish().await;
+
+    assert!(
+        clear.is_ok(),
+        "Router configuration clear failed: {clear:?}"
+    );
+    assert!(
+        deregistered,
+        "auto-registered Router component was not removed"
+    );
+    assert!(
+        server.is_ok(),
+        "Router CLI server shutdown failed: {server:?}"
+    );
+    assert!(nemo_relay::plugin::active_plugin_report().is_none());
+    assert!(nemo_relay::plugin::lookup_plugin(ROUTER_PLUGIN_KIND).is_none());
+    assert_eq!(response_status, StatusCode::OK);
+    assert_eq!(response_body, anchor_result);
+    assert_eq!(observed_requests, vec![anchor_request.clone()]);
+    assert_eq!(
+        witnessed,
+        vec![(
+            LlmApiFamily::OpenAIChatCompletions,
+            LlmCallRole::Primary,
+            true,
+            anchor_request,
+        )]
+    );
 }
 
 #[tokio::test]

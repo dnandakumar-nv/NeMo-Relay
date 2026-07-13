@@ -1161,6 +1161,116 @@ async fn collect_observability_covers_absent_invalid_and_componentless_configs()
     );
 }
 
+fn doctor_router_config(database_path: &Path, mode: &str) -> Value {
+    serde_json::json!({
+        "version": 1,
+        "components": [{
+            "kind": "router",
+            "enabled": true,
+            "config": {
+                "version": 1,
+                "mode": mode,
+                "project_id": "doctor-router-project",
+                "database_path": database_path,
+                "pools": [{
+                    "id": "doctor-pool",
+                    "api_family": "openai_chat_completions",
+                    "anchor_models": ["anchor-model"],
+                    "anchor_revision": "2026-07-11",
+                    "sampling_probability": 1.0,
+                    "max_candidates_per_sample": 1,
+                    "selector": {},
+                    "concurrency": {"shadow": 1, "judge": 1, "max_pending": 2},
+                    "candidates": [{
+                        "id": "candidate",
+                        "model": "candidate-model",
+                        "model_revision": "2026-07-11",
+                        "cost_rank": 0
+                    }],
+                    "judge": {
+                        "version": 1,
+                        "model": "judge-model",
+                        "model_revision": "2026-07-11",
+                        "prompt_version": "pairwise-equivalence-v1",
+                        "rubric_version": "response-trajectory-equivalence-v1",
+                        "output_schema_version": 1,
+                        "response_weight": 0.5,
+                        "trajectory_weight": 0.5,
+                        "response_floor": 0.8,
+                        "trajectory_floor": 0.8,
+                        "judge_confidence_floor": 0.7,
+                        "pass_threshold": 0.85,
+                        "max_rationale_bytes": 4096,
+                        "base_cooloff_seconds": 10,
+                        "max_cooloff_seconds": 300
+                    }
+                }]
+            }
+        }]
+    })
+}
+
+#[tokio::test]
+async fn collect_observability_reports_router_package_and_shadow_preflight() {
+    let temporary = tempfile::tempdir().unwrap();
+    let database_path = temporary.path().join("router.sqlite3");
+    let checks = collect_observability(&GatewayConfig {
+        plugin_config: Some(doctor_router_config(&database_path, "shadow")),
+        ..GatewayConfig::default()
+    })
+    .await;
+
+    let check = |name| checks.iter().find(|check| check.name == name).unwrap();
+    assert_eq!(check("Router registration").status, Status::Pass);
+    assert_eq!(check("Router native vector").status, Status::Pass);
+    assert!(
+        check("Router native vector")
+            .details
+            .contains("temporary vec0 insert/query passed")
+    );
+    assert_eq!(check("Router V2 bridge").status, Status::Pass);
+    assert!(check("Router mode").details.contains("shadow; 1 pool(s)"));
+    assert_eq!(check("Router database directory").status, Status::Pass);
+    assert_eq!(check("Router database schema").status, Status::Info);
+    assert!(check("Router database schema").details.contains("missing"));
+    assert!(
+        check("Router configured queues")
+            .details
+            .contains("pending 2")
+    );
+    assert_eq!(check("Router controls").status, Status::Info);
+    assert_eq!(check("Router outcome policy").status, Status::Info);
+    assert!(
+        !database_path.exists(),
+        "doctor must not initialize the ledger"
+    );
+}
+
+#[tokio::test]
+async fn collect_observability_reports_invalid_active_outcome_policy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let checks = collect_observability(&GatewayConfig {
+        plugin_config: Some(doctor_router_config(
+            &temporary.path().join("router.sqlite3"),
+            "active",
+        )),
+        ..GatewayConfig::default()
+    })
+    .await;
+
+    assert!(checks.iter().any(|check| {
+        check.name == "Plugin diagnostic"
+            && check.status == Status::Fail
+            && check.details.contains("outcome")
+    }));
+    let outcome = checks
+        .iter()
+        .find(|check| check.name == "Router outcome policy")
+        .unwrap();
+    assert_eq!(outcome.status, Status::Fail);
+    assert!(outcome.details.contains("configured policies 0/1"));
+}
+
 #[tokio::test]
 async fn collect_observability_rejects_websocket_endpoint_http_scheme() {
     let gateway = GatewayConfig {

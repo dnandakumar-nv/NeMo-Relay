@@ -144,6 +144,7 @@ pub struct DynamicPluginManifestRustDynamicLoad {
 #[cfg(feature = "schema")]
 #[derive(schemars::JsonSchema)]
 #[serde(untagged)]
+#[allow(dead_code)]
 enum DynamicPluginManifestLoadSchema {
     Worker(DynamicPluginManifestWorkerLoad),
     RustDynamic(DynamicPluginManifestRustDynamicLoad),

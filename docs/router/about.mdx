@@ -1,0 +1,107 @@
+---
+title: "NeMo Relay Router"
+sidebar-title: "About"
+description: "Understand bundled Router hosts, Shadow evidence, recommendations, and bounded Active canaries."
+position: 1
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+The NeMo Relay Router evaluates eligible candidate models in the background,
+records bounded recommendations, and can serve a durably authorized randomized
+Active canary. The Rust crate is published independently and is bundled into
+the NeMo Relay CLI, Python wheel, and Node.js npm package.
+
+> [!IMPORTANT]
+> `shadow` and `recommend` always serve the anchor response. Recommend executes
+> no replay and performs no model rewrite. `active` substitutes only an
+> authorized treatment root and keeps separate anchor control and holdout arms.
+> Judge labels are counterfactual proxy evidence, not randomized outcomes.
+
+At this rollout gate, Router provides:
+
+- Versioned configuration, deterministic pool selection, and conservative
+  three-family candidate eligibility.
+- Bounded, sanitized request, response, routing-context, and future-local event
+  projections.
+- Durable SQLite admission before evaluation, with one bounded writer and
+  independently bounded Shadow and Judge calls.
+- Deterministic response-contract checks, structured pairwise judging, one
+  repair attempt for invalid Judge output, and explicit ambiguous evidence.
+- Optional per-pool canonical query construction, durable shared embedding
+  jobs, and a strictly partitioned rebuildable vector index.
+- Complete-policy Shadow warm-up and query-local, root-aware, conservative
+  recommendation confidence with immutable decision audits.
+- Deterministic randomized Active treatment, anchor-control, and holdout arms
+  with exact-once durable dispatch and protected production outcomes.
+- Fixed-batch treatment-versus-control looks, query-local invalidation and
+  cool-off, and generation-checked pause and force-anchor controls.
+- Project-wide dependency cool-off, process heartbeats, restart reconciliation,
+  and deterministic retention of fully terminal evidence.
+- Verified Rust inspection, redacted JSONL/CSV export, authenticated optional
+  HTTP routes, and local CLI read and operator commands.
+- An embedded, authenticated, read-only local dashboard for overview, pools,
+  evidence, neighborhoods, decisions, and operations state.
+- Anchor-preserving failure handling and deadline-bound lifecycle ownership.
+
+The CLI, Python, and Node.js hosts register Router before plugin validation and
+initialization. Python exposes `nemo_relay.router`; Node.js exposes
+`nemo-relay-node/router`. Both helper modules ship in their existing main
+package and serialize the same native configuration. The CLI includes Router
+in its plugin editor and reports package, V2, configuration, database, and
+Active-readiness checks through `nemo-relay doctor`.
+
+A custom Rust host must depend on `nemo-relay-router`, call
+`register_router_component()` before plugin validation or initialization, and
+own plugin teardown. Core does not depend on Router. The generic C FFI and Go
+plugin APIs can recognize and activate Router, but they provide no typed Router
+surface or V2 replay bridge, so calls from those bindings are not Router
+eligible.
+
+Published CLI, wheel, and npm artifacts include the pinned sqlite-vec native
+extension and run a temporary `vec0` create, insert, and nearest-row query
+before artifact upload. Rust, CLI, and optional Rust HTTP hosts expose stable
+inspection and operator surfaces. Python and Node.js expose typed Router
+configuration helpers but no inspection or operator methods. The CLI dashboard
+uses the Rust inspection surface and does not add a binding API.
+
+## Pages
+
+The following pages describe Router behavior and operation:
+
+- [Router Configuration](/router/configuration) documents bundled hosts,
+  custom Rust registration, typed helpers, a complete Judge policy, file
+  layering, validation, and activation side effects.
+- [Current Runtime Behavior](/router/current-behavior) documents selection,
+  eligibility, sanitization, durable scheduling, and teardown.
+- [Future-Local Trajectories](/router/future-local-trajectories) documents
+  boundaries, progress, terminal states, hard limits, and durable handoff.
+- [Shadow Evaluation and Evidence](/router/shadow-evaluation-and-evidence)
+  documents counterfactual execution, hard and operational failures, scoring,
+  repair, ambiguity, partial evidence, cool-off, and privacy.
+- [Validate Router with Real Providers](/router/real-provider-validation)
+  provides the bounded NVIDIA Inference, Codex host, buffered replay, Judge,
+  embedding, and SQLite acceptance workflow.
+- [Router Recommendation Confidence](/router/recommendation-confidence)
+  documents warm-up, strict neighbor semantics, weighted confidence,
+  cheapest-first reasons, immutable audits, retry, retention, and privacy.
+- [Active Canary and Outcomes](/router/active-canary-and-outcomes) documents
+  Active configuration, randomized arms, exact-once serving, protected
+  outcomes, posterior looks, controls, recovery, and retention.
+- [Embeddings and Vector Store](/router/embeddings-and-vector-store) documents
+  pool/profile association, canonical queries, strict partitions, provider
+  egress, caching, rebuild, retention, and observability.
+- [Inspect and Control Router](/router/inspection-and-control) documents the
+  typed Rust service, schemas, pages, evidence, content policy, neighborhood
+  lookup, export, mutations, and errors.
+- [Use Router CLI and HTTP](/router/cli-and-http) documents exact command
+  syntax, JSON output, exit codes, authenticated routes, and limits.
+- [Use the Local Router Dashboard](/router/dashboard) documents launch,
+  authentication, session lifetime, views, remote TLS, and troubleshooting.
+- [Ledger Migrations and Recovery](/router/ledger-migrations-and-recovery)
+  documents filesystem security, migrations, process recovery, leases,
+  retention, and shutdown for maintainers.
+
+Refer to [Provider Request Codecs](/integrate-into-frameworks/provider-codecs)
+for the normalized Developer-instruction and structured-output mappings that
+Router relies on.

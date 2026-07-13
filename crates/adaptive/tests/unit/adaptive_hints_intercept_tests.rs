@@ -179,6 +179,7 @@ fn test_adaptive_hints_intercept_injects_prediction_hints_and_manual_override() 
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

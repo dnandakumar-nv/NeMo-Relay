@@ -5,17 +5,23 @@
 
 pub mod callbacks;
 pub mod global;
+pub(crate) mod llm_context;
+mod replay;
 pub mod scope_stack;
 pub mod state;
 pub mod subscriber_dispatcher;
 
 pub use callbacks::{
     EventSanitizeFn, EventSubscriberFn, LlmCollectorFn, LlmConditionalFn, LlmExecutionFn,
-    LlmExecutionNextFn, LlmFinalizerFn, LlmJsonStream, LlmRequestInterceptFn, LlmSanitizeRequestFn,
-    LlmSanitizeResponseFn, LlmStreamExecutionFn, LlmStreamExecutionNextFn, ToolConditionalFn,
-    ToolExecutionFn, ToolExecutionNextFn, ToolInterceptFn, ToolSanitizeFn,
+    LlmExecutionNextFn, LlmExecutionV2Fn, LlmFinalizerFn, LlmJsonStream, LlmRequestInterceptFn,
+    LlmSanitizeRequestFn, LlmSanitizeResponseFn, LlmStreamExecutionFn, LlmStreamExecutionNextFn,
+    ToolConditionalFn, ToolExecutionFn, ToolExecutionNextFn, ToolInterceptFn, ToolSanitizeFn,
 };
 pub use global::global_context;
+pub use replay::{
+    LLM_REPLAY_CONTRACT_VERSION, LlmReplayCall, LlmReplayCancellationHandle, LlmReplayCapability,
+    LlmReplayFactory, LlmReplayTransport,
+};
 pub use scope_stack::{
     ScopeStack, ScopeStackHandle, TASK_SCOPE_STACK, ThreadScopeStackBinding,
     capture_thread_scope_stack, create_scope_stack, current_scope_stack, propagate_scope_to_thread,

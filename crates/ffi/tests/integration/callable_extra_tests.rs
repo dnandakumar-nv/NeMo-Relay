@@ -260,6 +260,7 @@ fn test_callable_extra_request_intercept_and_codec_paths() {
         params: None,
         tools: Some(vec![]),
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

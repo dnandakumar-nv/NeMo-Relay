@@ -136,6 +136,209 @@ function makeAnthropicRequest() {
   };
 }
 
+function makeNormalizedStrictTools() {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'strict_true',
+        parameters: {
+          type: 'object',
+        },
+        strict: true,
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'strict_false',
+        parameters: {
+          type: 'object',
+        },
+        strict: false,
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'strict_omitted',
+        parameters: {
+          type: 'object',
+        },
+      },
+    },
+  ];
+}
+
+// ===========================================================================
+// Built-in provider codec tool strictness
+// ===========================================================================
+
+describe('built-in provider codec tool strictness', () => {
+  it('preserves true, false, and omitted strictness for OpenAI Chat tools', () => {
+    const codec = new OpenAIChatCodec();
+    const tools = makeNormalizedStrictTools();
+    const request = {
+      headers: {},
+      content: {
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'user',
+            content: 'Use a tool',
+          },
+        ],
+        tools,
+      },
+    };
+
+    const annotated = codec.decode(request);
+    assert.deepEqual(annotated.tools, tools);
+    assert.deepEqual(codec.encode(annotated, request), request);
+  });
+
+  it('preserves true, false, and omitted strictness for OpenAI Responses tools', () => {
+    const codec = new OpenAIResponsesCodec();
+    const normalizedTools = makeNormalizedStrictTools();
+    const nativeTools = normalizedTools.map(({ type, function: definition }) => ({
+      type,
+      ...definition,
+    }));
+    const request = {
+      headers: {},
+      content: {
+        model: 'gpt-4.1-mini',
+        input: 'Use a tool',
+        tools: nativeTools,
+      },
+    };
+
+    const annotated = codec.decode(request);
+    assert.deepEqual(annotated.tools, normalizedTools);
+    assert.deepEqual(codec.encode(annotated, request), request);
+  });
+
+  it('rejects explicit null strictness for both OpenAI tool shapes', () => {
+    const cases = [
+      [
+        new OpenAIChatCodec(),
+        {
+          messages: [{ role: 'user', content: 'Use a tool' }],
+          tools: [{ type: 'function', function: { name: 'lookup', strict: null } }],
+        },
+      ],
+      [
+        new OpenAIResponsesCodec(),
+        {
+          input: 'Use a tool',
+          tools: [{ type: 'function', name: 'lookup', strict: null }],
+        },
+      ],
+    ];
+
+    for (const [codec, content] of cases) {
+      assert.throws(() => codec.decode({ headers: {}, content }));
+    }
+  });
+
+  it('rejects lossy OpenAI Responses tool shapes', () => {
+    const codec = new OpenAIResponsesCodec();
+    const request = {
+      headers: {},
+      content: {
+        input: 'Use a tool',
+        tools: [{ type: 'function', name: 'lookup' }],
+      },
+    };
+    const annotated = codec.decode(request);
+    annotated.tools = [{ type: 'custom', function: { name: 'lookup' } }];
+    assert.throws(() => codec.encode(annotated, request), /only function tools/i);
+    assert.throws(() =>
+      codec.decode({
+        headers: {},
+        content: {
+          input: 'Use a tool',
+          tools: [
+            {
+              type: 'function',
+              name: 'flat',
+              function: { name: 'nested' },
+            },
+          ],
+        },
+      }),
+    );
+  });
+
+  it('rejects true and false strictness for Anthropic tools', () => {
+    const codec = new AnthropicMessagesCodec();
+    const request = {
+      headers: {},
+      content: {
+        model: 'claude-sonnet-4',
+        messages: [
+          {
+            role: 'user',
+            content: 'Use a tool',
+          },
+        ],
+        max_tokens: 64,
+        tools: [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+            },
+          },
+        ],
+      },
+    };
+
+    for (const strict of [true, false]) {
+      const annotated = codec.decode(request);
+      assert.equal('strict' in annotated.tools[0].function, false);
+      assert.deepEqual(codec.encode(annotated, request), request);
+      annotated.tools = [
+        {
+          type: 'function',
+          function: {
+            name: 'lookup',
+            parameters: {
+              type: 'object',
+            },
+            strict,
+          },
+        },
+      ];
+
+      assert.throws(() => codec.encode(annotated, request), /strict/i);
+    }
+  });
+
+  it('rejects any native Anthropic strict key', () => {
+    const codec = new AnthropicMessagesCodec();
+    for (const strict of [true, false, null, 'true']) {
+      const request = {
+        headers: {},
+        content: {
+          model: 'claude-sonnet-4',
+          messages: [{ role: 'user', content: 'Use a tool' }],
+          max_tokens: 64,
+          tools: [
+            {
+              name: 'lookup',
+              input_schema: { type: 'object' },
+              strict,
+            },
+          ],
+        },
+      };
+
+      assert.throws(() => codec.decode(request), /strict/i);
+    }
+  });
+});
+
 // ===========================================================================
 // JsonPassthrough
 // ===========================================================================
@@ -497,6 +700,55 @@ describe('typedLlmExecute', () => {
       deregisterLlmRequestIntercept('typed_chat_codec_req');
       popScope(scope);
     }
+  });
+
+  it('exposes developer messages and structured response formats as typed JSON', () => {
+    const codec = new OpenAIChatCodec();
+    const request = {
+      headers: {
+        'x-request-id': 'typed-json',
+      },
+      content: {
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'developer',
+            content: 'Return JSON.',
+            name: 'policy',
+          },
+          {
+            role: 'user',
+            content: 'Hello',
+          },
+        ],
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'answer',
+            schema: {
+              type: 'object',
+              properties: {
+                value: {
+                  type: 'string',
+                },
+              },
+            },
+            strict: true,
+          },
+        },
+      },
+    };
+
+    const annotated = codec.decode(request);
+    assert.deepEqual(annotated.messages[0], {
+      role: 'developer',
+      content: 'Return JSON.',
+      name: 'policy',
+    });
+    assert.equal(annotated.response_format.kind, 'json_schema');
+    assert.equal(annotated.response_format.name, 'answer');
+    assert.equal(annotated.response_format.strict, true);
+    assert.deepEqual(codec.encode(annotated, request), request);
   });
 
   it('decodes Anthropic responses through typedLlmExecute responseCodec', async () => {

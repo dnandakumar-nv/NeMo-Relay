@@ -10,6 +10,7 @@
     "integrations/openclaw"
   ],
   "devDependencies": {
+    "@playwright/test": "1.60.0",
     "fern-api": "5.57.0",
     "typescript": "^5.9.3"
   }

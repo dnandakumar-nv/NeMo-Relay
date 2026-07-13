@@ -12,6 +12,7 @@ use nemo_relay::plugin::{PluginError, merge_plugin_config_documents};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use strum::{Display, IntoStaticStr};
+use uuid::Uuid;
 
 use crate::error::CliError;
 use crate::plugin_shim::PluginShimCommand;
@@ -81,6 +82,8 @@ pub(crate) enum Command {
     ModelPricing(PricingCommand),
     /// Diagnose env, agents, config, observability (optionally scoped to one agent)
     Doctor(DoctorCommand),
+    /// Inspect Router status, evidence, neighborhoods, and decisions.
+    Router(RouterCommand),
     /// List supported and locally-detected agents (use `--json` for machine output)
     Agents(AgentsCommand),
     /// Print shell completion script (e.g. `nemo-relay completions zsh > ~/.zfunc/_nemo-relay`)
@@ -93,6 +96,340 @@ pub(crate) enum Command {
     /// Internal: plugin-local hook and sidecar supervisor. Not typed by humans.
     #[command(hide = true)]
     PluginShim(PluginShimCommand),
+    /// Internal: clean-artifact Router activation and native vector probe.
+    #[command(hide = true)]
+    RouterPackageProbe,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterCommand {
+    #[command(subcommand)]
+    pub(crate) command: RouterSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum RouterSubcommand {
+    /// Launch the local read-only Router operations dashboard.
+    Dashboard(RouterDashboardCommand),
+    /// Show one consistent Router status snapshot.
+    Status(RouterStatusCommand),
+    /// List configured Router pools.
+    Pools(RouterPoolsCommand),
+    /// List, show, or export verified evidence.
+    Evidence(RouterEvidenceCommand),
+    /// Inspect a persisted or request-file neighborhood.
+    Neighborhood(RouterNeighborhoodCommand),
+    /// Tail verified routing decisions.
+    Decisions(RouterDecisionsCommand),
+    /// Pause all Router work or one pool.
+    Pause(RouterControlCommand),
+    /// Clear pause for all Router work or one pool.
+    Resume(RouterControlCommand),
+    /// Set or clear force-anchor independently from pause.
+    ForceAnchor(RouterForceAnchorCommand),
+    /// Advance one or every learning generation.
+    Reset(RouterResetCommand),
+    /// Rotate protected cohort authority.
+    Cohort(RouterCohortCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterDashboardCommand {
+    /// Concrete address for the dashboard listener.
+    #[arg(long, default_value = "127.0.0.1:0")]
+    pub(crate) bind: SocketAddr,
+    /// Explicitly permit a non-loopback listener.
+    #[arg(long)]
+    pub(crate) allow_remote: bool,
+    /// Permit full secret-filtered inspection content instead of redacted previews.
+    #[arg(long)]
+    pub(crate) full_content: bool,
+    /// Create a new owner-only file containing the one-time bootstrap URL.
+    #[arg(long)]
+    pub(crate) token_file: Option<PathBuf>,
+    /// PEM certificate chain for HTTPS.
+    #[arg(long, requires = "tls_key")]
+    pub(crate) tls_cert: Option<PathBuf>,
+    /// PEM private key for HTTPS.
+    #[arg(long, requires = "tls_cert")]
+    pub(crate) tls_key: Option<PathBuf>,
+    /// Do not launch the platform browser.
+    #[arg(long)]
+    pub(crate) no_open: bool,
+    /// Exit after this many seconds without authenticated activity.
+    #[arg(
+        long,
+        default_value_t = 900,
+        value_parser = clap::value_parser!(u64).range(60..=86_400)
+    )]
+    pub(crate) idle_timeout: u64,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct RouterStatusCommand {
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterPoolsCommand {
+    #[command(flatten)]
+    pub(crate) page: RouterPageArgs,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterEvidenceCommand {
+    #[command(subcommand)]
+    pub(crate) command: RouterEvidenceSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum RouterEvidenceSubcommand {
+    /// List evidence newest first.
+    List(RouterEvidenceListCommand),
+    /// Show one complete verified evidence record.
+    Show(RouterEvidenceShowCommand),
+    /// Stream evidence as JSON Lines or CSV.
+    Export(RouterEvidenceExportCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterEvidenceListCommand {
+    #[command(flatten)]
+    pub(crate) filter: RouterEvidenceFilterArgs,
+    #[command(flatten)]
+    pub(crate) page: RouterPageArgs,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterEvidenceShowCommand {
+    /// Immutable evidence UUID.
+    pub(crate) evidence_id: Uuid,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub(crate) enum RouterEvidenceExportFormat {
+    Jsonl,
+    Csv,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterEvidenceExportCommand {
+    /// Destination file, or `-` for standard output.
+    pub(crate) output: PathBuf,
+    /// Streaming output format.
+    #[arg(long, value_enum, default_value = "jsonl")]
+    pub(crate) format: RouterEvidenceExportFormat,
+    /// Atomically replace an existing destination file.
+    #[arg(long)]
+    pub(crate) force: bool,
+    #[command(flatten)]
+    pub(crate) filter: RouterEvidenceFilterArgs,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct RouterEvidenceFilterArgs {
+    /// Exact pool ID.
+    #[arg(long)]
+    pub(crate) pool: Option<String>,
+    /// Exact candidate ID.
+    #[arg(long)]
+    pub(crate) candidate: Option<String>,
+    /// Exact terminal class.
+    #[arg(long)]
+    pub(crate) terminal_class: Option<String>,
+    /// Exact `pass` or `fail` label.
+    #[arg(long)]
+    pub(crate) quality_label: Option<String>,
+    /// Exact historical learning generation.
+    #[arg(long)]
+    pub(crate) learning_generation_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterNeighborhoodCommand {
+    #[command(subcommand)]
+    pub(crate) command: RouterNeighborhoodSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum RouterNeighborhoodSubcommand {
+    /// Inspect one evidence, exact query partition, or sanitized request file.
+    Inspect(RouterNeighborhoodInspectCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("router_neighborhood_lookup")
+        .args(["evidence_id", "query_hash", "request_file"])
+        .required(true)
+        .multiple(false)
+))]
+pub(crate) struct RouterNeighborhoodInspectCommand {
+    /// Resolve the persisted query and partition for one evidence UUID.
+    #[arg(long)]
+    pub(crate) evidence_id: Option<Uuid>,
+    /// Resolve one persisted canonical query hash under an exact partition file.
+    #[arg(long, requires = "partition_file")]
+    pub(crate) query_hash: Option<String>,
+    /// JSON file containing one exact `RoutingPartitionV1`, or `-` for standard input.
+    #[arg(long, requires = "query_hash")]
+    pub(crate) partition_file: Option<PathBuf>,
+    /// JSON file containing one `RoutingInspectionInputV1`, or `-` for standard input.
+    #[arg(long)]
+    pub(crate) request_file: Option<PathBuf>,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterDecisionsCommand {
+    #[command(subcommand)]
+    pub(crate) command: RouterDecisionsSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum RouterDecisionsSubcommand {
+    /// Show the latest decisions and optionally follow new records.
+    Tail(RouterDecisionsTailCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterDecisionsTailCommand {
+    #[command(flatten)]
+    pub(crate) filter: RouterDecisionFilterArgs,
+    #[command(flatten)]
+    pub(crate) page: RouterPageArgs,
+    /// Continue polling for newly committed decisions.
+    #[arg(long)]
+    pub(crate) follow: bool,
+    /// Emit one schema-versioned JSON record per line while following.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct RouterDecisionFilterArgs {
+    /// Exact pool ID.
+    #[arg(long)]
+    pub(crate) pool: Option<String>,
+    /// Exact `recommend` or `active` mode.
+    #[arg(long)]
+    pub(crate) mode: Option<String>,
+    /// Exact selected candidate ID.
+    #[arg(long)]
+    pub(crate) candidate: Option<String>,
+    /// Exact stable final reason.
+    #[arg(long)]
+    pub(crate) final_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterPageArgs {
+    /// Maximum records in this page.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub(crate) limit: u16,
+    /// Opaque cursor returned by the preceding page or tail checkpoint.
+    #[arg(long)]
+    pub(crate) cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterControlCommand {
+    /// Bounded nonblank audit reason.
+    #[arg(long)]
+    pub(crate) reason: String,
+    /// Explicit audit actor; defaults to the authenticated OS principal.
+    #[arg(long)]
+    pub(crate) actor: Option<String>,
+    /// Apply only to this exact pool instead of all pools.
+    #[arg(long)]
+    pub(crate) pool: Option<String>,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterForceAnchorCommand {
+    #[command(subcommand)]
+    pub(crate) command: RouterForceAnchorSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum RouterForceAnchorSubcommand {
+    /// Force anchor serving while preserving allowed learning work.
+    Set(RouterControlCommand),
+    /// Clear force-anchor without changing pause.
+    Clear(RouterControlCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("router_reset_scope")
+        .args(["pool", "all"])
+        .required(true)
+        .multiple(false)
+))]
+pub(crate) struct RouterResetCommand {
+    /// Reset only this exact pool.
+    #[arg(long)]
+    pub(crate) pool: Option<String>,
+    /// Reset every configured pool atomically.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Exact configured project confirmation ID.
+    #[arg(long)]
+    pub(crate) confirm: String,
+    /// Bounded nonblank audit reason.
+    #[arg(long)]
+    pub(crate) reason: String,
+    /// Explicit audit actor; defaults to the authenticated OS principal.
+    #[arg(long)]
+    pub(crate) actor: Option<String>,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterCohortCommand {
+    #[command(subcommand)]
+    pub(crate) command: RouterCohortSubcommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum RouterCohortSubcommand {
+    /// Rotate protected cohort generation and invalidate prior authorization.
+    Rotate(RouterCohortRotateCommand),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct RouterCohortRotateCommand {
+    /// Exact configured project confirmation ID.
+    #[arg(long)]
+    pub(crate) confirm: String,
+    /// Bounded nonblank audit reason.
+    #[arg(long)]
+    pub(crate) reason: String,
+    /// Explicit audit actor; defaults to the authenticated OS principal.
+    #[arg(long)]
+    pub(crate) actor: Option<String>,
+    /// Emit a schema-versioned JSON envelope.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 /// Args for `nemo-relay doctor`. `--json` is on this command (rather than as a global flag)
@@ -697,6 +1034,11 @@ pub(crate) fn resolve_plugins_config(
     load_shared_config(explicit, None)
 }
 
+/// Resolve the merged plugin document once for a Router inspection command.
+pub(crate) fn resolve_router_command_config(args: &ServerArgs) -> Result<ResolvedConfig, CliError> {
+    load_shared_config(args.config.as_ref(), args.plugin_config_path.as_ref())
+}
+
 /// Resolves transparent `run` configuration and switches the gateway to an ephemeral bind address.
 ///
 /// Explicit run arguments override inherited top-level server flags, which override shared config.
@@ -1034,8 +1376,17 @@ fn load_plugin_toml_config(
 
 /// Returns the physical `plugins.toml` files that contribute effective runtime or dynamic
 /// plugin configuration under the default discovery rules.
+#[cfg(test)]
 pub(crate) fn effective_plugin_toml_sources() -> Result<Vec<PathBuf>, CliError> {
-    let Some(config) = load_plugin_toml_config(None, None)? else {
+    effective_plugin_toml_sources_for(&ServerArgs::default())
+}
+
+pub(crate) fn effective_plugin_toml_sources_for(
+    args: &ServerArgs,
+) -> Result<Vec<PathBuf>, CliError> {
+    let Some(config) =
+        load_plugin_toml_config(args.config.as_ref(), args.plugin_config_path.as_ref())?
+    else {
         return Ok(Vec::new());
     };
     let mut sources = config.contributing_sources;

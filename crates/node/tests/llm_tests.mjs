@@ -3,11 +3,14 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const lib = require('../index.js');
+const nodePackageDir = fileURLToPath(new URL('..', import.meta.url));
 
 const {
   pushScope,
@@ -16,7 +19,9 @@ const {
   llmCallEnd,
   llmCallExecute,
   llmCallExecuteAsync,
+  llmCallExecuteV2,
   llmStreamCallExecute,
+  __testNodeReplayBridge,
   llmRequestIntercepts,
   llmConditionalExecution,
   registerLlmSanitizeRequestGuardrail,
@@ -39,6 +44,7 @@ const {
 
 const LLM_ATTR_STATELESS = 0b01;
 const LLM_ATTR_STREAMING = 0b10;
+const V2_API_FAMILIES = ['openai_responses', 'openai_chat_completions', 'anthropic_messages'];
 
 function rejectWith(value) {
   return Promise.reject(value);
@@ -59,6 +65,17 @@ function makeNative() {
       model: 'test-model',
     },
   };
+}
+
+function assertRecursivelyFrozen(value) {
+  if (value === null || typeof value !== 'object') return;
+  assert.equal(Object.isFrozen(value), true);
+  for (const child of Object.values(value)) assertRecursivelyFrozen(child);
+}
+
+function assertReplayTestContext(context, apiFamily) {
+  assert.equal(context.apiFamily, apiFamily);
+  assert.equal(context.callRole, 'primary');
 }
 
 // ===========================================================================
@@ -284,6 +301,525 @@ describe('LLM execute', () => {
         ),
       /string llm error/,
     );
+  });
+});
+
+// ===========================================================================
+// LLM execute V2 and replay factory
+// ===========================================================================
+
+describe('LLM execute V2', () => {
+  it('requires explicit family, role, and sanitized metadata', async () => {
+    let providerCalls = 0;
+    const provider = async () => {
+      providerCalls += 1;
+      return { response: 'should not run' };
+    };
+
+    await assert.rejects(
+      async () => llmCallExecuteV2('v2_invalid_family', makeNative(), provider, 'openai_unknown', 'primary', {}),
+      /apiFamily/,
+    );
+    await assert.rejects(
+      async () => llmCallExecuteV2('v2_invalid_role', makeNative(), provider, 'openai_responses', 'observer', {}),
+      /callRole/,
+    );
+    await assert.rejects(
+      async () => llmCallExecuteV2('v2_invalid_metadata', makeNative(), provider, 'openai_responses', 'primary', []),
+      /sanitizedMetadata/,
+    );
+    await assert.rejects(
+      async () =>
+        llmCallExecuteV2(
+          'v2_invalid_tenant',
+          makeNative(),
+          provider,
+          'openai_responses',
+          'primary',
+          {},
+          null,
+          null,
+          null,
+          null,
+          null,
+          'Bearer tenant-secret',
+        ),
+      /tenant_id.*credential/,
+    );
+    assert.equal(providerCalls, 0);
+  });
+
+  it('passes an exact recursively frozen context to one synchronous factory for every family', async () => {
+    for (const apiFamily of V2_API_FAMILIES) {
+      let capturedContext;
+      let factoryCalls = 0;
+      let providerCalls = 0;
+      let replayCalls = 0;
+      const sanitizedMetadata = {
+        region: 'us-east',
+        routing: { family: apiFamily, fallbacks: ['none'] },
+      };
+      const response = await llmCallExecuteV2(
+        `v2_context_${apiFamily}`,
+        makeNative(),
+        async () => {
+          providerCalls += 1;
+          return { response: 'anchor' };
+        },
+        apiFamily,
+        'primary',
+        sanitizedMetadata,
+        null,
+        null,
+        null,
+        null,
+        'test-model',
+        'Tenant-A',
+        'Agent-A',
+        (context) => {
+          factoryCalls += 1;
+          capturedContext = context;
+          return {
+            contractVersion: 1,
+            apiFamily,
+            transportIdentity: `node-test-transport-${apiFamily}`,
+            replay(request) {
+              replayCalls += 1;
+              return { result: Promise.resolve(request), cancel() {} };
+            },
+          };
+        },
+      );
+
+      assert.deepEqual(response, { response: 'anchor' });
+      assertRecursivelyFrozen(capturedContext);
+      assert.equal(capturedContext.apiFamily, apiFamily);
+      assert.equal(capturedContext.callRole, 'primary');
+      assert.equal(capturedContext.tenantId, 'Tenant-A');
+      assert.equal(capturedContext.agentId, 'Agent-A');
+      assert.deepEqual(capturedContext.sanitizedMetadata, sanitizedMetadata);
+      assert.match(capturedContext.callUuid, /^[0-9a-f-]+$/);
+      assert.equal(factoryCalls, 1);
+      assert.equal(providerCalls, 1);
+      assert.equal(replayCalls, 0);
+    }
+  });
+
+  it('fails open once for every family when a factory throws or returns an invalid descriptor', async () => {
+    for (const apiFamily of V2_API_FAMILIES) {
+      const mismatchedFamily = V2_API_FAMILIES.find((family) => family !== apiFamily);
+      const invalidFactories = [
+        () => {
+          throw new Error('factory secret must not escape');
+        },
+        () => ({
+          contractVersion: 1,
+          apiFamily,
+          transportIdentity: 'node-test-transport',
+        }),
+        () => ({
+          contractVersion: 99,
+          apiFamily,
+          transportIdentity: 'node-test-transport',
+          replay() {},
+        }),
+        () => ({
+          contractVersion: 1,
+          apiFamily: mismatchedFamily,
+          transportIdentity: 'node-test-transport',
+          replay() {},
+        }),
+        () => ({
+          contractVersion: 1,
+          apiFamily,
+          transportIdentity: 'Bearer must-not-be-a-transport-identity',
+          replay() {},
+        }),
+        () => ({
+          contractVersion: 1,
+          apiFamily,
+          transportIdentity: 'node-test-transport',
+          endpoint: 'https://example.test',
+          replay() {},
+        }),
+        async () => ({
+          contractVersion: 1,
+          apiFamily,
+          transportIdentity: 'node-test-transport',
+          replay() {},
+        }),
+      ];
+
+      for (const invalidFactory of invalidFactories) {
+        let capturedContext;
+        let factoryCalls = 0;
+        let providerCalls = 0;
+        const response = await llmCallExecuteV2(
+          `v2_factory_fail_open_${apiFamily}`,
+          makeNative(),
+          async () => {
+            providerCalls += 1;
+            return { response: 'anchor' };
+          },
+          apiFamily,
+          'primary',
+          {},
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          (context) => {
+            factoryCalls += 1;
+            capturedContext = context;
+            return invalidFactory();
+          },
+        );
+        assert.deepEqual(response, { response: 'anchor' });
+        assertRecursivelyFrozen(capturedContext);
+        assert.equal(capturedContext.apiFamily, apiFamily);
+        assert.equal(capturedContext.callRole, 'primary');
+        assert.equal(factoryCalls, 1);
+        assert.equal(providerCalls, 1);
+      }
+    }
+  });
+
+  it('rejects enumerable descriptor side-channel fields at the replay bridge', async () => {
+    for (const apiFamily of V2_API_FAMILIES) {
+      for (const extra of [
+        { endpoint: 'https://example.test' },
+        { authorization: 'Bearer must-not-cross-the-bridge' },
+        { anchorResponse: { status: 200 } },
+      ]) {
+        await assert.rejects(
+          () =>
+            __testNodeReplayBridge(
+              (context) => {
+                assertReplayTestContext(context, apiFamily);
+                return {
+                  contractVersion: 1,
+                  apiFamily,
+                  transportIdentity: `node-side-channel-test-${apiFamily}`,
+                  replay(request) {
+                    return { result: Promise.resolve(request), cancel() {} };
+                  },
+                  ...extra,
+                };
+              },
+              apiFamily,
+              [{ headers: {}, content: {} }],
+              false,
+            ),
+          /Node replay factory returned an invalid descriptor/,
+        );
+      }
+    }
+  });
+
+  it('consumes rejected async factories under strict unhandled-rejection policy', () => {
+    const script = `
+      const { llmCallExecuteV2 } = require('./index.js');
+      void (async () => {
+        const response = await llmCallExecuteV2(
+          'v2_rejected_async_factory',
+          { headers: {}, content: {} },
+          async () => ({ anchor: true }),
+          'openai_responses',
+          'primary',
+          {},
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          async () => { throw new Error('factory secret must not escape'); },
+        );
+        console.log(JSON.stringify(response));
+        await new Promise((resolve) => setImmediate(resolve));
+      })().catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+    `;
+    const child = spawnSync(process.execPath, ['--unhandled-rejections=strict', '--eval', script], {
+      cwd: nodePackageDir,
+      encoding: 'utf8',
+    });
+
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /\{"anchor":true\}/);
+    assert.doesNotMatch(child.stderr, /factory secret must not escape/);
+  });
+
+  it('retains the original descriptor and private state until transport release', () => {
+    const script = `
+      const assert = require('node:assert/strict');
+      const { __testNodeReplayBridge } = require('./index.js');
+      void (async () => {
+        const apiFamilies = ${JSON.stringify(V2_API_FAMILIES)};
+        for (const apiFamily of apiFamilies) {
+          let descriptorRef;
+          let replayCalls = 0;
+          const results = await __testNodeReplayBridge(
+            (context) => {
+              assert.equal(context.apiFamily, apiFamily);
+              assert.equal(context.callRole, 'primary');
+              const descriptor = {
+                contractVersion: 1,
+                apiFamily,
+                transportIdentity: 'node-private-state-transport-' + apiFamily,
+                replay(request) {
+                  assert.equal(Object.isFrozen(this), true);
+                  assert.equal(descriptorRef.deref(), this);
+                  assert.equal(this.privateState.prefix, 'retained');
+                  replayCalls += 1;
+                  return {
+                    result: Promise.resolve({ value: this.privateState.prefix + '-' + request.content.id }),
+                    cancel() {},
+                  };
+                },
+              };
+              Object.defineProperty(descriptor, 'privateState', {
+                value: { prefix: 'retained' },
+                enumerable: false,
+              });
+              descriptorRef = new WeakRef(descriptor);
+              return descriptor;
+            },
+            apiFamily,
+            [
+              { headers: {}, content: { id: 1 } },
+              { headers: {}, content: { id: 2 } },
+            ],
+            false,
+          );
+          assert.deepEqual(results, [{ value: 'retained-1' }, { value: 'retained-2' }]);
+          assert.equal(replayCalls, 2);
+
+          let released = false;
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            await new Promise((resolve) => setImmediate(resolve));
+            global.gc();
+            await new Promise((resolve) => setImmediate(resolve));
+            if (descriptorRef.deref() === undefined) {
+              released = true;
+              break;
+            }
+          }
+          assert.equal(released, true, 'descriptor remained alive after replay transport release for ' + apiFamily);
+        }
+      })().catch((error) => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+    `;
+    const child = spawnSync(process.execPath, ['--expose-gc', '--eval', script], {
+      cwd: nodePackageDir,
+      encoding: 'utf8',
+      timeout: 30_000,
+    });
+
+    assert.equal(child.status, 0, child.stderr || child.error?.message);
+  });
+
+  it('does not invoke a replay factory for stateful calls', async () => {
+    let factoryCalls = 0;
+    const response = await llmCallExecuteV2(
+      'v2_stateful',
+      makeNative(),
+      async () => ({ response: 'anchor' }),
+      'openai_responses',
+      'primary',
+      {},
+      null,
+      LLM_ATTR_STATELESS,
+      null,
+      null,
+      null,
+      null,
+      null,
+      () => {
+        factoryCalls += 1;
+        throw new Error('must not run');
+      },
+    );
+    assert.deepEqual(response, { response: 'anchor' });
+    assert.equal(factoryCalls, 0);
+  });
+
+  it('supports sequential and concurrent replay calls after the factory is released', async () => {
+    for (const apiFamily of V2_API_FAMILIES) {
+      const seen = [];
+      let activeCalls = 0;
+      let maxActiveCalls = 0;
+      const replayFactory = (context) => {
+        assertReplayTestContext(context, apiFamily);
+        return {
+          contractVersion: 1,
+          apiFamily,
+          transportIdentity: `node-repeated-transport-${apiFamily}`,
+          replay(request) {
+            assert.equal(Object.isFrozen(request), true);
+            const id = request.content.id;
+            seen.push(id);
+            activeCalls += 1;
+            maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+            return {
+              result: new Promise((resolve) =>
+                setTimeout(
+                  () => {
+                    activeCalls -= 1;
+                    resolve({ id, complete: true });
+                  },
+                  id === 2 ? 20 : 1,
+                ),
+              ),
+              cancel() {},
+            };
+          },
+        };
+      };
+      const results = await __testNodeReplayBridge(
+        replayFactory,
+        apiFamily,
+        [
+          { headers: {}, content: { id: 1 } },
+          { headers: {}, content: { id: 2 } },
+          { headers: {}, content: { id: 3 } },
+        ],
+        false,
+      );
+      assert.deepEqual(results, [
+        { id: 1, complete: true },
+        { id: 2, complete: true },
+        { id: 3, complete: true },
+      ]);
+      assert.deepEqual(seen.sort(), [1, 2, 3]);
+      assert.equal(maxActiveCalls, 2);
+    }
+  });
+
+  it('cancels one dropped replay exactly once without affecting a sibling', async () => {
+    for (const apiFamily of V2_API_FAMILIES) {
+      let cancelled = 0;
+      let completed = 0;
+      let siblingCancelled = 0;
+      const results = await __testNodeReplayBridge(
+        (context) => {
+          assertReplayTestContext(context, apiFamily);
+          return {
+            contractVersion: 1,
+            apiFamily,
+            transportIdentity: `node-cancel-transport-${apiFamily}`,
+            replay(request) {
+              if (request.content.pending) {
+                return {
+                  result: new Promise(() => {}),
+                  cancel() {
+                    cancelled += 1;
+                  },
+                };
+              }
+              return {
+                result: Promise.resolve().then(() => {
+                  completed += 1;
+                  return { sibling: 'complete' };
+                }),
+                cancel() {
+                  siblingCancelled += 1;
+                },
+              };
+            },
+          };
+        },
+        apiFamily,
+        [
+          { headers: {}, content: { pending: true } },
+          { headers: {}, content: { pending: false } },
+        ],
+        true,
+      );
+      assert.deepEqual(results, [{ sibling: 'complete' }]);
+      for (let i = 0; i < 20 && cancelled === 0; i += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(cancelled, 1);
+      assert.equal(completed, 1);
+      assert.equal(siblingCancelled, 0);
+    }
+  });
+
+  it('maps replay rejection and malformed invocation to replay errors', async () => {
+    for (const apiFamily of V2_API_FAMILIES) {
+      await assert.rejects(
+        () =>
+          __testNodeReplayBridge(
+            (context) => {
+              assertReplayTestContext(context, apiFamily);
+              return {
+                contractVersion: 1,
+                apiFamily,
+                transportIdentity: `node-reject-transport-${apiFamily}`,
+                replay() {
+                  return { result: Promise.reject(new Error('replay failed')), cancel() {} };
+                },
+              };
+            },
+            apiFamily,
+            [{ headers: {}, content: {} }],
+            false,
+          ),
+        /replay failed/,
+      );
+      await assert.rejects(
+        () =>
+          __testNodeReplayBridge(
+            (context) => {
+              assertReplayTestContext(context, apiFamily);
+              return {
+                contractVersion: 1,
+                apiFamily,
+                transportIdentity: `node-invalid-invocation-${apiFamily}`,
+                replay() {
+                  return Promise.resolve({ invalid: true });
+                },
+              };
+            },
+            apiFamily,
+            [{ headers: {}, content: {} }],
+            false,
+          ),
+        /invalid invocation/,
+      );
+
+      for (const invalidResult of [undefined, 1n, Number.NaN, () => {}]) {
+        await assert.rejects(
+          () =>
+            __testNodeReplayBridge(
+              (context) => {
+                assertReplayTestContext(context, apiFamily);
+                return {
+                  contractVersion: 1,
+                  apiFamily,
+                  transportIdentity: `node-invalid-result-${apiFamily}`,
+                  replay() {
+                    return { result: Promise.resolve(invalidResult), cancel() {} };
+                  },
+                };
+              },
+              apiFamily,
+              [{ headers: {}, content: {} }],
+              false,
+            ),
+          /Node replay result must be valid JSON/,
+        );
+      }
+    }
   });
 });
 
@@ -940,6 +1476,7 @@ describe('LLM event fields', () => {
         (e) => e.name === 'field_llm' && e.kind === 'scope' && e.category === 'llm' && e.scope_category === 'end',
       );
       assert.equal(start.category_profile.model_name, 'gpt-field-model');
+      assert.equal(start.category_profile.call_role, 'primary');
       assert.deepEqual(start.data, {
         headers: {},
         content: {

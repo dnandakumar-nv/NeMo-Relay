@@ -77,6 +77,48 @@ Use them when behavior belongs around the invocation boundary itself, such as:
 - Wrapper logic
 - Framework integration
 
+#### Call-Scoped Continuations and Replay
+
+Non-streaming V1 and V2 LLM execution intercepts share one priority-ordered
+registry. V1 calls invoke only V1 entries. V2 calls combine context-aware V2
+entries with adapted V1 entries while preserving name uniqueness, scope
+visibility, and deterministic ordering.
+
+The `next` continuation always belongs to the current physical call. A Rust
+V2 intercept can invoke `next` at most once while its callback future is active.
+It must not retain `next` for a delayed retry, shadow call, or judge call. A V1
+intercept adapted into a V2 chain keeps its V1 retry behavior while the callback
+is active, but its continuation is invalid after the callback returns.
+
+A V2 intercept can instead receive an optional host-owned replay transport.
+The transport is separate from `next` and can outlive the anchor chain. It can
+start repeated sequential or concurrent non-streaming calls, and each start has
+independent cancellation. Dropping one incomplete replay call does not cancel
+siblings. Rust callers can clone the exact-once authority returned by
+`LlmReplayCall::cancellation_handle()`. The first call to `cancel()` that claims
+the hook returns `true`; later calls return `false`. Completing the call disarms
+all handle clones.
+
+Host implementations must keep both edges nonblocking.
+`LlmReplayTransport::start` must promptly dispatch potentially blocking host
+work through the returned call rather than wait for host I/O, an interpreter
+lock, or an event loop. The cancellation hook must likewise signal or dispatch
+cancellation promptly without waiting for host I/O, an interpreter lock, or
+task completion.
+
+Replay is fail-open for the anchor path. If the host factory fails or advertises
+an unsupported contract, mismatched API family, or invalid non-secret identity,
+the intercept receives no transport and the anchor continues. Core records only
+a stable reason code in the `nemo_relay.replay_ineligible` mark, not the factory
+error text or transport secrets.
+
+The transport contract does not expose endpoint, authentication, TLS, proxy,
+anchor response status, response headers, streaming writers, or client-side
+channels. Keep immutable connection policy in the opaque host implementation.
+`Shadow` and `Judge` work must run as separate managed calls under an immediate
+`Evaluator` parent with a valid `anchor_uuid` in sanitized metadata. Those calls
+must not receive another replay factory.
+
 ### Stream Execution Intercepts
 
 LLM streaming has a stream execution path for wrappers that need to run around
@@ -278,3 +320,5 @@ Use these practices when applying the concept in application or integration code
   configuration-driven.
 - Treat execution intercepts as the preferred wrapper point for framework
   integrations.
+- Keep `next` call-scoped. Use a host-owned replay transport for delayed or
+  repeated V2 work.

@@ -43,6 +43,18 @@ If instrumentation is not in place yet, start with
 [Instrument Applications](/instrument-applications/about) or
 [Integrate into Frameworks](/integrate-into-frameworks/about).
 
+## LLM Call Roles
+
+Adaptive creates LLM learning records only from Primary calls. It accepts an
+explicit `primary` role and legacy LLM events that omit
+`category_profile.call_role`. It ignores Shadow, Judge, and malformed-role LLM
+events so evaluation traffic cannot affect learned runtime behavior. Tool
+observation is unchanged.
+
+This filtering applies to Adaptive learning, not to the raw event stream. ATOF
+subscribers can still observe every LLM call role. Embedding work uses
+`ScopeType::Embedder` and has no `LlmApiFamily` or `LlmCallRole`.
+
 ## Pages
 
 - [Adaptive Configuration](/configure-plugins/adaptive/configuration) documents the full plugin

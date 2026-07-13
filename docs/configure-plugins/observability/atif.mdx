@@ -152,7 +152,6 @@ endpoint = "https://observability.example.com/atif"
 ```
 
 #### Connection Fields
-
 By default, Relay reads credentials, region, and endpoint URL from standard AWS
 environment variables. You can also set non-secret connection fields directly
 in the configuration. This lets one file describe multiple S3-compatible
@@ -229,6 +228,37 @@ ATIF is a trajectory projection over NeMo Relay events. It should preserve the
 meaning of scope parentage, event UUIDs, codec annotations, and exporter-local
 lineage rules without becoming the source of truth for runtime ownership,
 middleware ordering, or provider payload decoding.
+
+### Internal Call Projection
+
+ATIF exports Primary LLM calls by default. The default projection also includes
+legacy LLM events that omit `category_profile.call_role`, because typed readers
+treat an absent role as Primary. It excludes explicitly labeled Shadow and
+Judge pairs, and it excludes a present malformed role rather than treating it
+as Primary.
+
+The default projection also excludes every Evaluator and Embedder scope and its
+complete descendant closure. This event-order-independent filter removes
+nested LLM, tool, mark, and other scope events even when a child event arrives
+before the internal scope start event. Events in sibling subtrees remain
+eligible for export. Both filters run before step, deduplication, correlation,
+and metric construction. Tool and mark events outside these internal subtrees
+are unchanged.
+
+Router creates one fresh-root Embedder scope for each embedding HTTP operation.
+The scope has no LLM family or call role and contains only bounded linkage such
+as profile ID, vector-space ID, canonical-query hashes, and embedding-job or
+decision IDs. Default ATIF does not expose that scope. Raw ATOF and the existing
+OpenTelemetry and OpenInference projections can expose those identifiers.
+
+Rust diagnostic exporters can call `AtifExporter::export_with_options` with
+`AtifExportOptions { include_non_primary_llm_calls: true }` to include the
+complete buffered event stream, including Evaluator and Embedder subtrees plus
+Shadow, Judge, and malformed-role LLM events. This diagnostic option can expose
+the bounded Router linkage identifiers described above. Existing constructors,
+`export`, `try_export`, and plugin-managed ATIF export keep the production
+default. Raw ATOF export remains available when a diagnostic needs the complete
+role-bearing event stream.
 
 ## Plugin Configuration
 
@@ -444,6 +474,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Common Configuration and Runtime Issues
 
+Common ATIF validation failures include:
+
 - `filename_template` does not contain `{session_id}`.
 - The output directory is not writable at runtime.
 - Tool definitions or `extra` metadata are not JSON-compatible.
@@ -451,4 +483,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   coding-agent turn scope, so no trajectory file is created.
 - `storage[i].type` is unknown or `storage[i].bucket` is empty for some entry.
 - `storage` is non-empty in a build that was compiled without the
-  `atif-storage` feature.
+  `object-store` feature.

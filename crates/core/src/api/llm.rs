@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -17,9 +19,10 @@ use crate::api::optimization::{
 };
 use crate::api::runtime::NemoRelayContextState;
 use crate::api::runtime::global_context;
+use crate::api::runtime::llm_context::{capture_llm_execution_context, validate_routing_identity};
 use crate::api::runtime::{
-    EventSubscriberFn, LlmCollectorFn, LlmExecutionNextFn, LlmFinalizerFn, LlmJsonStream,
-    LlmStreamExecutionNextFn,
+    EventSubscriberFn, LLM_REPLAY_CONTRACT_VERSION, LlmCollectorFn, LlmExecutionNextFn,
+    LlmFinalizerFn, LlmJsonStream, LlmReplayFactory, LlmReplayTransport, LlmStreamExecutionNextFn,
 };
 use crate::api::runtime::{ScopeStackHandle, current_scope_stack};
 use crate::api::scope::event;
@@ -36,7 +39,10 @@ use crate::error::{FlowError, Result};
 use crate::json::Json;
 use crate::stream::LlmStreamWrapper;
 
-pub use nemo_relay_types::api::llm::{LlmAttributes, LlmRequest, LlmRequestInterceptOutcome};
+pub use nemo_relay_types::api::llm::{
+    LlmApiFamily, LlmAttributes, LlmCallRole, LlmExecutionContextSnapshot, LlmRequest,
+    LlmRequestInterceptOutcome, LlmTrajectoryScopeSnapshot,
+};
 
 #[derive(Clone)]
 struct CapturedLlmScopeStack(ScopeStackHandle);
@@ -220,6 +226,55 @@ pub struct LlmCallExecuteParams {
     /// Optional response codec used to attach annotated response data.
     #[builder(default)]
     pub response_codec: Option<Arc<dyn LlmResponseCodec>>,
+}
+
+/// Builder parameters for [`llm_call_execute_v2`].
+#[derive(TypedBuilder)]
+#[builder(field_defaults(setter(strip_option(ignore_invalid, fallback_suffix = "_opt"))))]
+pub struct LlmCallExecuteV2Params {
+    /// Logical provider or model family name recorded on emitted events.
+    #[builder(setter(into))]
+    pub name: String,
+    /// Raw request passed into the managed pipeline.
+    pub request: LlmRequest,
+    /// Provider callback or execution continuation.
+    pub func: LlmExecutionNextFn,
+    /// Explicit provider API family used for replay validation.
+    pub api_family: LlmApiFamily,
+    /// Explicit managed-call role.
+    pub call_role: LlmCallRole,
+    /// Caller-owned non-secret routing metadata copied into the frozen context.
+    pub sanitized_metadata: BTreeMap<String, Json>,
+    /// Optional explicit parent scope for the emitted LLM span.
+    #[builder(default)]
+    pub parent: Option<ScopeHandle>,
+    /// LLM attribute bitflags applied to the managed span.
+    #[builder(default = LlmAttributes::empty())]
+    pub attributes: LlmAttributes,
+    /// Optional application payload stored on the managed LLM handle.
+    #[builder(default)]
+    pub data: Option<Json>,
+    /// Optional JSON metadata recorded on emitted events.
+    #[builder(default)]
+    pub metadata: Option<Json>,
+    /// Optional normalized model name for observability output.
+    #[builder(default, setter(into))]
+    pub model_name: Option<String>,
+    /// Optional request codec used to produce annotated request data.
+    #[builder(default)]
+    pub codec: Option<Arc<dyn LlmCodec>>,
+    /// Optional response codec used to attach annotated response data.
+    #[builder(default)]
+    pub response_codec: Option<Arc<dyn LlmResponseCodec>>,
+    /// Optional stable tenant routing identity.
+    #[builder(default, setter(into))]
+    pub tenant_id: Option<String>,
+    /// Optional stable agent routing identity.
+    #[builder(default, setter(into))]
+    pub agent_id: Option<String>,
+    /// Optional host-owned factory for delayed replay.
+    #[builder(default)]
+    pub replay_factory: Option<Arc<dyn LlmReplayFactory>>,
 }
 
 /// Builder parameters for [`llm_stream_call_execute`].
@@ -409,6 +464,24 @@ fn emit_llm_start_with_subscribers(
     request_codec: Option<&dyn LlmCodec>,
     subscribers: &[EventSubscriberFn],
 ) -> Result<()> {
+    emit_llm_start_with_subscribers_and_role(
+        handle,
+        request,
+        annotated_request,
+        request_codec,
+        subscribers,
+        LlmCallRole::Primary,
+    )
+}
+
+fn emit_llm_start_with_subscribers_and_role(
+    handle: &LlmHandle,
+    request: &LlmRequest,
+    annotated_request: Option<Arc<AnnotatedLlmRequest>>,
+    request_codec: Option<&dyn LlmCodec>,
+    subscribers: &[EventSubscriberFn],
+    call_role: LlmCallRole,
+) -> Result<()> {
     ensure_runtime_owner()?;
     let entries = {
         let scope_stack = handle.captured_scope_stack();
@@ -451,7 +524,7 @@ fn emit_llm_start_with_subscribers(
         let state = context
             .read()
             .map_err(|error| FlowError::Internal(error.to_string()))?;
-        state.build_llm_start_event(handle, Some(input), annotated_request)
+        state.build_llm_start_event_with_role(handle, Some(input), annotated_request, call_role)
     };
     if let Some(event) = sanitize_event_with_scope_stack(event, scope_stack) {
         NemoRelayContextState::emit_event(&event, subscribers);
@@ -653,6 +726,20 @@ fn llm_call_end_with_behavior(
     behavior: LlmCallEndBehavior,
     lifecycle_subscribers: Option<&[EventSubscriberFn]>,
 ) -> Result<()> {
+    llm_call_end_with_behavior_and_role(
+        params,
+        behavior,
+        lifecycle_subscribers,
+        LlmCallRole::Primary,
+    )
+}
+
+fn llm_call_end_with_behavior_and_role(
+    params: LlmCallEndParams<'_>,
+    behavior: LlmCallEndBehavior,
+    lifecycle_subscribers: Option<&[EventSubscriberFn]>,
+    call_role: LlmCallRole,
+) -> Result<()> {
     let LlmCallEndParams {
         handle,
         response,
@@ -731,7 +818,7 @@ fn llm_call_end_with_behavior(
             .read()
             .map_err(|error| FlowError::Internal(error.to_string()))?;
         let end_metadata = metadata_with_otel_status(metadata, "OK", None);
-        state.build_llm_end_event(
+        state.build_llm_end_event_with_role(
             EndLlmHandleParams::builder()
                 .handle(handle)
                 .data_opt(data)
@@ -739,6 +826,7 @@ fn llm_call_end_with_behavior(
                 .annotated_response_opt(annotated_response)
                 .timestamp_opt(timestamp)
                 .build(),
+            call_role,
         )
     };
     if let Some(event) = sanitize_event_with_scope_stack(event, handle.captured_scope_stack()) {
@@ -757,6 +845,20 @@ fn emit_llm_end_without_output(
     handle: &LlmHandle,
     metadata: Option<Json>,
     lifecycle_subscribers: Option<&[EventSubscriberFn]>,
+) -> Result<()> {
+    emit_llm_end_without_output_with_role(
+        handle,
+        metadata,
+        lifecycle_subscribers,
+        LlmCallRole::Primary,
+    )
+}
+
+fn emit_llm_end_without_output_with_role(
+    handle: &LlmHandle,
+    metadata: Option<Json>,
+    lifecycle_subscribers: Option<&[EventSubscriberFn]>,
+    call_role: LlmCallRole,
 ) -> Result<()> {
     ensure_runtime_owner()?;
     let subscribers = {
@@ -788,7 +890,15 @@ fn emit_llm_end_without_output(
         let state = context
             .read()
             .map_err(|error| FlowError::Internal(error.to_string()))?;
-        state.end_llm_handle(handle, handle.data.clone(), metadata, annotated_response)
+        state.build_llm_end_event_with_role(
+            EndLlmHandleParams::builder()
+                .handle(handle)
+                .data_opt(handle.data.clone())
+                .metadata_opt(metadata)
+                .annotated_response_opt(annotated_response)
+                .build(),
+            call_role,
+        )
     };
     if let Some(event) = sanitize_event_with_scope_stack(event, handle.captured_scope_stack()) {
         NemoRelayContextState::emit_event(&event, &subscribers);
@@ -980,6 +1090,253 @@ pub async fn llm_call_execute(params: LlmCallExecuteParams) -> Result<Json> {
             Err(error)
         }
     }
+}
+
+/// Execute a non-streaming V2 LLM call with frozen context and optional replay.
+///
+/// The V2 path preserves the V1 middleware and lifecycle order while requiring
+/// an explicit provider family, call role, and caller-sanitized routing
+/// metadata. Replay capability failures are fail-open: context-aware
+/// intercepts receive no transport and the anchor provider callback continues.
+///
+/// # Errors
+/// Returns an error for invalid V2 context authority, guardrail rejection, or
+/// any request/execution/codec/provider failure on the anchor path. Replay
+/// factory and capability validation errors do not fail the anchor.
+pub async fn llm_call_execute_v2(params: LlmCallExecuteV2Params) -> Result<Json> {
+    let LlmCallExecuteV2Params {
+        name,
+        request,
+        func,
+        api_family,
+        call_role,
+        sanitized_metadata,
+        parent,
+        attributes,
+        data,
+        metadata,
+        model_name,
+        codec,
+        response_codec,
+        tenant_id,
+        agent_id,
+        replay_factory,
+    } = params;
+    ensure_runtime_owner()?;
+    {
+        let (entries, subscribers, parent_uuid, guardrail_metadata) = {
+            let scope_stack = current_scope_stack();
+            let scope_guard = scope_stack.read().expect("scope stack lock poisoned");
+            let scope_locals = scope_guard.collect_scope_local_registries(|registries| {
+                &registries.llm_conditional_execution_guardrails
+            });
+            let scope_subscribers = scope_guard.collect_scope_local_subscribers();
+            let context = global_context();
+            let state = context
+                .read()
+                .map_err(|error| FlowError::Internal(error.to_string()))?;
+            let entries = state.llm_conditional_execution_entries(&scope_locals);
+            let subscribers = state.collect_event_subscribers(&scope_subscribers);
+            (
+                entries,
+                subscribers,
+                resolve_parent_uuid(parent.as_ref()),
+                metadata.clone(),
+            )
+        };
+        if let Some(error) = NemoRelayContextState::llm_conditional_execution_snapshot_chain(
+            &request,
+            &entries,
+            &subscribers,
+            parent_uuid,
+            guardrail_metadata,
+        )? {
+            let rejection_data = json!({
+                "rejected": true,
+                "rejection_reason": error,
+            });
+            let _ = event(
+                EmitMarkEventParams::builder()
+                    .name(&name)
+                    .parent_opt(parent.as_ref())
+                    .data(rejection_data)
+                    .metadata_opt(metadata.clone())
+                    .build(),
+            );
+            return Err(FlowError::GuardrailRejected(error));
+        }
+    }
+
+    let request_codec = codec.clone();
+    let optimization_recorder = LlmOptimizationRecorder::default();
+    let (intercepted_request, annotated_request, mut pending_marks, optimization_contributions) =
+        scope_llm_optimization_recorder(optimization_recorder.clone(), async {
+            run_request_intercepts_with_codec_and_recorder(
+                &name,
+                request,
+                codec,
+                &optimization_recorder,
+            )
+        })
+        .await?;
+
+    let mut handle = create_llm_handle(
+        CreateLlmHandleParams::builder()
+            .name(name.as_str())
+            .parent_uuid_opt(resolve_parent_uuid(parent.as_ref()))
+            .attributes(attributes)
+            .data_opt(data.clone())
+            .metadata_opt(metadata.clone())
+            .model_name_opt(model_name)
+            .build(),
+    )?;
+    handle.optimization_recorder = optimization_recorder;
+    let execution_context = capture_llm_execution_context(
+        &handle,
+        api_family,
+        call_role,
+        tenant_id,
+        agent_id,
+        sanitized_metadata,
+    )?;
+    let (replay_transport, replay_diagnostic) =
+        build_replay_transport(&execution_context, attributes, replay_factory.as_ref());
+    if let Some(reason) = replay_diagnostic {
+        pending_marks.insert(
+            0,
+            PendingMarkSpec::builder()
+                .name("nemo_relay.replay_ineligible")
+                .metadata(json!({
+                    "call_uuid": handle.uuid.to_string(),
+                    "reason": reason,
+                }))
+                .build(),
+        );
+    }
+
+    let lifecycle_subscribers = {
+        let scope_stack = current_scope_stack();
+        let scope_guard = scope_stack.read().expect("scope stack lock poisoned");
+        snapshot_event_subscribers(scope_guard.collect_scope_local_subscribers())?
+    };
+    emit_llm_start_with_subscribers_and_role(
+        &handle,
+        &intercepted_request,
+        annotated_request.clone(),
+        request_codec.as_deref(),
+        &lifecycle_subscribers,
+        call_role,
+    )?;
+    emit_pending_request_marks(&handle, pending_marks, &lifecycle_subscribers)?;
+    handle
+        .optimization_recorder
+        .record_all(optimization_contributions);
+    emit_optimization_marks(&handle, &lifecycle_subscribers);
+
+    let execution_name = name.clone();
+    let execution =
+        scope_llm_optimization_recorder(handle.optimization_recorder.clone(), async move {
+            let execution = {
+                let scope_stack = current_scope_stack();
+                let scope_guard = scope_stack.read().expect("scope stack lock poisoned");
+                let scope_locals = scope_guard.collect_scope_local_registries(|registries| {
+                    &registries.llm_execution_intercepts
+                });
+                let context = global_context();
+                let state = context
+                    .read()
+                    .map_err(|error| FlowError::Internal(error.to_string()))?;
+                state.llm_build_execution_chain_v2(
+                    &execution_name,
+                    execution_context,
+                    replay_transport,
+                    func,
+                    &scope_locals,
+                )
+            };
+            execution(intercepted_request).await
+        })
+        .await;
+
+    match execution {
+        Ok(response) => {
+            llm_call_end_with_behavior_and_role(
+                LlmCallEndParams::builder()
+                    .handle(&handle)
+                    .response(response.clone())
+                    .data_opt(data)
+                    .metadata_opt(metadata)
+                    .response_codec_opt(response_codec)
+                    .build(),
+                LlmCallEndBehavior {
+                    response_codec_errors_fatal: false,
+                    attach_estimated_cost: true,
+                },
+                Some(&lifecycle_subscribers),
+                call_role,
+            )?;
+            Ok(response)
+        }
+        Err(error) => {
+            let end_metadata =
+                metadata_with_otel_status(metadata, "ERROR", Some(error.to_string()));
+            let _ = emit_llm_end_without_output_with_role(
+                &handle,
+                end_metadata,
+                Some(&lifecycle_subscribers),
+                call_role,
+            );
+            Err(error)
+        }
+    }
+}
+
+fn build_replay_transport(
+    context: &LlmExecutionContextSnapshot,
+    attributes: LlmAttributes,
+    replay_factory: Option<&Arc<dyn LlmReplayFactory>>,
+) -> (Option<Arc<dyn LlmReplayTransport>>, Option<&'static str>) {
+    let Some(factory) = replay_factory else {
+        return (None, None);
+    };
+    if context.call_role != LlmCallRole::Primary {
+        return (None, Some("internal_role"));
+    }
+    if attributes.contains(LlmAttributes::STREAMING) {
+        return (None, Some("streaming"));
+    }
+    if attributes.contains(LlmAttributes::STATEFUL) {
+        return (None, Some("stateful"));
+    }
+    let transport = match catch_unwind(AssertUnwindSafe(|| factory.build(context))) {
+        Ok(Ok(transport)) => transport,
+        Ok(Err(_)) => return (None, Some("factory_error")),
+        Err(_) => return (None, Some("factory_panic")),
+    };
+    let capability_error = catch_unwind(AssertUnwindSafe(|| {
+        let capability = transport.capability();
+        if capability.contract_version != LLM_REPLAY_CONTRACT_VERSION {
+            return Some("unsupported_contract");
+        }
+        if capability.api_family != context.api_family {
+            return Some("family_mismatch");
+        }
+        if validate_routing_identity(
+            "transport_identity",
+            Some(capability.transport_identity.as_str()),
+        )
+        .is_err()
+        {
+            return Some("invalid_transport_identity");
+        }
+        None
+    }));
+    match capability_error {
+        Ok(Some(reason)) => return (None, Some(reason)),
+        Err(_) => return (None, Some("capability_panic")),
+        Ok(None) => {}
+    }
+    (Some(transport), None)
 }
 
 /// Execute a streaming LLM call through the managed middleware pipeline.

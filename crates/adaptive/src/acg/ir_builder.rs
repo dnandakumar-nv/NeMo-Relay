@@ -20,7 +20,7 @@ use crate::acg::prompt_ir::{
 /// Build a normalized [`PromptIR`] from an annotated LLM request.
 ///
 /// The builder preserves prompt order, inserts tool-schema blocks before the
-/// first non-system message when tools are present, and computes the request
+/// first non-instruction message when tools are present, and computes the request
 /// hashes needed by downstream Adaptive Cache Governor (ACG) analysis.
 ///
 /// # Parameters
@@ -71,7 +71,9 @@ fn should_insert_tool_blocks_before_message(
     request: &AnnotatedLlmRequest,
     message: &Message,
 ) -> bool {
-    !inserted_tool_blocks && !matches!(message, Message::System { .. }) && request.tools.is_some()
+    !inserted_tool_blocks
+        && !matches!(message, Message::System { .. } | Message::Developer { .. })
+        && request.tools.is_some()
 }
 
 fn append_message_blocks(
@@ -86,6 +88,13 @@ fn append_message_blocks(
             PromptRole::System,
             ProvenanceLabel::System,
             None,
+        )),
+        Message::Developer { content, .. } => blocks.push(build_text_block(
+            sequence_index,
+            content,
+            PromptRole::System,
+            ProvenanceLabel::Developer,
+            Some("developer"),
         )),
         Message::User { content, .. } => blocks.push(build_text_block(
             sequence_index,

@@ -1,0 +1,477 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>NeMo Relay Router</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-block">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>NeMo Relay Router</h1>
+          <p id="project-name">Connecting</p>
+        </div>
+      </div>
+      <dl class="header-status" aria-label="Router status">
+        <div>
+          <dt>Configured</dt>
+          <dd id="configured-mode">-</dd>
+        </div>
+        <div>
+          <dt>Effective</dt>
+          <dd id="effective-mode">-</dd>
+        </div>
+        <div>
+          <dt>Generation</dt>
+          <dd id="generation-id">-</dd>
+        </div>
+        <div>
+          <dt>Control</dt>
+          <dd id="control-state">-</dd>
+        </div>
+        <div>
+          <dt>Health</dt>
+          <dd id="health-state">-</dd>
+        </div>
+      </dl>
+      <div class="header-actions">
+        <span id="stale-indicator" class="stale-indicator" hidden>Stale</span>
+        <button
+          id="refresh-button"
+          class="icon-button"
+          type="button"
+          aria-label="Refresh current view"
+          title="Refresh current view"
+        ></button>
+      </div>
+    </header>
+
+    <nav class="view-tabs" role="tablist" aria-label="Dashboard views">
+      <button
+        id="tab-overview"
+        type="button"
+        role="tab"
+        aria-controls="panel-overview"
+        aria-selected="true"
+        data-view="overview"
+      >
+        <span data-icon="overview"></span>Overview
+      </button>
+      <button
+        id="tab-pools"
+        type="button"
+        role="tab"
+        aria-controls="panel-pools"
+        aria-selected="false"
+        tabindex="-1"
+        data-view="pools"
+      >
+        <span data-icon="pools"></span>Pools
+      </button>
+      <button
+        id="tab-evidence"
+        type="button"
+        role="tab"
+        aria-controls="panel-evidence"
+        aria-selected="false"
+        tabindex="-1"
+        data-view="evidence"
+      >
+        <span data-icon="evidence"></span>Evidence
+      </button>
+      <button
+        id="tab-neighborhood"
+        type="button"
+        role="tab"
+        aria-controls="panel-neighborhood"
+        aria-selected="false"
+        tabindex="-1"
+        data-view="neighborhood"
+      >
+        <span data-icon="neighborhood"></span>Neighborhoods
+      </button>
+      <button
+        id="tab-decisions"
+        type="button"
+        role="tab"
+        aria-controls="panel-decisions"
+        aria-selected="false"
+        tabindex="-1"
+        data-view="decisions"
+      >
+        <span data-icon="decisions"></span>Decisions
+      </button>
+      <button
+        id="tab-operations"
+        type="button"
+        role="tab"
+        aria-controls="panel-operations"
+        aria-selected="false"
+        tabindex="-1"
+        data-view="operations"
+      >
+        <span data-icon="operations"></span>Operations
+      </button>
+    </nav>
+
+    <main id="main-content" tabindex="-1">
+      <section
+        id="panel-overview"
+        class="view-panel"
+        role="tabpanel"
+        data-panel="overview"
+        aria-labelledby="tab-overview"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Current state</p>
+            <h2 id="overview-title">Overview</h2>
+          </div>
+          <span id="overview-window" class="window-label">Last 24 hours</span>
+        </div>
+        <div id="overview-state" class="data-state" hidden></div>
+        <div id="overview-content">
+          <div id="overview-metrics" class="metric-grid"></div>
+          <div class="overview-grid">
+            <section class="data-section" aria-labelledby="routing-title">
+              <h3 id="routing-title">Routing</h3>
+              <div id="routing-breakdown"></div>
+            </section>
+            <section class="data-section" aria-labelledby="outcome-title">
+              <h3 id="outcome-title">Outcomes</h3>
+              <div id="outcome-breakdown"></div>
+            </section>
+            <section class="data-section" aria-labelledby="runtime-title">
+              <h3 id="runtime-title">Runtime</h3>
+              <div id="runtime-status"></div>
+            </section>
+            <section class="data-section" aria-labelledby="freshness-title">
+              <h3 id="freshness-title">Freshness</h3>
+              <div id="freshness-status"></div>
+            </section>
+          </div>
+        </div>
+      </section>
+
+      <section
+        id="panel-pools"
+        class="view-panel"
+        role="tabpanel"
+        data-panel="pools"
+        aria-labelledby="tab-pools"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Configured policy</p>
+            <h2 id="pools-title">Pools</h2>
+          </div>
+          <span id="pool-count" class="count-label">0 pools</span>
+        </div>
+        <div id="pools-state" class="data-state" hidden></div>
+        <div class="table-frame">
+          <table>
+            <thead>
+              <tr>
+                <th>Pool</th>
+                <th>Family</th>
+                <th>Anchor</th>
+                <th>Candidates</th>
+                <th>Evidence</th>
+                <th>Coverage</th>
+                <th>Control</th>
+                <th>Health</th>
+              </tr>
+            </thead>
+            <tbody id="pools-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section
+        id="panel-evidence"
+        class="view-panel"
+        role="tabpanel"
+        data-panel="evidence"
+        aria-labelledby="tab-evidence"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Verified records</p>
+            <h2 id="evidence-title">Evidence</h2>
+          </div>
+          <div class="command-group">
+            <select id="export-format" aria-label="Export format">
+              <option value="jsonl">JSONL</option>
+              <option value="csv">CSV</option></select
+            ><button id="export-button" type="button"><span data-icon="download"></span>Export</button>
+          </div>
+        </div>
+        <form id="evidence-filters" class="filter-bar">
+          <label>Pool<input name="pool_id" autocomplete="off" /></label>
+          <label>Candidate<input name="candidate_id" autocomplete="off" /></label>
+          <label
+            >Terminal<select name="terminal_class">
+              <option value="">All</option>
+              <option value="completed">Completed</option>
+              <option value="deterministic_failure">Deterministic failure</option>
+              <option value="operational_failure">Operational failure</option>
+              <option value="skipped_cooloff">Skipped cooloff</option>
+              <option value="canceled_shutdown">Canceled shutdown</option>
+            </select></label
+          >
+          <label
+            >Label<select name="quality_label">
+              <option value="">All</option>
+              <option value="pass">Pass</option>
+              <option value="fail">Fail</option>
+            </select></label
+          >
+          <label>Generation<input name="learning_generation_id" autocomplete="off" /></label>
+          <button type="submit"><span data-icon="filter"></span>Apply</button>
+          <button id="evidence-reset" class="secondary-button" type="button">Reset</button>
+        </form>
+        <div id="evidence-state" class="data-state" hidden></div>
+        <div class="table-frame">
+          <table>
+            <thead>
+              <tr>
+                <th>Created</th>
+                <th>Pool</th>
+                <th>Candidate</th>
+                <th>Terminal</th>
+                <th>Label</th>
+                <th>Vector</th>
+                <th>Preview</th>
+              </tr>
+            </thead>
+            <tbody id="evidence-body"></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <button
+            id="evidence-back"
+            class="icon-button"
+            type="button"
+            aria-label="Previous evidence page"
+            title="Previous page"
+            disabled
+          ></button
+          ><span id="evidence-page-label">Page 1</span
+          ><button
+            id="evidence-next"
+            class="icon-button"
+            type="button"
+            aria-label="Next evidence page"
+            title="Next page"
+            disabled
+          ></button>
+        </div>
+      </section>
+
+      <section
+        id="panel-neighborhood"
+        class="view-panel"
+        role="tabpanel"
+        data-panel="neighborhood"
+        aria-labelledby="tab-neighborhood"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Query-local confidence</p>
+            <h2 id="neighborhood-title">Neighborhoods</h2>
+          </div>
+        </div>
+        <form id="neighborhood-form" class="lookup-form">
+          <div class="segmented-control" aria-label="Lookup source">
+            <button type="button" data-lookup-mode="evidence" aria-pressed="true">Evidence ID</button>
+            <button type="button" data-lookup-mode="query" aria-pressed="false">Query hash</button>
+          </div>
+          <div id="evidence-lookup-fields" class="lookup-fields">
+            <label>Evidence ID<input id="lookup-evidence-id" autocomplete="off" required /></label>
+          </div>
+          <div id="query-lookup-fields" class="lookup-fields" hidden>
+            <label>Canonical query hash<input id="lookup-query-hash" autocomplete="off" /></label
+            ><label class="wide-field"
+              >Exact partition JSON<textarea id="lookup-partition" rows="5" spellcheck="false"></textarea>
+            </label>
+          </div>
+          <button type="submit"><span data-icon="search"></span>Inspect</button>
+        </form>
+        <div id="neighborhood-state" class="data-state">Choose a persisted lookup.</div>
+        <div id="neighborhood-content" hidden>
+          <div id="neighborhood-metrics" class="metric-grid compact"></div>
+          <div class="neighborhood-grid">
+            <section class="projection-section" aria-labelledby="projection-title">
+              <div class="subheading">
+                <h3 id="projection-title">Diagnostic projection</h3>
+                <div id="projection-legend" class="legend"></div>
+              </div>
+              <div class="canvas-wrap">
+                <canvas id="projection-canvas" width="720" height="400"></canvas>
+                <div id="projection-empty" class="canvas-state" hidden></div>
+              </div>
+              <div id="projection-selection" class="selection-detail">No point selected</div>
+            </section>
+            <section class="data-section" aria-labelledby="gates-title">
+              <h3 id="gates-title">Confidence gates</h3>
+              <div id="gate-list"></div>
+              <h3>Recommendation</h3>
+              <div id="recommendation"></div>
+            </section>
+          </div>
+          <div class="table-frame">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Evidence</th>
+                  <th>Distance</th>
+                  <th>Age</th>
+                  <th>Weight</th>
+                  <th>Label</th>
+                  <th>Inclusion</th>
+                </tr>
+              </thead>
+              <tbody id="neighbors-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section
+        id="panel-decisions"
+        class="view-panel"
+        role="tabpanel"
+        data-panel="decisions"
+        aria-labelledby="tab-decisions"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Forward cursor</p>
+            <h2 id="decisions-title">Decisions</h2>
+          </div>
+          <label class="toggle-control"><input id="decision-follow" type="checkbox" checked /><span>Live</span></label>
+        </div>
+        <form id="decision-filters" class="filter-bar">
+          <label>Pool<input name="pool_id" autocomplete="off" /></label>
+          <label
+            >Mode<select name="mode">
+              <option value="">All</option>
+              <option value="recommend">Recommend</option>
+              <option value="active">Active</option>
+            </select></label
+          >
+          <label>Candidate<input name="candidate_id" autocomplete="off" /></label>
+          <label>Final reason<input name="final_reason" autocomplete="off" /></label>
+          <button type="submit"><span data-icon="filter"></span>Apply</button>
+          <button id="decision-reset" class="secondary-button" type="button">Reset</button>
+        </form>
+        <div class="stream-status">
+          <span id="stream-indicator" class="status-dot"></span><span id="stream-label">Paused</span
+          ><button id="stream-resume" class="secondary-button" type="button" hidden>Resume</button>
+        </div>
+        <div id="decisions-state" class="data-state" hidden></div>
+        <div class="table-frame">
+          <table>
+            <thead>
+              <tr>
+                <th>Created</th>
+                <th>Pool</th>
+                <th>Mode</th>
+                <th>Candidate</th>
+                <th>Recommended</th>
+                <th>Served</th>
+                <th>Reason</th>
+                <th>Arm</th>
+                <th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody id="decisions-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section
+        id="panel-operations"
+        class="view-panel"
+        role="tabpanel"
+        data-panel="operations"
+        aria-labelledby="tab-operations"
+        hidden
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Read-only state</p>
+            <h2 id="operations-title">Operations</h2>
+          </div>
+          <span class="read-only-label">Read only</span>
+        </div>
+        <div id="operations-state" class="data-state" hidden></div>
+        <div class="operations-grid">
+          <section class="data-section span-two" aria-labelledby="controls-title">
+            <h3 id="controls-title">Control history</h3>
+            <div class="table-frame">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Created</th>
+                    <th>Kind</th>
+                    <th>Scope</th>
+                    <th>Result</th>
+                    <th>Generation</th>
+                    <th>Actor</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="controls-body"></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="data-section" aria-labelledby="health-events-title">
+            <h3 id="health-events-title">Health events</h3>
+            <div id="health-events"></div>
+          </section>
+          <section class="data-section" aria-labelledby="migrations-title">
+            <h3 id="migrations-title">Migrations</h3>
+            <div id="migration-list"></div>
+          </section>
+          <section class="data-section span-two" aria-labelledby="authority-title">
+            <h3 id="authority-title">Current authority</h3>
+            <div id="authority-status"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-title">
+      <div class="detail-header">
+        <div>
+          <p id="detail-eyebrow" class="eyebrow">Detail</p>
+          <h2 id="detail-title">Record</h2>
+        </div>
+        <button
+          id="detail-close"
+          class="icon-button"
+          type="button"
+          aria-label="Close detail"
+          title="Close detail"
+        ></button>
+      </div>
+      <div id="detail-content" class="detail-content"></div>
+    </dialog>
+    <div id="live-region" class="sr-only" aria-live="polite"></div>
+  </body>
+</html>

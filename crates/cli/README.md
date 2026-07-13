@@ -49,6 +49,13 @@ with the installed `nemo-relay` command rather than link against the crate.
   CLI overrides for deterministic non-interactive use.
 - **Hook forwarding server**: A local gateway accepts agent hook events and
   provider-shaped OpenAI or Anthropic requests.
+- **Bundled Router host**: The CLI registers Router before plugin validation.
+  Buffered Responses, Chat Completions, and Anthropic Messages calls use the V2
+  managed path with frozen host transport policy and independent delayed
+  replay. Streaming, model-list, and token-count routes remain
+  replay-ineligible. A buffered non-success is a managed-call error while the
+  client still receives its exact status, allowed headers, and bounded body.
+  Graceful gateway shutdown drains plugin resources under a bounded deadline.
 
 ## Installation Options
 
@@ -127,10 +134,68 @@ plugin config with:
 nemo-relay plugins edit
 ```
 
-The top-level editor menu contains one entry per supported built-in, followed by
-the dynamic plugin references in the selected physical `plugins.toml`. Dynamic
-plugins with a manifest-declared JSON Schema provide structured field controls.
-Other dynamic plugins use a raw JSON object editor.
+The top-level editor menu contains one entry per supported built-in, including
+Router, followed by the dynamic plugin references in the selected physical
+`plugins.toml`. Router fields use the crate's typed editor schema and preserve
+unknown configuration during edits. Dynamic plugins with a manifest-declared
+JSON Schema provide structured field controls. Other dynamic plugins use a raw
+JSON object editor.
+
+`nemo-relay doctor` reports Router registration, the bundled SQLite and
+sqlite-vec versions, a temporary `vec0` insert/query probe, V2 route support,
+configured mode and queue capacity, database directory and schema readiness,
+embedding egress, and Active control/outcome-policy readiness. Doctor reads the
+same discovered `plugins.toml` configuration as gateway startup and does not
+call a model provider or migrate the Router ledger.
+
+## Router Inspection and Control
+
+An enabled Router component can be inspected without starting the gateway:
+
+```bash
+nemo-relay router status --json
+nemo-relay router pools --limit 100 --json
+nemo-relay router evidence list --pool support --json
+nemo-relay router decisions tail --follow --json
+```
+
+Launch the embedded read-only dashboard on an available loopback port:
+
+```bash
+nemo-relay router dashboard
+```
+
+For a headless session, use `--no-open`. Add `--token-file PATH` to place the
+one-time launch URL in a new owner-only file instead of printing it. Remote
+binding requires a concrete address, `--allow-remote`, a token file, and both
+`--tls-cert` and `--tls-key`. The dashboard uses redacted inspection content by
+default; `--full-content` enables bounded secret-filtered content for the
+process session.
+
+Export verified redacted evidence to standard output or a new file:
+
+```bash
+nemo-relay router evidence export - --format jsonl
+nemo-relay router evidence export evidence.csv --format csv
+```
+
+Operator commands require a bounded reason. Reset and cohort rotation also
+require the exact configured project ID:
+
+```bash
+nemo-relay router pause --reason "maintenance"
+nemo-relay router force-anchor set --pool support --reason "provider incident"
+nemo-relay router reset --pool support --confirm my-project --reason "new corpus"
+nemo-relay router cohort rotate --confirm my-project --reason "new cohort"
+```
+
+The CLI derives the audit actor from the OS principal unless `--actor` is
+provided. It submits one generation compare-and-swap and does not retry a
+conflict. Refer to [Use Router CLI and
+HTTP](https://docs.nvidia.com/nemo/relay/router/cli-and-http) for the complete
+tree, filters, JSON schemas, file behavior, and exit codes. Refer to [Use the
+Local Router Dashboard](https://docs.nvidia.com/nemo/relay/router/dashboard)
+for session lifetime, views, remote TLS setup, and troubleshooting.
 
 The canonical plugin file is `plugins.toml`; user config lives at
 `~/.config/nemo-relay/plugins.toml` or

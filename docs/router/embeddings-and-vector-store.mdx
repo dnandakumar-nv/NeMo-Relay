@@ -1,0 +1,405 @@
+---
+title: "Router Embeddings and Vector Store"
+sidebar-title: "Embeddings and Vector Store"
+description: "Configure Router embedding profiles and understand canonical queries, strict vector partitions, indexing, retention, and privacy."
+position: 8
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+In `shadow` mode, Router can convert terminal candidate-attempt evidence into
+canonical query documents, shared embeddings, and strictly partitioned vector
+index rows. In `recommend` mode, Router uses the same canonicalizer,
+cache-first live embedding service, and exact partitions to compute a bounded
+observational recommendation. SQLite remains authoritative. The `sqlite-vec`
+index is derived and can be rebuilt without calling the embedding provider
+again.
+
+Recommend never substitutes a candidate response or executes replay. Refer to
+[Router Recommendation Confidence](/router/recommendation-confidence) for
+neighbor eligibility, weighted confidence, candidate selection, and decision
+audits. Active reruns the same strict live lookup before a bounded randomized
+admission; refer to [Active Canary and
+Outcomes](/router/active-canary-and-outcomes).
+
+## Associate a Pool with an Embedder
+
+The following fragment associates one pool with one local OpenAI-compatible
+embeddings endpoint:
+
+```toml
+[components.config]
+allow_remote_embedding_egress = false
+
+[[components.config.embedders]]
+id = "local-embedding-v1"
+base_url = "http://127.0.0.1:8080/v1"
+model = "embedding-model"
+provider_revision = "2026-07-01"
+dimensions = 1536
+api_key_env = "LOCAL_EMBEDDING_API_KEY"
+timeout_ms = 10000
+max_in_flight = 4
+batch_size = 16
+
+[[components.config.pools]]
+# Include the other required pool, concurrency, Judge, and candidate fields.
+id = "chat-default"
+
+[components.config.pools.learning]
+version = 1
+embedder = "local-embedding-v1"
+```
+
+`api_key_env` is optional. Remove it when the endpoint does not use a bearer
+credential. Refer to [Router Configuration](/router/configuration) for the
+complete pool shape and all profile bounds.
+
+Each pool activates at most one vector space:
+
+- Omitting `learning`, or setting it to an empty table, disables vectorization
+  for that pool.
+- A minimal `learning` table contains `version = 1` and one configured
+  embedder ID. A complete table also contains every version-1 confidence field.
+  A complete Active table adds all three Active learning fields. Partial
+  statistical policies are invalid. Shadow accepts any complete shape for
+  warm-up; Recommend requires the confidence shape, and Active requires the
+  Active shape for every pool.
+- One vector-space identity combines the profile version and the pool's full
+  canonicalizer policy. Compatible identities can share a space across pools.
+- Delayed terminalization uses the attempt's frozen durable mapping. A changed
+  current mapping can backfill retained attempts into the new space without
+  rewriting the historical mapping.
+
+An embedder profile that no pool references is syntactically validated but
+does not cause a credential lookup, provider client, job, vector, Embedder
+scope, or network request. `off` mode validates references but remains free of
+filesystem, extension, credential, task, scope, and network side effects.
+
+## Understand the Canonical Query
+
+Router builds `CanonicalRoutingQueryV1` only from verified, sanitized request
+and routing projections. It normalizes CRLF and CR to LF, collapses horizontal
+whitespace within each line, trims outer whitespace, and never truncates a
+selected field or message. Ordered text parts are normalized separately, empty
+parts are removed, and the remaining parts are joined with one LF.
+
+The query includes:
+
+- Ordered System and Developer instructions, preserving role and order.
+- The most recent normalized, nonempty User message as `current_task`.
+- Whole, nonempty User, Assistant, and Tool text entries as bounded context.
+  The selected task and instruction messages are excluded, but eligible
+  messages after the selected task remain candidates. Router considers entries
+  newest first, stops at the first configured count or byte boundary, and
+  restores selected entries to chronological order. It does not skip an
+  oversized recent entry to cherry-pick older context.
+- A SHA-256 fingerprint of the complete sanitized tool-definition array in
+  declaration order, including tool names, descriptions, optional strictness,
+  and parameter schemas.
+- The complete response-schema fingerprint when a response schema is present.
+- The sorted, unique required-capability list.
+- Every configured position feature, currently only `turn_index`.
+
+The query excludes:
+
+- The anchor or candidate model and the provider API family.
+- Request headers, credentials, replay authority, transport state, and raw
+  provider request shape.
+- Arbitrary metadata, scope names and UUIDs, implicit call ordinals,
+  nonallowlisted position data, generation controls, and nonallowlisted
+  provider extras.
+- Tool-call IDs, assistant tool-call structures, and empty tool-only messages.
+- Raw response schemas and raw tool definitions outside their fingerprints.
+
+Any image part makes the request noncanonicalizable. Missing tasks, unsupported
+families, projection mismatches, oversized instructions, tasks or context,
+invalid schema fingerprints, unordered capabilities, and position-feature
+mismatches also produce an explicit noncanonicalizable outcome instead of a
+partial query.
+
+The resulting RFC 8785 JSON bytes are both the retained canonical source and
+the exact string sent as an embedding input. Its SHA-256 is the
+`canonical_query_hash`.
+
+### Configure `turn_index`
+
+Canonicalizer version 1 registers one optional position feature:
+
+```toml
+[components.config.pools.canonicalizer]
+version = 1
+position_features = ["turn_index"]
+```
+
+When enabled, every eligible V2 call must supply `turn_index` in sanitized
+metadata as a nonnegative JSON integer that fits `u64`. Router does not infer it
+from event order. It stores the accepted value as its canonical base-10 decimal
+string, preserving exact values above `2^53`. The projected feature set must
+exactly match the configured set and fit `max_position_features_bytes`.
+
+## Keep Retrieval Strictly Partitioned
+
+The canonical query intentionally omits compatibility dimensions that belong
+in `RoutingPartitionV1`. Every vector lookup uses one exact partition containing:
+
+- `tenant_policy_hash`, `agent_policy_hash`, and `policy_version_id`.
+- `learning_generation_id`, `api_family`, and `transport_identity`.
+- `anchor_model` and `anchor_revision`.
+- `candidate_id`, `candidate_model`, and `candidate_model_revision`.
+- `decoding_fingerprint`, `evaluator_version`, and `vector_space_id`.
+
+Router hashes the RFC 8785 partition document, allocates a positive SQLite
+partition key, and compares the complete canonical JSON whenever it reuses the
+hash. A same-hash, different-document result is an integrity fault.
+
+`sqlite-vec` applies the integer partition predicate as part of the KNN query,
+before Router returns any distance result. Router never performs a global KNN
+query and filters it afterward. Results use deterministic `(distance,
+record_id)` ordering, including an exact bounded fallback for cutoff ties.
+Version 1 accepts `top_k` from `1` through `4095`.
+
+The synchronous internal `VectorStore` trait and `BruteForceMemoryStore` are a
+deterministic parity oracle. Recommend and Active production use the separate
+asynchronous `SqliteVecStore` facade: mutations go through the ledger's sole
+writer, and deadline-bound health, search, and complete neighbor projection use
+the bounded read pool. The production facade does not implement the
+synchronous trait.
+
+Every Recommend or Active search resolves the exact frozen mapping, current learning
+generation, partition hash and canonical partition document, active index
+generation, KNN rows, and complete relational evidence projection in one read
+transaction. A missing exact partition is local `no_partition` evidence.
+Stale, corrupt, unhealthy, or version-inconsistent authority stops the decision
+to the anchor; Router never broadens the partition.
+
+## Control Endpoint and Credential Egress
+
+`base_url` is an API prefix, not the final method path. Router removes redundant
+trailing slashes and appends exactly one `embeddings` segment. For example,
+`https://example.test/v1` becomes
+`https://example.test/v1/embeddings`. A URL with user information, a query,
+fragment, backslash, noncanonical percent encoding, or an existing
+`embeddings` suffix is rejected.
+
+Endpoint policy is explicit:
+
+- Plain HTTP is accepted only for `localhost` or a literal loopback address.
+- HTTPS loopback endpoints do not require remote-egress consent.
+- Every nonloopback endpoint requires HTTPS and
+  `allow_remote_embedding_egress = true`.
+- Router resolves `localhost` during activation, requires every result to be
+  loopback, and pins the client to those addresses.
+- Automatic redirects and environment or system proxies are disabled.
+
+Remote consent applies to the canonical TLS origin. Version 1 does not apply a
+second private-address policy after remote DNS resolution.
+
+`api_key_env` contains an environment-variable name, not a credential. Router
+reads the named value only when activating a referenced profile and requires a
+nonempty value. The value is held by a nonserializable, redacted, zeroizing
+runtime owner and is attached only as an Authorization header to the frozen
+endpoint request. The value is not hashed, persisted, logged, emitted in
+events, or included in diagnostics. The protected profile identity retains
+only a hash of the environment-variable name. A profile without `api_key_env`
+sends no Authorization header.
+
+## Cache and Bound Provider Work
+
+The relational embedding cache has at most one authoritative vector for each
+`(vector_space_id, canonical_query_hash)` pair. Every canonicalizable terminal
+attempt receives its own evidence link and materialization state in each
+applicable vector space, including unlabeled, operationally failed, canceled,
+and orphaned attempts.
+
+A Recommend or Active live lookup is cache-first:
+
+1. A cache hit returns the persisted exact-space vector without HTTP.
+2. A miss creates or joins the same durable embedding job used by background
+   work.
+3. One fenced owner wins the cross-process claim and can issue one provider
+   request. Other processes observe the durable result until their absolute
+   deadline instead of starting a duplicate request.
+4. Router commits and re-reads the authoritative vector before returning
+   `Ready`; every uncertain path returns `Unavailable`.
+
+Profile bounds are dimensions `1..=8192`, timeout `1..=55000` milliseconds,
+`max_in_flight` `1..=256`, and `batch_size` `1..=128`. Request JSON is bounded
+at 32 MiB. For each call, Router uses checked
+`1 MiB + expected_count * dimensions * 32` as the actual streamed response
+ceiling. Profile activation applies the same formula with `batch_size` and
+rejects a value above the absolute 64 MiB validation cap.
+
+Background discovery returns a deterministic same-space ordered prefix capped
+at 32 MiB of cumulative canonical-query bytes. Router drains each batch from
+that page and moves the query payloads into request items without cloning the
+payloads during batch assembly.
+
+Discovery includes only vector spaces referenced by a pool mapping in the
+running process's current configuration generation. A job from an older,
+unreferenced mapping stays durable and pending, but it cannot resolve a
+credential, claim a lease, send HTTP, or degrade the current runtime. If a later
+configuration authorizes that exact space again, normal discovery can resume
+the job.
+
+All referenced profiles share one conservative 256 MiB activation-wide byte
+governor. Before durable claim or HTTP, an admitted provider permit reserves
+three 32 MiB request-sized buffers, its profile's configured-batch response
+ceiling, and 16 bytes per configured-batch vector component for decoded `f64`,
+normalized `f32`, and retained blob `f32` values. Request construction uses
+borrowed canonical-query references and a bounded JSON writer; the three-buffer
+reservation remains deliberately conservative. This makes `max_in_flight` an
+upper bound. Byte saturation defers background work or returns live
+`Unavailable` through the existing retry path, without a claim or provider
+request. The streamed response ceiling continues to use the actual input count.
+
+The configured timeout covers the complete provider operation. It must fit
+inside the durable 60-second lease with a five-second completion fence. In
+Recommend and Active, the same `timeout_ms` starts one absolute foreground
+deadline at admission and also covers preflight, canonicalization, searches,
+confidence, audit construction, and the first decision-write acknowledgement.
+
+Embedding, materialization, and rebuild claims carry that monotonic operation
+deadline through the writer queue. Router checks it at transaction start, so a
+queued claim that resumes after expiry leaves attempts, leases, state, and HTTP
+unchanged. Live embedding uses the provider/caller deadline for claim start;
+the lease deadline remains available only to complete or release work after an
+acknowledged claim.
+
+Background jobs make at most five provider attempts. Retryable connection,
+timeout, bounded generic request-send or response-body-stream transport failure,
+HTTP 408/429, and HTTP 5xx classes use exponential delays starting at one second
+and capped at five minutes. Authentication failures, other HTTP 4xx responses,
+malformed or oversized responses, count or index mismatches, dimension
+mismatches, and nonfinite, zero, or otherwise invalid vectors quarantine the
+shared job immediately. A fifth retryable failure also quarantines it. Only
+stable, text-free failure classes are durable.
+
+Cache-backed materialization is claimed only while the vector space has a
+verified active index generation. An unavailable index therefore leaves work
+at `pending_index` without consuming leases or growing retry history. After
+repair, Router resumes it. Materialization is limited to 64 claim attempts; an
+eligible job at that ceiling is closed atomically with matching `failed_index`
+link and job states and stable class
+`router.vector.materialization_attempt_limit`. This terminal is nonfatal to the
+Router runtime. A live lease remains authoritative, while an expired owner is
+recorded before terminalization. Router bounds verified per-job state history
+to 130 materialization events and 66 link events.
+
+Provider results must contain exactly one ordered vector per input with the
+configured dimensions. Router converts finite values to normalized `f32`,
+stores exact little-endian component bytes in SQLite, and protects them with a
+space-bound checksum.
+
+## Understand Index Growth and Rebuild
+
+Storage grows along three different identities:
+
+- One canonical query document per retained query hash.
+- One shared embedding per vector space and query hash.
+- One vectorization outcome per applicable `(terminal attempt, vector space)`
+  pair. A canonicalizable outcome adds one evidence link and materialization
+  state, and each `ready` link adds one derived index record. A later current
+  mapping can therefore add another graph for the same retained attempt in a
+  new space.
+
+Canonical instructions, the selected task, and bounded context remain in the
+protected ledger while any job, embedding, or evidence link references the
+query. Version 1 has no hash-only source-retention option. Retained source is
+also what allows a later current mapping to backfill historical attempts.
+Source expiry is not a version-1 mode: a retained attempt selected for backfill
+but missing required source is ledger corruption, and the operation commits no
+partial writes. The schema token `source_expired` is reserved for a future
+explicit source-retention mode and cannot be authored in version 1.
+
+The source build pins `sqlite-vec = "=0.1.9"` and verifies runtime version
+`v0.1.9` on vector-capable connections. Missing or mismatched extension support
+degrades vector search and index writes, but relational Shadow evidence remains
+active.
+
+Every ready-link insert or delete advances a durable per-space source sequence
+and appends a source change in the same writer transaction. Rebuild creates a
+new immutable vec0 generation, populates it from authoritative relational
+vectors in bounded chunks, catches up later source changes, validates count and
+fingerprint, and atomically flips the regular-table manifest pointer. It never
+renames a vec0 table and never calls the embedding provider. Readers use only
+the verified active generation. Complete retired generations are dropped later,
+and an already-missing generation is reconciled as dropped. Partial generated
+authority is instead preserved and reported as a permanent integrity failure;
+Router does not silently drop it.
+
+## Retain and Shut Down Safely
+
+Retention preserves shared queries, jobs, embeddings, profiles, mappings, and
+spaces while retained evidence, decision audits, unfinished work, or a verified
+live process/configuration still references them. It is also an explicit
+cancellation boundary for pending materialization work. Materialization already
+closed as `failed_index` is retained and deleted as terminal evidence; retention
+does not relabel it as `canceled_retention`.
+
+With a healthy active index, retention deletes the selected index row and its
+relational evidence graph atomically. An index fault rolls back that deletion
+before Router marks the space unavailable. If the active generation is already
+unavailable, retention retires its searchable pointer before deleting the
+relational evidence. Complete stale derived objects remain unsearchable until
+bounded generation cleanup removes them. Partial current generated authority
+blocks and rolls back retention, and partial retired authority remains a
+permanent integrity failure. Global orphan cleanup is also bounded and can
+continue across retention passes.
+
+Provider admission opens only after plugin activation commits. Graceful clear
+closes recommendation and Active foreground admission before Primary, live,
+scheduler, background-claim, and provider admission. It waits for admitted
+Active foreground ownership and exact pending recommendation delivery before
+live and background work, all within Core's one deadline. It does not drain the
+complete durable backlog or wait through unrelated retry delays. Canceled
+leases are released when writer time remains and otherwise expire durably.
+Process stop is the final acknowledged domain writer command before readers
+and the writer close. Synchronous abort fences later writer and provider starts
+before canceling delivery, HTTP, tasks, and readers without joining.
+
+## Treat Query Content as Sensitive
+
+Every embedding HTTP call sends the canonical instructions, current task,
+bounded context, fingerprints, capabilities, and configured position features
+to the profile's endpoint. This disclosure occurs for loopback services too.
+Configure only an endpoint that is authorized to receive that application
+content. Nonloopback delivery additionally requires explicit remote-egress
+consent and HTTPS.
+
+The owner-only ledger remains sensitive application data. Sanitization removes
+known credential-bearing fields, but it does not discover secrets written into
+ordinary instruction, task, or context text.
+
+Each HTTP operation runs in a fresh Router-owned `Embedder` scope with bounded
+metadata containing the profile ID, vector-space ID, canonical-query hashes,
+and embedding-job or decision IDs. It has no LLM API family, LLM call role,
+replay capability, or managed Relay child call.
+
+Default ATIF export removes each Embedder scope and its complete descendant
+closure, independent of event arrival order. Raw ATOF, OpenTelemetry,
+OpenInference, and Rust ATIF export with
+`include_non_primary_llm_calls: true` remain diagnostic surfaces and can expose
+those bounded linkage identifiers. Embedder scopes do not create Adaptive LLM
+observations. Refer to [Agent Trajectory Interchange Format
+(ATIF)](/configure-plugins/observability/atif#internal-call-projection) for the export
+boundary.
+
+## Account for the Native Package Boundary
+
+The Router crate registers the statically linked sqlite-vec extension with
+SQLite before opening Router vector connections; that auto-extension
+registration is process-global. The bundled CLI, Python wheel, and Node.js npm
+package link and register Router automatically. A custom Rust host must call
+`register_router_component()` before plugin validation or initialization.
+
+Each CLI, wheel, and npm release artifact runs a provider-free temporary
+database probe that verifies the pinned sqlite-vec version, creates a `vec0`
+table, inserts vectors, and returns the deterministic nearest row. A missing or
+mismatched native vector extension blocks artifact publication. At runtime, an
+unavailable or mismatched vector index follows Router's documented degraded
+health and relational-evidence behavior rather than changing the anchor call.
+
+The raw C FFI and Go binding can recognize and activate Router through generic
+plugin JSON, but expose no V2 replay factory or typed Router APIs. There is no
+separate Python, npm, or Go Router package.

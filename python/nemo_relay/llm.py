@@ -29,9 +29,9 @@ Example::
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict
 
 from nemo_relay._native import (
     LLMRequest,
@@ -47,6 +47,9 @@ from nemo_relay._native import (
     llm_call_execute as _native_llm_call_execute,
 )
 from nemo_relay._native import (
+    llm_call_execute_v2 as _native_llm_call_execute_v2,
+)
+from nemo_relay._native import (
     llm_conditional_execution as _native_llm_conditional_execution,
 )
 from nemo_relay._native import (
@@ -60,6 +63,41 @@ if TYPE_CHECKING:
     from nemo_relay import Json
     from nemo_relay._native import AnnotatedLLMResponse
     from nemo_relay.codecs import LlmCodec, LlmResponseCodec
+
+
+LlmApiFamily: TypeAlias = Literal[
+    "openai_chat_completions",
+    "openai_responses",
+    "anthropic_messages",
+]
+LlmCallRole: TypeAlias = Literal["primary", "shadow", "judge"]
+
+
+#: Recursively frozen JSON exposed through mapping proxies and tuples.
+LlmFrozenJson: TypeAlias = str | int | float | bool | None | tuple["LlmFrozenJson", ...] | Mapping[str, "LlmFrozenJson"]
+LlmTrajectoryScope: TypeAlias = Mapping[str, str]
+LlmExecutionContextValue: TypeAlias = LlmFrozenJson | tuple[LlmTrajectoryScope, ...] | Mapping[str, LlmFrozenJson]
+LlmExecutionContext: TypeAlias = Mapping[str, LlmExecutionContextValue]
+
+
+LlmReplayCallable: TypeAlias = Callable[[LLMRequest], Awaitable["Json"]]
+
+
+class LlmReplayDescriptor(TypedDict):
+    """Replay transport descriptor returned by a V2 replay factory."""
+
+    contract_version: int
+    api_family: LlmApiFamily
+    transport_identity: str
+    replay: LlmReplayCallable
+
+
+class LlmReplayFactory(Protocol):
+    """Synchronous factory receiving one recursively frozen call context."""
+
+    def __call__(self, context: LlmExecutionContext) -> LlmReplayDescriptor:
+        """Return a replay descriptor for the frozen call context."""
+        ...
 
 
 def call(
@@ -270,6 +308,78 @@ def execute(
     )
 
 
+def execute_v2(
+    name: str,
+    request: LLMRequest,
+    func: Callable[[LLMRequest], Json | Awaitable[Json]],
+    *,
+    api_family: LlmApiFamily,
+    call_role: LlmCallRole,
+    sanitized_metadata: Mapping[str, Json],
+    tenant_id: str | None = None,
+    agent_id: str | None = None,
+    replay_factory: LlmReplayFactory | None = None,
+    handle=None,
+    attributes=None,
+    data=None,
+    metadata=None,
+    model_name: str | None = None,
+    codec: LlmCodec | None = None,
+    response_codec: LlmResponseCodec | None = None,
+) -> Awaitable[Json]:
+    """Run a V2 managed LLM call with explicit routing context.
+
+    Args:
+        name: Provider or logical call name recorded on emitted events.
+        request: Initial provider request.
+        func: Sync or async provider callback invoked after middleware.
+        api_family: Explicit provider request/response family.
+        call_role: Explicit ``primary``, ``shadow``, or ``judge`` role.
+        sanitized_metadata: Non-secret routing metadata copied into the frozen
+            execution context.
+        tenant_id: Optional normalized tenant routing identity.
+        agent_id: Optional normalized agent routing identity.
+        replay_factory: Optional synchronous factory returning a descriptor
+            with a distinct async replay callable. Its context uses recursively
+            read-only mappings and tuples.
+        handle: Optional parent scope handle.
+        attributes: Optional native LLM attributes.
+        data: Optional JSON application payload.
+        metadata: Optional JSON event metadata.
+        model_name: Optional normalized model name.
+        codec: Optional annotated request codec.
+        response_codec: Optional annotated response codec.
+
+    Returns:
+        Awaitable resolving to the raw provider or intercept response.
+
+    Notes:
+        Replay-factory failures make the call replay-ineligible but do not fail
+        an otherwise valid primary call. Family and role are never inferred
+        from the request body.
+    """
+    if not isinstance(sanitized_metadata, Mapping):
+        raise TypeError("sanitized_metadata must be a mapping")
+    return _native_llm_call_execute_v2(
+        name,
+        request,
+        func,
+        api_family=api_family,
+        call_role=call_role,
+        sanitized_metadata=dict(sanitized_metadata),
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        replay_factory=replay_factory,
+        handle=handle,
+        attributes=attributes,
+        data=data,
+        metadata=metadata,
+        model_name=model_name,
+        codec=codec,
+        response_codec=response_codec,
+    )
+
+
 def stream_execute(
     name: str,
     request: LLMRequest,
@@ -407,9 +517,19 @@ def conditional_execution(request):
 
 
 __all__ = [
+    "LlmApiFamily",
+    "LlmCallRole",
+    "LlmExecutionContext",
+    "LlmExecutionContextValue",
+    "LlmFrozenJson",
+    "LlmReplayCallable",
+    "LlmReplayDescriptor",
+    "LlmReplayFactory",
+    "LlmTrajectoryScope",
     "call",
     "call_end",
     "execute",
+    "execute_v2",
     "stream_execute",
     "request_intercepts",
     "conditional_execution",

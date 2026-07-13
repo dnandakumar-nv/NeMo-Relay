@@ -11,11 +11,12 @@ use super::{
     active_plugin_report, c_char, c_str_to_json, c_str_to_string, clear_last_error,
     clear_plugin_configuration, deregister_plugin, initialize_plugins, json_to_c_string,
     last_error_message, list_plugin_kinds, nemo_relay_string_free, register_adaptive_component,
-    register_plugin, set_last_error, status_from_plugin_error, tokio_runtime,
-    validate_plugin_config, wrap_event_sanitize_fn, wrap_event_subscriber, wrap_llm_conditional_fn,
-    wrap_llm_exec_intercept_fn, wrap_llm_request_intercept_fn, wrap_llm_response_fn,
-    wrap_llm_sanitize_request_fn, wrap_llm_stream_exec_intercept_fn, wrap_tool_conditional_fn,
-    wrap_tool_exec_intercept_fn, wrap_tool_request_intercept_fn, wrap_tool_sanitize_fn,
+    register_plugin, register_router_component, set_last_error, status_from_plugin_error,
+    tokio_runtime, validate_plugin_config, wrap_event_sanitize_fn, wrap_event_subscriber,
+    wrap_llm_conditional_fn, wrap_llm_exec_intercept_fn, wrap_llm_request_intercept_fn,
+    wrap_llm_response_fn, wrap_llm_sanitize_request_fn, wrap_llm_stream_exec_intercept_fn,
+    wrap_tool_conditional_fn, wrap_tool_exec_intercept_fn, wrap_tool_request_intercept_fn,
+    wrap_tool_sanitize_fn,
 };
 use crate::api::event_registry::Surface;
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
@@ -132,6 +133,10 @@ fn ensure_pii_redaction_component_registered() -> std::result::Result<(), NemoRe
     register_pii_redaction_component().map_err(|err| status_from_plugin_error(&err))
 }
 
+fn ensure_router_component_registered() -> std::result::Result<(), NemoRelayStatus> {
+    register_router_component().map_err(|err| status_from_plugin_error(&err))
+}
+
 /// Validate a generic plugin config document and return the diagnostics report as JSON.
 ///
 /// # Safety
@@ -150,6 +155,9 @@ pub unsafe extern "C" fn nemo_relay_validate_plugin_config(
         return status;
     }
     if let Err(status) = ensure_pii_redaction_component_registered() {
+        return status;
+    }
+    if let Err(status) = ensure_router_component_registered() {
         return status;
     }
     let config_value = match c_str_to_json(config_json) {
@@ -192,6 +200,9 @@ pub unsafe extern "C" fn nemo_relay_initialize_plugins(
         return status;
     }
     if let Err(status) = ensure_pii_redaction_component_registered() {
+        return status;
+    }
+    if let Err(status) = ensure_router_component_registered() {
         return status;
     }
     let config_value = match c_str_to_json(config_json) {
@@ -271,6 +282,9 @@ pub unsafe extern "C" fn nemo_relay_list_plugin_kinds_json(
         return status;
     }
     if let Err(status) = ensure_pii_redaction_component_registered() {
+        return status;
+    }
+    if let Err(status) = ensure_router_component_registered() {
         return status;
     }
     let kinds_json = match serde_json::to_value(list_plugin_kinds()) {

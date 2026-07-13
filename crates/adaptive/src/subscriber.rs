@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 use nemo_relay::api::event::{Event, ScopeCategory};
+use nemo_relay::api::llm::LlmCallRole;
 use nemo_relay::api::runtime::EventSubscriberFn;
 use nemo_relay::api::scope::ScopeType;
 
@@ -38,7 +39,9 @@ pub(crate) fn event_to_call_record(event: &Event) -> Option<CallRecord> {
         return None;
     }
     let (kind, annotated_request) = match event.category().map(|category| category.as_str()) {
-        Some("llm") => (CallKind::Llm, event.annotated_request().cloned()),
+        Some("llm") if !is_non_primary_llm_event(event) => {
+            (CallKind::Llm, event.annotated_request().cloned())
+        }
         Some("tool") => (CallKind::Tool, None),
         _ => return None,
     };
@@ -56,6 +59,11 @@ pub(crate) fn event_to_call_record(event: &Event) -> Option<CallRecord> {
         annotated_request,
         annotated_response: None,
     })
+}
+
+pub(crate) fn is_non_primary_llm_event(event: &Event) -> bool {
+    event.category().map(|category| category.as_str()) == Some("llm")
+        && event.llm_call_role() != Some(LlmCallRole::Primary)
 }
 
 pub(crate) fn is_run_boundary(event: &Event) -> bool {

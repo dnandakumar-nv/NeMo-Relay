@@ -76,6 +76,7 @@ fn derive_key_parts(annotated_request: &AnnotatedLlmRequest) -> AcgKeyParts<'_> 
 fn message_role_tag(message: &Message) -> &'static str {
     match message {
         Message::System { .. } => "system",
+        Message::Developer { .. } => "developer",
         Message::User { .. } => "user",
         Message::Assistant { .. } => "assistant",
         Message::Tool { .. } => "tool",
@@ -83,18 +84,30 @@ fn message_role_tag(message: &Message) -> &'static str {
 }
 
 fn system_prompt_fingerprint(annotated_request: &AnnotatedLlmRequest) -> String {
-    let system_content = annotated_request
+    let instructions = annotated_request
         .messages
         .iter()
         .filter_map(|message| match message {
-            Message::System { content, .. } => Some(extract_text(content)),
+            Message::System { content, .. } => Some(("system", extract_text(content))),
+            Message::Developer { content, .. } => Some(("developer", extract_text(content))),
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if system_content.is_empty() {
+        .collect::<Vec<_>>();
+    if instructions.is_empty() {
         "no-system".to_string()
+    } else if instructions.iter().any(|(role, _)| *role == "developer") {
+        let instruction_content = instructions
+            .into_iter()
+            .map(|(role, content)| format!("{role}:{content}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sha256_hex(&instruction_content)
     } else {
+        let system_content = instructions
+            .into_iter()
+            .map(|(_, content)| content)
+            .collect::<Vec<_>>()
+            .join("\n");
         sha256_hex(&system_content)
     }
 }
@@ -148,7 +161,7 @@ fn learning_seed_fingerprint(annotated_request: &AnnotatedLlmRequest) -> String 
         .messages
         .iter()
         .find_map(|message| match message {
-            Message::System { .. } => None,
+            Message::System { .. } | Message::Developer { .. } => None,
             Message::User { content, .. } => {
                 Some(format!("user:{}", sha256_hex(&extract_text(content))))
             }

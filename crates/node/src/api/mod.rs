@@ -9,7 +9,7 @@
 //! All functions are annotated with `#[napi]` and their doc comments appear
 //! in the generated `index.d.ts` TypeScript definitions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -28,10 +28,11 @@ use serde_json::Value as Json;
 use tokio_stream::StreamExt;
 
 use nemo_relay::api::llm as core_llm_api;
-use nemo_relay::api::llm::{LlmAttributes, LlmRequest};
+use nemo_relay::api::llm::{LlmApiFamily, LlmAttributes, LlmCallRole, LlmRequest};
 use nemo_relay::api::registry as core_registry_api;
 use nemo_relay::api::runtime::{
-    EventSanitizeFn, LlmExecutionNextFn, LlmStreamExecutionNextFn, ToolExecutionNextFn,
+    EventSanitizeFn, LlmExecutionNextFn, LlmReplayFactory, LlmStreamExecutionNextFn,
+    ToolExecutionNextFn,
 };
 use nemo_relay::api::runtime::{
     TASK_SCOPE_STACK, create_scope_stack as create_scope_stack_handle,
@@ -50,6 +51,7 @@ use nemo_relay::plugin::{
     ConfigDiagnostic, DiagnosticLevel, Plugin, PluginConfig, PluginError, PluginRegistration,
     PluginRegistrationContext, active_plugin_report as active_plugin_report_impl,
     clear_plugin_configuration as clear_plugin_configuration_impl,
+    clear_plugin_configuration_async as clear_plugin_configuration_async_impl,
     deregister_plugin as deregister_plugin_impl, initialize_plugins as initialize_plugins_impl,
     list_plugin_kinds as list_plugin_kinds_impl, register_plugin as register_plugin_impl,
     validate_plugin_config as validate_plugin_config_impl,
@@ -62,6 +64,7 @@ use nemo_relay_adaptive::context_helpers::set_latency_sensitivity as adaptive_se
 use nemo_relay_adaptive::plugin_component::register_adaptive_component;
 use nemo_relay_adaptive::{AdaptiveConfig, AdaptiveRuntime as CoreAdaptiveRuntime};
 use nemo_relay_pii_redaction::component::register_pii_redaction_component;
+use nemo_relay_router::register_router_component;
 
 use crate::callable;
 use crate::convert::{
@@ -75,6 +78,37 @@ use crate::types::{
     event_sanitize_fields_from_js,
 };
 
+fn parse_llm_api_family(value: String) -> napi::Result<LlmApiFamily> {
+    serde_json::from_value(Json::String(value)).map_err(|_| {
+        napi::Error::from_reason(
+            "apiFamily must be 'openai_chat_completions', 'openai_responses', or 'anthropic_messages'",
+        )
+    })
+}
+
+fn parse_llm_call_role(value: String) -> napi::Result<LlmCallRole> {
+    serde_json::from_value(Json::String(value))
+        .map_err(|_| napi::Error::from_reason("callRole must be 'primary', 'shadow', or 'judge'"))
+}
+
+fn parse_sanitized_metadata(value: Json) -> napi::Result<BTreeMap<String, Json>> {
+    serde_json::from_value(value)
+        .map_err(|_| napi::Error::from_reason("sanitizedMetadata must be an object"))
+}
+
+fn parse_plugin_shutdown_timeout(timeout_millis: f64) -> napi::Result<std::time::Duration> {
+    if !timeout_millis.is_finite()
+        || timeout_millis < 0.0
+        || timeout_millis.fract() != 0.0
+        || timeout_millis > f64::from(u32::MAX)
+    {
+        return Err(napi::Error::from_reason(
+            "timeoutMillis must be a finite non-negative integer no greater than 4294967295",
+        ));
+    }
+    Ok(std::time::Duration::from_millis(timeout_millis as u64))
+}
+
 #[napi::module_init]
 fn init() {
     initialize_shared_runtime_binding("node")
@@ -83,6 +117,16 @@ fn init() {
         .expect("node adaptive plugin component registration should succeed");
     register_pii_redaction_component()
         .expect("node pii redaction plugin component registration should succeed");
+    register_router_component().expect("node Router plugin component registration should succeed");
+}
+
+#[napi(js_name = "__routerNativeVectorProbe")]
+/// Run the binding-private Router native package probe.
+pub fn router_native_vector_probe() -> napi::Result<Json> {
+    let report = nemo_relay_router::probe_native_vector_capability()
+        .map_err(|error| napi::Error::from_reason(error.code()))?;
+    serde_json::to_value(report)
+        .map_err(|_| napi::Error::from_reason("Router native vector probe serialization failed"))
 }
 
 fn parse_string_map(
@@ -2035,6 +2079,139 @@ pub fn llm_call_execute_async(
                         .map_err(to_napi_err)
                 })
                 .await
+        },
+        |_env, result| Ok(result),
+    )
+}
+
+/// Execute a context-aware non-streaming LLM call with optional delayed replay.
+///
+/// `apiFamily`, `callRole`, and `sanitizedMetadata` are required and are copied
+/// into one frozen call context. `replayFactory`, when provided, is a separate
+/// synchronous callable that receives that context and returns exactly
+/// `{ contractVersion, apiFamily, transportIdentity, replay }`. Each later
+/// `replay(request)` invocation must return
+/// `{ result: Promise<Json>, cancel: () => void }`.
+///
+/// Replay-factory errors and invalid descriptors make the call replay-ineligible
+/// without failing its provider callback. The existing `llmCallExecute` and
+/// `llmCallExecuteAsync` functions remain V1 and never infer V2 fields.
+#[allow(clippy::too_many_arguments)]
+#[napi(ts_return_type = "Promise<Json>")]
+pub fn llm_call_execute_v2(
+    env: Env,
+    name: String,
+    request: Json,
+    #[napi(ts_arg_type = "(request: Readonly<Json>) => Json | Promise<Json>")] func: JsFunction,
+    #[napi(ts_arg_type = "LlmApiFamily")] api_family: String,
+    #[napi(ts_arg_type = "LlmCallRole")] call_role: String,
+    #[napi(ts_arg_type = "Readonly<Record<string, DeepReadonlyJson>>")] sanitized_metadata: Json,
+    handle: Option<&ScopeHandle>,
+    attributes: Option<u32>,
+    data: Option<Json>,
+    metadata: Option<Json>,
+    model_name: Option<String>,
+    tenant_id: Option<String>,
+    agent_id: Option<String>,
+    #[napi(ts_arg_type = "LlmReplayFactory | undefined | null")] replay_factory: Option<JsFunction>,
+    codec_decode: Option<ThreadsafeFunction<Json, ErrorStrategy::Fatal>>,
+    codec_encode: Option<ThreadsafeFunction<Json, ErrorStrategy::Fatal>>,
+    response_codec_decode: Option<ThreadsafeFunction<Json, ErrorStrategy::Fatal>>,
+) -> Result<JsObject> {
+    let attrs = LlmAttributes::from_bits_truncate(attributes.unwrap_or(0));
+    let parent = handle
+        .map(|value| value.inner.clone())
+        .unwrap_or_else(task_scope_top);
+    let request: LlmRequest = serde_json::from_value(request)
+        .map_err(|error| napi::Error::from_reason(format!("invalid LlmRequest: {error}")))?;
+    let api_family = parse_llm_api_family(api_family)?;
+    let call_role = parse_llm_call_role(call_role)?;
+    let sanitized_metadata = parse_sanitized_metadata(sanitized_metadata)?;
+
+    let provider = Arc::new(
+        crate::promise_call::PromiseAwareFn::new(&env, &func).map_err(|error| {
+            napi::Error::from_reason(format!("failed to create PromiseAwareFn: {error}"))
+        })?,
+    );
+    let exec_fn: LlmExecutionNextFn = Arc::new(move |request| {
+        let provider = provider.clone();
+        let request = serde_json::to_value(request).unwrap_or(Json::Null);
+        Box::pin(async move { provider.call(request).await })
+    });
+    let replay_factory: Option<Arc<dyn LlmReplayFactory>> = replay_factory
+        .map(|factory| {
+            crate::replay::NodeReplayFactory::new(&env, &factory)
+                .map(|factory| Arc::new(factory) as Arc<dyn LlmReplayFactory>)
+        })
+        .transpose()?;
+    let codec = match (codec_decode, codec_encode) {
+        (Some(decode), Some(encode)) => Some(callable::wrap_js_codec(decode, encode)),
+        _ => None,
+    };
+    let response_codec = response_codec_decode.map(callable::wrap_js_response_codec);
+    let scope_stack = current_scope_stack_handle();
+
+    env.execute_tokio_future(
+        async move {
+            TASK_SCOPE_STACK
+                .scope(scope_stack, async move {
+                    let params = core_llm_api::LlmCallExecuteV2Params::builder()
+                        .name(name)
+                        .request(request)
+                        .func(exec_fn)
+                        .api_family(api_family)
+                        .call_role(call_role)
+                        .sanitized_metadata(sanitized_metadata)
+                        .parent(parent)
+                        .attributes(attrs)
+                        .data_opt(opt_json(data))
+                        .metadata_opt(opt_json(metadata))
+                        .model_name_opt(model_name)
+                        .codec_opt(codec)
+                        .response_codec_opt(response_codec)
+                        .tenant_id_opt(tenant_id)
+                        .agent_id_opt(agent_id)
+                        .replay_factory_opt(replay_factory)
+                        .build();
+                    core_llm_api::llm_call_execute_v2(params)
+                        .await
+                        .map_err(to_napi_err)
+                })
+                .await
+        },
+        |_env, result| Ok(result),
+    )
+}
+
+/// Internal test helper for the Node replay-factory lifetime bridge.
+#[napi(
+    js_name = "__testNodeReplayBridge",
+    ts_return_type = "Promise<Array<Json>>"
+)]
+pub fn test_node_replay_bridge(
+    env: Env,
+    #[napi(ts_arg_type = "LlmReplayFactory")] replay_factory: JsFunction,
+    #[napi(ts_arg_type = "LlmApiFamily")] api_family: String,
+    requests: Vec<Json>,
+    cancel_first: bool,
+) -> Result<JsObject> {
+    let api_family = parse_llm_api_family(api_family)?;
+    let factory = Arc::new(crate::replay::NodeReplayFactory::new(
+        &env,
+        &replay_factory,
+    )?);
+    let requests = requests
+        .into_iter()
+        .map(|request| {
+            serde_json::from_value::<LlmRequest>(request)
+                .map_err(|error| napi::Error::from_reason(format!("invalid LlmRequest: {error}")))
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+    env.execute_tokio_future(
+        async move {
+            crate::replay::exercise_replay_factory(factory, api_family, requests, cancel_first)
+                .await
+                .map_err(to_napi_err)
         },
         |_env, result| Ok(result),
     )
@@ -4011,6 +4188,19 @@ pub async fn initialize_plugins(config: Json) -> napi::Result<Json> {
 #[napi]
 pub fn clear_plugin_configuration() -> napi::Result<()> {
     clear_plugin_configuration_impl().map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+/// Stop intake, drain, and clear the active plugin configuration.
+///
+/// `timeoutMillis` is one shared deadline for all component drains. Failed or
+/// timed-out drains are aborted before registrations are removed. Use
+/// `clearPluginConfiguration` when immediate abort semantics are required.
+#[napi]
+pub async fn clear_plugin_configuration_async(timeout_millis: f64) -> napi::Result<()> {
+    let timeout = parse_plugin_shutdown_timeout(timeout_millis)?;
+    clear_plugin_configuration_async_impl(timeout)
+        .await
+        .map_err(|error| napi::Error::from_reason(error.to_string()))
 }
 
 /// Return the last successfully configured plugin report.

@@ -20,6 +20,7 @@ use nemo_relay::api::runtime::{
     EventSubscriberFn, LlmExecutionFn, LlmRequestInterceptFn, LlmStreamExecutionFn, ToolExecutionFn,
 };
 use nemo_relay::codec::request::AnnotatedLlmRequest;
+use nemo_relay::error::FlowError;
 use nemo_relay::plugin::{
     ConfigReport, DiagnosticLevel, PluginError, PluginRegistration as ComponentRegistration,
     PluginRegistrationContext as HostedRegistrationContext, rollback_registrations,
@@ -362,13 +363,12 @@ impl AdaptiveRuntime {
                 if let Ok(mut guard) = bound_scopes.write() {
                     guard.remove(&scope_uuid);
                 }
-                scope_deregister_llm_request_intercept(&scope_uuid, &registration_name)
-                    .map(|_| ())
-                    .map_err(|error| {
-                        PluginError::RegistrationFailed(format!(
-                            "scope-bound ACG llm request intercept deregistration failed: {error}"
-                        ))
-                    })
+                match scope_deregister_llm_request_intercept(&scope_uuid, &registration_name) {
+                    Ok(_) | Err(FlowError::NotFound(_)) => Ok(()),
+                    Err(error) => Err(PluginError::RegistrationFailed(format!(
+                        "scope-bound ACG llm request intercept deregistration failed: {error}"
+                    ))),
+                }
             }),
         ));
 

@@ -4,10 +4,11 @@
 //! Middleware registry helpers for global and scope-local guardrails,
 //! intercepts, and subscribers.
 
+use crate::api::runtime::callbacks::LlmExecutionInterceptFn;
 use crate::api::runtime::{
-    EventSanitizeFn, LlmConditionalFn, LlmExecutionFn, LlmRequestInterceptFn, LlmSanitizeRequestFn,
-    LlmSanitizeResponseFn, LlmStreamExecutionFn, ToolConditionalFn, ToolExecutionFn,
-    ToolInterceptFn, ToolSanitizeFn,
+    EventSanitizeFn, LlmConditionalFn, LlmExecutionFn, LlmExecutionV2Fn, LlmRequestInterceptFn,
+    LlmSanitizeRequestFn, LlmSanitizeResponseFn, LlmStreamExecutionFn, ToolConditionalFn,
+    ToolExecutionFn, ToolInterceptFn, ToolSanitizeFn,
 };
 use crate::api::runtime::{current_scope_stack, global_context};
 use crate::api::shared::ensure_runtime_owner;
@@ -583,16 +584,93 @@ global_intercept_registry_api!(
     llm_request_intercepts,
     LlmRequestInterceptFn
 );
-global_execution_registry_api!(
-    /// Register a global LLM execution intercept.
-    /// Execution intercepts can wrap or replace the non-streaming provider
-    /// callback.
-    register_llm_execution_intercept,
-    /// Deregister a global LLM execution intercept.
-    deregister_llm_execution_intercept,
-    llm_execution_intercepts,
-    LlmExecutionFn
-);
+/// Register a global V1 LLM execution intercept.
+///
+/// V1 and V2 execution intercepts share one global name namespace. A V1
+/// managed call selects only V1 entries. A V2 managed call merges both entry
+/// kinds and orders them deterministically by ascending `priority` and then
+/// `name`; the V1 callback is adapted without a V2 context or replay transport.
+///
+/// # Parameters
+/// - `name`: Unique name across global V1 and V2 LLM execution intercepts.
+/// - `priority`: Lower values run earlier in the execution chain.
+/// - `callable`: V1 execution callback stored under `name`.
+///
+/// # Returns
+/// A [`Result`] that is `Ok(())` when the intercept was registered.
+///
+/// # Errors
+/// Returns [`FlowError::AlreadyExists`] when either version already uses the
+/// name, or an internal error if the runtime state cannot be updated.
+pub fn register_llm_execution_intercept(
+    name: &str,
+    priority: i32,
+    callable: LlmExecutionFn,
+) -> Result<()> {
+    register_llm_execution_intercept_entry(name, priority, LlmExecutionInterceptFn::V1(callable))
+}
+
+/// Register a global context-aware V2 LLM execution intercept.
+///
+/// V2 intercepts share a name namespace and deterministic priority/name order
+/// with global V1 intercepts. Their continuation is leased to one invocation
+/// while the callback future is active; delayed work must retain the immutable
+/// context and replay transport instead.
+///
+/// # Parameters
+/// - `name`: Unique name across global V1 and V2 LLM execution intercepts.
+/// - `priority`: Lower values run earlier in the execution chain.
+/// - `callable`: Context-aware V2 execution callback stored under `name`.
+///
+/// # Returns
+/// A [`Result`] that is `Ok(())` when the intercept was registered.
+///
+/// # Errors
+/// Returns [`FlowError::AlreadyExists`] when either version already uses the
+/// name, or an internal error if the runtime state cannot be updated.
+pub fn register_llm_execution_intercept_v2(
+    name: &str,
+    priority: i32,
+    callable: LlmExecutionV2Fn,
+) -> Result<()> {
+    register_llm_execution_intercept_entry(name, priority, LlmExecutionInterceptFn::V2(callable))
+}
+
+fn register_llm_execution_intercept_entry(
+    name: &str,
+    priority: i32,
+    callable: LlmExecutionInterceptFn,
+) -> Result<()> {
+    ensure_runtime_owner()?;
+    let context = global_context();
+    let mut state = context
+        .write()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    state
+        .llm_execution_intercepts
+        .register(ExecutionIntercept::new(name, priority, callable))
+        .map_err(FlowError::AlreadyExists)
+}
+
+/// Deregister a global V1 or V2 LLM execution intercept.
+///
+/// # Parameters
+/// - `name`: Global execution-intercept name to remove.
+///
+/// # Returns
+/// A [`Result`] containing `true` when either entry kind was removed and
+/// `false` when the name was not registered.
+///
+/// # Errors
+/// Returns an internal error if the runtime state cannot be updated.
+pub fn deregister_llm_execution_intercept(name: &str) -> Result<bool> {
+    ensure_runtime_owner()?;
+    let context = global_context();
+    let mut state = context
+        .write()
+        .map_err(|error| FlowError::Internal(error.to_string()))?;
+    Ok(state.llm_execution_intercepts.deregister(name))
+}
 global_execution_registry_api!(
     /// Register a global streaming LLM execution intercept.
     /// Execution intercepts can wrap or replace the streaming provider
@@ -716,16 +794,114 @@ scope_intercept_registry_api!(
     llm_request_intercepts,
     LlmRequestInterceptFn
 );
-scope_execution_registry_api!(
-    /// Register a scope-local LLM execution intercept.
-    /// Execution intercepts can wrap or replace the non-streaming provider
-    /// callback inside the owning scope.
-    scope_register_llm_execution_intercept,
-    /// Deregister a scope-local LLM execution intercept.
-    scope_deregister_llm_execution_intercept,
-    llm_execution_intercepts,
-    LlmExecutionFn
-);
+/// Register a scope-local V1 LLM execution intercept.
+///
+/// V1 and V2 execution intercepts share one name namespace within the scope. A
+/// V1 managed call selects only visible V1 entries. A V2 managed call merges
+/// visible V1 and V2 entries and orders them deterministically by ascending
+/// `priority` and then `name`.
+///
+/// # Parameters
+/// - `scope_uuid`: Active scope that owns the registration.
+/// - `name`: Unique name across V1 and V2 LLM execution intercepts in that scope.
+/// - `priority`: Lower values run earlier in the execution chain.
+/// - `callable`: V1 execution callback stored under `name`.
+///
+/// # Returns
+/// A [`Result`] that is `Ok(())` when the intercept was registered.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when the scope is not active and
+/// [`FlowError::AlreadyExists`] when either version already uses the name.
+pub fn scope_register_llm_execution_intercept(
+    scope_uuid: &uuid::Uuid,
+    name: &str,
+    priority: i32,
+    callable: LlmExecutionFn,
+) -> Result<()> {
+    scope_register_llm_execution_intercept_entry(
+        scope_uuid,
+        name,
+        priority,
+        LlmExecutionInterceptFn::V1(callable),
+    )
+}
+
+/// Register a scope-local context-aware V2 LLM execution intercept.
+///
+/// V2 intercepts share the scope-local namespace and deterministic
+/// priority/name order with V1 intercepts. Their continuation is leased to one
+/// invocation while the callback future is active; delayed work must retain
+/// the immutable context and replay transport instead.
+///
+/// # Parameters
+/// - `scope_uuid`: Active scope that owns the registration.
+/// - `name`: Unique name across V1 and V2 LLM execution intercepts in that scope.
+/// - `priority`: Lower values run earlier in the execution chain.
+/// - `callable`: Context-aware V2 execution callback stored under `name`.
+///
+/// # Returns
+/// A [`Result`] that is `Ok(())` when the intercept was registered.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when the scope is not active and
+/// [`FlowError::AlreadyExists`] when either version already uses the name.
+pub fn scope_register_llm_execution_intercept_v2(
+    scope_uuid: &uuid::Uuid,
+    name: &str,
+    priority: i32,
+    callable: LlmExecutionV2Fn,
+) -> Result<()> {
+    scope_register_llm_execution_intercept_entry(
+        scope_uuid,
+        name,
+        priority,
+        LlmExecutionInterceptFn::V2(callable),
+    )
+}
+
+fn scope_register_llm_execution_intercept_entry(
+    scope_uuid: &uuid::Uuid,
+    name: &str,
+    priority: i32,
+    callable: LlmExecutionInterceptFn,
+) -> Result<()> {
+    ensure_runtime_owner()?;
+    let scope_stack = current_scope_stack();
+    let mut guard = scope_stack.write().expect("scope stack lock poisoned");
+    let registries = guard
+        .local_registries_mut(scope_uuid)
+        .ok_or_else(|| FlowError::NotFound(format!("scope {scope_uuid} not found")))?;
+    registries
+        .llm_execution_intercepts
+        .register(ExecutionIntercept::new(name, priority, callable))
+        .map_err(FlowError::AlreadyExists)
+}
+
+/// Deregister a scope-local V1 or V2 LLM execution intercept.
+///
+/// # Parameters
+/// - `scope_uuid`: Active scope that owns the registration.
+/// - `name`: Scope-local execution-intercept name to remove.
+///
+/// # Returns
+/// A [`Result`] containing `true` when either entry kind was removed and
+/// `false` when the name was not registered.
+///
+/// # Errors
+/// Returns [`FlowError::NotFound`] when the scope is not active.
+pub fn scope_deregister_llm_execution_intercept(
+    scope_uuid: &uuid::Uuid,
+    name: &str,
+) -> Result<bool> {
+    ensure_runtime_owner()?;
+    let scope_stack = current_scope_stack();
+    let mut guard = scope_stack.write().expect("scope stack lock poisoned");
+    let registries = guard
+        .local_registries_mut(scope_uuid)
+        .ok_or_else(|| FlowError::NotFound(format!("scope {scope_uuid} not found")))?;
+    Ok(registries.llm_execution_intercepts.deregister(name))
+}
 scope_execution_registry_api!(
     /// Register a scope-local streaming LLM execution intercept.
     /// Execution intercepts can wrap or replace the streaming provider

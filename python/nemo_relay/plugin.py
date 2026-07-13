@@ -38,6 +38,9 @@ from nemo_relay._native import (
     clear_plugin_configuration as _clear_plugin_configuration,
 )
 from nemo_relay._native import (
+    clear_plugin_configuration_async as _clear_plugin_configuration_async,
+)
+from nemo_relay._native import (
     deregister_plugin as _deregister_plugin,
 )
 from nemo_relay._native import (
@@ -347,6 +350,24 @@ def clear() -> None:
     _clear_plugin_configuration()
 
 
+async def clear_async(timeout: float = 30.0) -> None:
+    """Drain and clear active plugin configuration within one timeout.
+
+    Args:
+        timeout: Shared shutdown deadline in seconds. Must be finite and
+            non-negative.
+
+    Returns:
+        ``None`` after intake has stopped and bounded teardown has completed.
+
+    Behavior:
+        Components drain in reverse registration order under one shared
+        deadline. Failed or timed-out resources are aborted before all
+        registrations are removed.
+    """
+    await _clear_plugin_configuration_async(timeout)
+
+
 @asynccontextmanager
 async def plugin(config: PluginConfig | JsonObject, *, clear_on_exit: bool = True) -> AsyncIterator[ConfigReport]:
     """Context manager for plugin initialization and cleanup.
@@ -439,6 +460,7 @@ __all__ = [
     "PluginContext",
     "Plugin",
     "clear",
+    "clear_async",
     "initialize",
     "deregister",
     "list_kinds",

@@ -34,6 +34,7 @@ from nemo_relay import model_pricing as model_pricing
 from nemo_relay import observability as observability
 from nemo_relay import pii_redaction as pii_redaction
 from nemo_relay import plugin as plugin
+from nemo_relay import router as router
 from nemo_relay import scope as scope
 from nemo_relay import scope_local as scope_local
 from nemo_relay import subscribers as subscribers

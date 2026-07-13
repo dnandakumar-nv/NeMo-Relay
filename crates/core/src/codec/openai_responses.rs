@@ -15,15 +15,16 @@
 //!   `instructions` (top-level) instead of system message.
 //! - **Max tokens**: `max_output_tokens` instead of `max_tokens`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::llm::LlmRequest;
 use crate::error::{FlowError, Result};
 use crate::json::Json;
 
 use super::request::{
-    AnnotatedLlmRequest, GenerationParams, Message, MessageContent, ToolChoice, ToolChoiceFunction,
-    ToolChoiceFunctionName, ToolDefinition,
+    AnnotatedLlmRequest, FunctionDefinition, GenerationParams, Message, MessageContent,
+    StructuredResponseFormat, StructuredResponseFormatKind, ToolChoice, ToolChoiceFunction,
+    ToolChoiceFunctionName, ToolDefinition, deserialize_optional_non_null_bool,
 };
 use super::resolve::{ProviderSurface, ProviderSurfaceDescriptor};
 use super::response::{
@@ -101,6 +102,42 @@ struct RawOutputTokensDetails {
     extra: serde_json::Map<String, Json>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawResponsesFunctionTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<Json>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_bool"
+    )]
+    strict: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLegacyResponsesFunctionTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: RawResponsesFunctionDefinition,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawResponsesFunctionDefinition {
+    name: String,
+    description: Option<String>,
+    parameters: Option<Json>,
+    #[serde(default, deserialize_with = "deserialize_optional_non_null_bool")]
+    strict: Option<bool>,
+}
+
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
@@ -162,6 +199,7 @@ const MODELED_REQUEST_KEYS: &[&str] = &[
     "top_p",
     "tools",
     "tool_choice",
+    "text",
     "store",
     "previous_response_id",
     "truncation",
@@ -176,6 +214,192 @@ const MODELED_REQUEST_KEYS: &[&str] = &[
     "stream",
 ];
 const UNPARSED_INPUT_ITEMS_KEY: &str = "_openai_responses_unparsed_input_items";
+const NATIVE_WRAPPER_KEY: &str = "native_wrapper";
+const NATIVE_FORMAT_KEY: &str = "native_format";
+
+fn response_format_error(message: impl Into<String>) -> FlowError {
+    FlowError::Internal(format!(
+        "OpenAI Responses text.format decode: {}",
+        message.into()
+    ))
+}
+
+fn structured_extra(
+    native_wrapper: serde_json::Map<String, Json>,
+    native_format: serde_json::Map<String, Json>,
+) -> serde_json::Map<String, Json> {
+    let mut extra = serde_json::Map::new();
+    if !native_wrapper.is_empty() {
+        extra.insert(NATIVE_WRAPPER_KEY.into(), Json::Object(native_wrapper));
+    }
+    if !native_format.is_empty() {
+        extra.insert(NATIVE_FORMAT_KEY.into(), Json::Object(native_format));
+    }
+    extra
+}
+
+fn decode_responses_response_format(
+    text: Option<&Json>,
+) -> Result<Option<StructuredResponseFormat>> {
+    let Some(text) = text.and_then(Json::as_object) else {
+        return Ok(None);
+    };
+    let Some(format) = text.get("format").and_then(Json::as_object) else {
+        return Ok(None);
+    };
+    let Some(kind) = format.get("type").and_then(Json::as_str) else {
+        return Ok(None);
+    };
+
+    let native_wrapper = text
+        .iter()
+        .filter(|(key, _)| key.as_str() != "format")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    match kind {
+        "json_object" => {
+            if format
+                .keys()
+                .any(|key| matches!(key.as_str(), "name" | "schema" | "strict"))
+            {
+                return Err(response_format_error(
+                    "json_object contains json_schema-only fields",
+                ));
+            }
+            let native_format = format
+                .iter()
+                .filter(|(key, _)| key.as_str() != "type")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            Ok(Some(StructuredResponseFormat {
+                kind: StructuredResponseFormatKind::JsonObject,
+                name: None,
+                schema: None,
+                strict: None,
+                extra: structured_extra(native_wrapper, native_format),
+            }))
+        }
+        "json_schema" => {
+            let name = format
+                .get("name")
+                .and_then(Json::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| response_format_error("name must be a nonempty string"))?
+                .to_string();
+            let schema = format
+                .get("schema")
+                .filter(|schema| !schema.is_null())
+                .cloned()
+                .ok_or_else(|| response_format_error("schema is required"))?;
+            let strict = format
+                .get("strict")
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| response_format_error("strict must be a boolean"))
+                })
+                .transpose()?;
+            let native_format = format
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "type" | "name" | "schema" | "strict"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            Ok(Some(StructuredResponseFormat {
+                kind: StructuredResponseFormatKind::JsonSchema,
+                name: Some(name),
+                schema: Some(schema),
+                strict,
+                extra: structured_extra(native_wrapper, native_format),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_extra_map(
+    format: &StructuredResponseFormat,
+    key: &str,
+) -> Result<serde_json::Map<String, Json>> {
+    match format.extra.get(key) {
+        Some(Json::Object(extra)) => Ok(extra.clone()),
+        Some(_) => Err(FlowError::Internal(format!(
+            "OpenAI Responses text.format encode: {key} must be an object"
+        ))),
+        None => Ok(serde_json::Map::new()),
+    }
+}
+
+fn validate_native_extra_keys(format: &StructuredResponseFormat) -> Result<()> {
+    if let Some(key) = format
+        .extra
+        .keys()
+        .find(|key| !matches!(key.as_str(), NATIVE_WRAPPER_KEY | NATIVE_FORMAT_KEY))
+    {
+        return Err(FlowError::Internal(format!(
+            "OpenAI Responses text.format encode: unsupported extra key {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_format_field(
+    obj: &mut serde_json::Map<String, Json>,
+    key: &str,
+    value: Json,
+) -> Result<()> {
+    if obj.contains_key(key) {
+        return Err(FlowError::Internal(format!(
+            "OpenAI Responses text.format encode: native extra conflicts with {key}"
+        )));
+    }
+    obj.insert(key.into(), value);
+    Ok(())
+}
+
+fn encode_responses_response_format(format: &StructuredResponseFormat) -> Result<Json> {
+    validate_native_extra_keys(format)?;
+    let mut text = native_extra_map(format, NATIVE_WRAPPER_KEY)?;
+    let mut descriptor = native_extra_map(format, NATIVE_FORMAT_KEY)?;
+    match format.kind {
+        StructuredResponseFormatKind::JsonObject => {
+            if format.name.is_some() || format.schema.is_some() || format.strict.is_some() {
+                return Err(FlowError::Internal(
+                    "OpenAI Responses text.format encode: json_object cannot include name, schema, or strict"
+                        .into(),
+                ));
+            }
+            insert_format_field(&mut descriptor, "type", Json::String("json_object".into()))?;
+        }
+        StructuredResponseFormatKind::JsonSchema => {
+            let name = format
+                .name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    FlowError::Internal(
+                        "OpenAI Responses text.format encode: name is required".into(),
+                    )
+                })?;
+            let schema = format
+                .schema
+                .as_ref()
+                .filter(|schema| !schema.is_null())
+                .ok_or_else(|| {
+                    FlowError::Internal(
+                        "OpenAI Responses text.format encode: schema is required".into(),
+                    )
+                })?;
+            insert_format_field(&mut descriptor, "type", Json::String("json_schema".into()))?;
+            insert_format_field(&mut descriptor, "name", Json::String(name.into()))?;
+            insert_format_field(&mut descriptor, "schema", schema.clone())?;
+            if let Some(strict) = format.strict {
+                insert_format_field(&mut descriptor, "strict", Json::Bool(strict))?;
+            }
+        }
+    }
+    insert_format_field(&mut text, "format", Json::Object(descriptor))?;
+    Ok(Json::Object(text))
+}
 
 /// Helper to construct a [`Json`] number from an `f64`.
 fn json_f64(v: f64) -> Json {
@@ -277,24 +501,6 @@ fn optional_vec<T>(items: Vec<T>) -> Option<Vec<T>> {
     (!items.is_empty()).then_some(items)
 }
 
-fn split_system_and_input_messages(messages: &[Message]) -> (Option<String>, Vec<&Message>) {
-    let mut system_text = None;
-    let mut input_messages = Vec::new();
-
-    for msg in messages {
-        match msg {
-            Message::System { content, .. } => {
-                if let MessageContent::Text(text) = content {
-                    system_text = Some(text.clone());
-                }
-            }
-            other => input_messages.push(other),
-        }
-    }
-
-    (system_text, input_messages)
-}
-
 fn set_or_remove_string(obj: &mut serde_json::Map<String, Json>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         obj.insert(key.into(), Json::String(value));
@@ -332,10 +538,43 @@ fn encode_openai_responses_input(
     obj: &mut serde_json::Map<String, Json>,
     annotated: &AnnotatedLlmRequest,
 ) -> Result<()> {
-    let (system_text, input_messages) = split_system_and_input_messages(&annotated.messages);
-    set_or_remove_string(obj, "instructions", system_text);
+    let had_family_instructions = obj.contains_key("instructions");
+    let (family_instructions, input_messages) = if had_family_instructions {
+        match annotated.messages.split_first() {
+            Some((
+                Message::System {
+                    content: MessageContent::Text(text),
+                    ..
+                },
+                rest,
+            )) => (Some(text.clone()), rest),
+            _ => (None, annotated.messages.as_slice()),
+        }
+    } else {
+        (None, annotated.messages.as_slice())
+    };
+    set_or_remove_string(obj, "instructions", family_instructions);
     if let Some(raw_input_items) = annotated.extra.get(UNPARSED_INPUT_ITEMS_KEY) {
         obj.insert("input".into(), raw_input_items.clone());
+    } else if obj.get("input").is_some_and(Json::is_string)
+        && matches!(
+            input_messages,
+            [Message::User {
+                content: MessageContent::Text(_),
+                name: None
+            }]
+        )
+    {
+        let [
+            Message::User {
+                content: MessageContent::Text(text),
+                name: None,
+            },
+        ] = input_messages
+        else {
+            unreachable!("shape is checked above")
+        };
+        obj.insert("input".into(), Json::String(text.clone()));
     } else {
         insert_serialized(obj, "input", &input_messages, "input")?;
     }
@@ -347,12 +586,87 @@ fn encode_openai_responses_tools(
     annotated: &AnnotatedLlmRequest,
 ) -> Result<()> {
     if let Some(ref tools) = annotated.tools {
-        insert_serialized(obj, "tools", tools, "tools")?;
+        let native_tools: Vec<RawResponsesFunctionTool> = tools
+            .iter()
+            .map(|tool| {
+                if tool.tool_type != "function" {
+                    return Err(FlowError::Internal(
+                        "OpenAI Responses tools encode: only function tools are supported".into(),
+                    ));
+                }
+                Ok(RawResponsesFunctionTool {
+                    tool_type: tool.tool_type.clone(),
+                    name: tool.function.name.clone(),
+                    description: tool.function.description.clone(),
+                    parameters: tool.function.parameters.clone(),
+                    strict: tool.function.strict,
+                })
+            })
+            .collect::<Result<_>>()?;
+        insert_serialized(obj, "tools", &native_tools, "tools")?;
     }
     if let Some(ref tool_choice) = annotated.tool_choice {
         insert_serialized(obj, "tool_choice", tool_choice, "tool_choice")?;
     }
     Ok(())
+}
+
+fn decode_openai_responses_tools(value: &Json) -> Result<Vec<ToolDefinition>> {
+    let tools = value.as_array().ok_or_else(|| {
+        FlowError::Internal("OpenAI Responses tools decode: expected an array".into())
+    })?;
+
+    tools
+        .iter()
+        .map(|tool| {
+            if tool
+                .get("type")
+                .and_then(Json::as_str)
+                .is_some_and(|tool_type| tool_type != "function")
+            {
+                return Err(FlowError::Internal(
+                    "OpenAI Responses tools decode: only function tools are supported".into(),
+                ));
+            }
+            if tool.get("function").is_some() {
+                let tool = serde_json::from_value::<RawLegacyResponsesFunctionTool>(tool.clone())
+                    .map_err(|e| {
+                    FlowError::Internal(format!("OpenAI Responses tools decode: {e}"))
+                })?;
+                if tool.tool_type != "function" {
+                    return Err(FlowError::Internal(
+                        "OpenAI Responses tools decode: only function tools are supported".into(),
+                    ));
+                }
+                return Ok(ToolDefinition {
+                    tool_type: tool.tool_type,
+                    function: FunctionDefinition {
+                        name: tool.function.name,
+                        description: tool.function.description,
+                        parameters: tool.function.parameters,
+                        strict: tool.function.strict,
+                    },
+                });
+            }
+
+            let tool: RawResponsesFunctionTool = serde_json::from_value(tool.clone())
+                .map_err(|e| FlowError::Internal(format!("OpenAI Responses tools decode: {e}")))?;
+            if tool.tool_type != "function" {
+                return Err(FlowError::Internal(
+                    "OpenAI Responses tools decode: only function tools are supported".into(),
+                ));
+            }
+            Ok(ToolDefinition {
+                tool_type: tool.tool_type,
+                function: FunctionDefinition {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                    strict: tool.strict,
+                },
+            })
+        })
+        .collect()
 }
 
 fn overlay_openai_responses_fields(
@@ -570,7 +884,12 @@ impl LlmCodec for OpenAIResponsesCodec {
         let mut preserved_unparsed_input: Option<Json> = None;
 
         // Extract instructions -> system message (first).
-        if let Some(instructions) = obj.get("instructions").and_then(|v| v.as_str()) {
+        if let Some(instructions) = obj.get("instructions") {
+            let instructions = instructions.as_str().ok_or_else(|| {
+                FlowError::Internal(
+                    "OpenAI Responses instructions decode: expected a string".into(),
+                )
+            })?;
             messages.push(Message::System {
                 content: MessageContent::Text(instructions.to_string()),
                 name: None,
@@ -588,17 +907,25 @@ impl LlmCodec for OpenAIResponsesCodec {
             } else if input.is_array() {
                 // Strict-first parse to avoid partial normalized state.
                 match serde_json::from_value::<Vec<Message>>(input.clone()) {
-                    Ok(input_messages) => messages.extend(input_messages),
-                    Err(_) => {
+                    Ok(input_messages)
+                        if serde_json::to_value(&input_messages).ok().as_ref() == Some(input) =>
+                    {
+                        messages.extend(input_messages);
+                    }
+                    Ok(_) | Err(_) => {
                         // Preserve full original array for lossless handling.
                         preserved_unparsed_input = Some(input.clone());
                     }
                 }
+            } else {
+                preserved_unparsed_input = Some(input.clone());
             }
         }
 
         // Extract model.
         let model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
+
+        let response_format = decode_responses_response_format(obj.get("text"))?;
 
         // Extract generation params.
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
@@ -618,11 +945,10 @@ impl LlmCodec for OpenAIResponsesCodec {
         };
 
         // Extract tools.
-        let tools: Option<Vec<ToolDefinition>> = obj
+        let tools = obj
             .get("tools")
-            .map(|v| serde_json::from_value(v.clone()))
-            .transpose()
-            .map_err(|e| FlowError::Internal(format!("OpenAI Responses tools decode: {e}")))?;
+            .map(decode_openai_responses_tools)
+            .transpose()?;
 
         // Extract tool_choice.
         let tool_choice: Option<ToolChoice> = obj
@@ -632,7 +958,10 @@ impl LlmCodec for OpenAIResponsesCodec {
         // Collect extra fields (keys not in MODELED_REQUEST_KEYS).
         let mut extra: serde_json::Map<String, Json> = obj
             .iter()
-            .filter(|(k, _)| !MODELED_REQUEST_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| {
+                !MODELED_REQUEST_KEYS.contains(&k.as_str())
+                    || (k.as_str() == "text" && response_format.is_none())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         if let Some(input_items) = preserved_unparsed_input {
@@ -645,6 +974,7 @@ impl LlmCodec for OpenAIResponsesCodec {
             params,
             tools,
             tool_choice,
+            response_format,
             store: obj.get("store").and_then(|v| v.as_bool()),
             previous_response_id: obj
                 .get("previous_response_id")
@@ -680,6 +1010,20 @@ impl LlmCodec for OpenAIResponsesCodec {
         }
         encode_openai_responses_tools(obj, annotated)?;
         overlay_openai_responses_fields(obj, annotated);
+        if annotated.response_format.is_some() && annotated.extra.contains_key("text") {
+            return Err(FlowError::Internal(
+                "OpenAI Responses text.format encode: typed and generic representations conflict"
+                    .into(),
+            ));
+        }
+        if let Some(response_format) = &annotated.response_format {
+            obj.insert(
+                "text".into(),
+                encode_responses_response_format(response_format)?,
+            );
+        } else if !annotated.extra.contains_key("text") {
+            obj.remove("text");
+        }
         merge_openai_responses_extra_fields(obj, &annotated.extra);
 
         Ok(LlmRequest {

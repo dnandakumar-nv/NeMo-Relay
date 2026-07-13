@@ -115,6 +115,173 @@ class TestBuiltinCodecDecodeEncode:
         assert cast(float, encoded_content["temperature"]) == 0.7
         assert len(cast(list[JsonObject], encoded_content["messages"])) == 2
 
+    def test_openai_chat_preserves_tool_strictness(self):
+        codec = OpenAIChatCodec()
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "strict_true", "parameters": {"type": "object"}, "strict": True},
+            },
+            {
+                "type": "function",
+                "function": {"name": "strict_false", "parameters": {"type": "object"}, "strict": False},
+            },
+            {
+                "type": "function",
+                "function": {"name": "strict_omitted", "parameters": {"type": "object"}},
+            },
+        ]
+        original = LLMRequest(
+            {},
+            {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "Use a tool"}],
+                "tools": tools,
+            },
+        )
+
+        annotated = codec.decode(original)
+        assert annotated.tools == tools
+        assert codec.encode(annotated, original).content == original.content
+
+    def test_openai_responses_preserves_tool_strictness(self):
+        codec = OpenAIResponsesCodec()
+        native_tools = [
+            {"type": "function", "name": "strict_true", "parameters": {"type": "object"}, "strict": True},
+            {"type": "function", "name": "strict_false", "parameters": {"type": "object"}, "strict": False},
+            {"type": "function", "name": "strict_omitted", "parameters": {"type": "object"}},
+        ]
+        normalized_tools = [
+            {
+                "type": "function",
+                "function": {"name": "strict_true", "parameters": {"type": "object"}, "strict": True},
+            },
+            {
+                "type": "function",
+                "function": {"name": "strict_false", "parameters": {"type": "object"}, "strict": False},
+            },
+            {
+                "type": "function",
+                "function": {"name": "strict_omitted", "parameters": {"type": "object"}},
+            },
+        ]
+        original = LLMRequest(
+            {},
+            {
+                "model": "gpt-4.1-mini",
+                "input": "Use a tool",
+                "tools": native_tools,
+            },
+        )
+
+        annotated = codec.decode(original)
+        assert annotated.tools == normalized_tools
+        assert codec.encode(annotated, original).content == original.content
+
+    @pytest.mark.parametrize("codec_kind", ["chat", "responses"])
+    def test_openai_codecs_reject_explicit_null_tool_strictness(self, codec_kind):
+        content: JsonObject
+        if codec_kind == "chat":
+            codec = OpenAIChatCodec()
+            content = {
+                "messages": [{"role": "user", "content": "Use a tool"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "lookup", "strict": None},
+                    }
+                ],
+            }
+        else:
+            codec = OpenAIResponsesCodec()
+            content = {
+                "input": "Use a tool",
+                "tools": [{"type": "function", "name": "lookup", "strict": None}],
+            }
+
+        with pytest.raises(RuntimeError):
+            codec.decode(LLMRequest({}, content))
+
+    def test_openai_responses_rejects_lossy_tool_shapes(self):
+        codec = OpenAIResponsesCodec()
+        request = LLMRequest(
+            {},
+            {
+                "input": "Use a tool",
+                "tools": [{"type": "function", "name": "lookup"}],
+            },
+        )
+        annotated = codec.decode(request)
+        assert annotated.tools is not None
+        annotated.tools = [{"type": "custom", "function": {"name": "lookup"}}]
+        with pytest.raises(RuntimeError, match="only function tools"):
+            codec.encode(annotated, request)
+
+        mixed = LLMRequest(
+            {},
+            {
+                "input": "Use a tool",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "flat",
+                        "function": {"name": "nested"},
+                    }
+                ],
+            },
+        )
+        with pytest.raises(RuntimeError):
+            codec.decode(mixed)
+
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_anthropic_rejects_tool_strictness(self, strict):
+        codec = AnthropicMessagesCodec()
+        original = LLMRequest(
+            {},
+            {
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "Use a tool"}],
+                "max_tokens": 64,
+                "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            },
+        )
+        annotated = codec.decode(original)
+        decoded_tools = annotated.tools
+        assert decoded_tools is not None
+        assert "strict" not in cast(JsonObject, decoded_tools[0]["function"])
+        assert codec.encode(annotated, original).content == original.content
+        annotated.tools = [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}, "strict": strict},
+            }
+        ]
+
+        with pytest.raises(RuntimeError, match="strict"):
+            codec.encode(annotated, original)
+
+    @pytest.mark.parametrize("strict", [True, False, None, "true"])
+    def test_anthropic_rejects_native_tool_strictness(self, strict):
+        codec = AnthropicMessagesCodec()
+        request = LLMRequest(
+            {},
+            {
+                "model": "claude-sonnet-4",
+                "messages": [{"role": "user", "content": "Use a tool"}],
+                "max_tokens": 64,
+                "tools": [
+                    {
+                        "name": "lookup",
+                        "input_schema": {"type": "object"},
+                        "strict": strict,
+                    }
+                ],
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="strict"):
+            codec.decode(request)
+
 
 # ---------------------------------------------------------------------------
 # 3. Built-in codec decode_response

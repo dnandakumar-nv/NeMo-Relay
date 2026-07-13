@@ -38,7 +38,8 @@ crate directly.
 - **Native extension**: The compiled `nemo_relay._native` module used by the
   public Python package.
 - **Runtime APIs for Python**: Access to scopes, tool calls, LLM calls,
-  middleware, subscribers, plugins, typed helpers, codecs, and adaptive helpers.
+  middleware, subscribers, plugins, typed helpers, codecs, Router, and adaptive
+  helpers.
 - **Shared Rust semantics**: Python behavior backed by the same runtime
   contract as the Rust crate.
 - **Local development path**: `uv sync` builds the editable package and native
@@ -74,6 +75,98 @@ import nemo_relay
 with nemo_relay.scope.scope("demo-agent", nemo_relay.ScopeType.Agent) as handle:
     nemo_relay.scope.event("initialized", handle=handle, data={"binding": "python"})
 ```
+
+## V2 Managed LLM Calls
+
+V2 calls make the provider API family and execution role explicit. A replay
+factory is synchronous and returns a descriptor with a separate async replay
+callable. Its context is recursively read-only: mappings are mapping proxies
+and sequences are tuples. Keep `sanitized_metadata` and all routing identities
+free of secrets.
+
+```python
+import asyncio
+
+import nemo_relay
+
+
+async def provider(request):
+    return {"model": request.content["model"], "text": "anchor response"}
+
+
+def replay_factory(context):
+    async def replay(request):
+        return {"model": request.content["model"], "text": "replayed response"}
+
+    return {
+        "contract_version": 1,
+        "api_family": context["api_family"],
+        "transport_identity": "in-memory-example",
+        "replay": replay,
+    }
+
+
+async def main():
+    request = nemo_relay.LLMRequest({}, {"model": "example-model", "messages": []})
+    response = await nemo_relay.llm.execute_v2(
+        "example-provider",
+        request,
+        provider,
+        api_family="openai_responses",
+        call_role="primary",
+        sanitized_metadata={"region": "us-west"},
+        tenant_id="tenant-a",
+        agent_id="agent-a",
+        replay_factory=replay_factory,
+    )
+    print(response)
+
+
+asyncio.run(main())
+```
+
+Use bounded async teardown when plugin resources need time to drain:
+
+```python
+import asyncio
+
+import nemo_relay
+
+asyncio.run(nemo_relay.plugin.clear_async(timeout=30.0))
+```
+
+The existing `nemo_relay.plugin.clear()` remains immediate and does not wait
+for component drains.
+
+## Bundled Router
+
+Importing `nemo_relay` registers the native Router component. Typed
+configuration helpers ship in the same wheel under `nemo_relay.router`; there
+is no separate Router Python package.
+
+```python
+import asyncio
+
+from nemo_relay import plugin, router
+
+
+async def main() -> None:
+    config = router.RouterConfig(mode="off")
+    assert router.validate_config(config)["diagnostics"] == []
+    await plugin.initialize(
+        plugin.PluginConfig(components=[router.ComponentSpec(config)])
+    )
+    await plugin.clear_async(timeout=30.0)
+
+
+asyncio.run(main())
+```
+
+The helpers apply Rust defaults, omit optional `None` values, and serialize the
+canonical plugin JSON shape. The native extension includes the same V2 replay
+bridge and pinned sqlite-vec capability as the CLI. Python can activate all
+Router modes through the generic plugin lifecycle, but Active controls and
+decision inspection are not exposed as Python APIs.
 
 ## Documentation
 

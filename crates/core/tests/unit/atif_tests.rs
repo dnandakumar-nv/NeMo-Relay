@@ -8,7 +8,7 @@ use crate::api::event::{
     BaseEvent, CategoryProfile, Event, EventCategory, MarkEvent, ScopeCategory, ScopeEvent,
     llm_attributes_to_strings, scope_attributes_to_strings, tool_attributes_to_strings,
 };
-use crate::api::llm::{LlmAttributes, LlmRequest};
+use crate::api::llm::{LlmAttributes, LlmCallRole, LlmRequest};
 use crate::api::scope::{HandleAttributes, ScopeAttributes, ScopeType};
 use crate::api::tool::ToolAttributes;
 use crate::codec::anthropic::AnthropicMessagesCodec;
@@ -361,6 +361,65 @@ fn event_builder(uuid: Uuid, event_type: EventType) -> TestEventBuilder {
     }
 }
 
+fn set_llm_call_role_value(event: &mut Event, value: serde_json::Value) {
+    let Event::Scope(scope) = event else {
+        panic!("LLM role test fixture must be a scope event");
+    };
+    scope
+        .category_profile
+        .get_or_insert_with(CategoryProfile::default)
+        .extra
+        .insert("call_role".to_string(), value);
+}
+
+fn llm_pair_with_role(
+    label: &str,
+    role: Option<serde_json::Value>,
+    parent_uuid: Option<Uuid>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> [Event; 2] {
+    let uuid = Uuid::now_v7();
+    let model = format!("{label}-model");
+    let start = event_builder(uuid, EventType::Start)
+        .name(label)
+        .scope_type(ScopeType::Llm)
+        .input(json!(LlmRequest {
+            headers: serde_json::Map::new(),
+            content: json!({"messages": [{"role": "user", "content": label}]}),
+        }))
+        .model_name(model.clone());
+    let mut start = match parent_uuid {
+        Some(parent_uuid) => start.parent_uuid(parent_uuid),
+        None => start,
+    }
+    .build();
+    let end = event_builder(uuid, EventType::End)
+        .name(label)
+        .scope_type(ScopeType::Llm)
+        .output(json!({"choices": [{"message": {"content": label}}]}))
+        .model_name(model.clone())
+        .annotated_response(annotated_response_with_usage(
+            &model,
+            Usage {
+                prompt_tokens: Some(prompt_tokens),
+                completion_tokens: Some(completion_tokens),
+                total_tokens: Some(prompt_tokens + completion_tokens),
+                ..Usage::default()
+            },
+        ));
+    let mut end = match parent_uuid {
+        Some(parent_uuid) => end.parent_uuid(parent_uuid),
+        None => end,
+    }
+    .build();
+    if let Some(role) = role {
+        set_llm_call_role_value(&mut start, role.clone());
+        set_llm_call_role_value(&mut end, role);
+    }
+    [start, end]
+}
+
 fn set_event_timestamp(event: &mut Event, timestamp: chrono::DateTime<chrono::Utc>) {
     match event {
         Event::Scope(inner) => inner.base.timestamp = timestamp,
@@ -576,6 +635,276 @@ fn test_exporter_empty() {
     let fm = trajectory.final_metrics.as_ref().unwrap();
     assert_eq!(fm.total_steps, Some(0));
     assert!(fm.total_prompt_tokens.is_none());
+}
+
+#[test]
+fn test_exporter_filters_non_primary_llm_calls_unless_explicitly_included() {
+    let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
+    let subscriber = exporter.subscriber();
+    let mut mismatched =
+        llm_pair_with_role("mismatched", Some(json!(LlmCallRole::Primary)), None, 0, 0);
+    set_llm_call_role_value(&mut mismatched[1], json!(LlmCallRole::Shadow));
+    let pairs = [
+        llm_pair_with_role("legacy", None, None, 1, 2),
+        llm_pair_with_role("primary", Some(json!(LlmCallRole::Primary)), None, 10, 20),
+        llm_pair_with_role("shadow", Some(json!(LlmCallRole::Shadow)), None, 100, 200),
+        llm_pair_with_role("judge", Some(json!(LlmCallRole::Judge)), None, 1_000, 2_000),
+        llm_pair_with_role("malformed", Some(json!("PRIMARY")), None, 10_000, 20_000),
+        mismatched,
+    ];
+    for event in pairs.iter().flatten() {
+        subscriber(event);
+    }
+
+    let default_trajectory = exporter.export().unwrap();
+    assert_eq!(default_trajectory.steps.len(), 4);
+    let default_metrics = default_trajectory.final_metrics.unwrap();
+    assert_eq!(default_metrics.total_prompt_tokens, Some(11));
+    assert_eq!(default_metrics.total_completion_tokens, Some(22));
+
+    let diagnostic_trajectory = exporter
+        .export_with_options(AtifExportOptions {
+            include_non_primary_llm_calls: true,
+        })
+        .unwrap();
+    assert_eq!(diagnostic_trajectory.steps.len(), 12);
+    let diagnostic_metrics = diagnostic_trajectory.final_metrics.unwrap();
+    assert_eq!(diagnostic_metrics.total_prompt_tokens, Some(11_111));
+    assert_eq!(diagnostic_metrics.total_completion_tokens, Some(22_222));
+}
+
+#[test]
+fn test_exporter_filters_evaluator_subtrees_independent_of_event_order() {
+    let root_uuid = Uuid::now_v7();
+    let evaluator_uuid = Uuid::now_v7();
+    let nested_uuid = Uuid::now_v7();
+    let hidden_mark_uuid = Uuid::now_v7();
+    let root_start = event_builder(root_uuid, EventType::Start)
+        .name("root")
+        .scope_type(ScopeType::Agent)
+        .build();
+    let nested_start = event_builder(nested_uuid, EventType::Start)
+        .name("evaluator-child")
+        .scope_type(ScopeType::Function)
+        .parent_uuid(evaluator_uuid)
+        .build();
+    let [hidden_start, hidden_end] = llm_pair_with_role(
+        "evaluator-primary",
+        Some(json!(LlmCallRole::Primary)),
+        Some(nested_uuid),
+        100,
+        200,
+    );
+    let hidden_llm_uuid = hidden_start.uuid();
+    let hidden_mark = event_builder(hidden_mark_uuid, EventType::Mark)
+        .name("evaluator-mark")
+        .parent_uuid(nested_uuid)
+        .data(json!({"hidden": true}))
+        .build();
+    let nested_end = event_builder(nested_uuid, EventType::End)
+        .name("evaluator-child")
+        .scope_type(ScopeType::Function)
+        .parent_uuid(evaluator_uuid)
+        .build();
+    let evaluator_start = event_builder(evaluator_uuid, EventType::Start)
+        .name("evaluator")
+        .scope_type(ScopeType::Evaluator)
+        .parent_uuid(root_uuid)
+        .build();
+    let evaluator_end = event_builder(evaluator_uuid, EventType::End)
+        .name("evaluator")
+        .scope_type(ScopeType::Evaluator)
+        .parent_uuid(root_uuid)
+        .build();
+    let [sibling_start, sibling_end] = llm_pair_with_role(
+        "primary-sibling",
+        Some(json!(LlmCallRole::Primary)),
+        Some(root_uuid),
+        1,
+        2,
+    );
+    let sibling_llm_uuid = sibling_start.uuid();
+    let root_end = event_builder(root_uuid, EventType::End)
+        .name("root")
+        .scope_type(ScopeType::Agent)
+        .build();
+
+    // Descendants arrive before the Evaluator start event to exercise the
+    // order-independent adjacency traversal.
+    let events = vec![
+        root_start,
+        nested_start,
+        hidden_start,
+        hidden_end,
+        hidden_mark,
+        nested_end,
+        evaluator_start,
+        evaluator_end,
+        sibling_start,
+        sibling_end,
+        root_end,
+    ];
+
+    let default_events = collect_events_for_atif(&events, AtifExportOptions::default());
+    let default_uuids = default_events
+        .iter()
+        .map(|event| event.uuid())
+        .collect::<HashSet<_>>();
+    assert!(default_uuids.contains(&root_uuid));
+    assert!(default_uuids.contains(&sibling_llm_uuid));
+    assert!(!default_uuids.contains(&evaluator_uuid));
+    assert!(!default_uuids.contains(&nested_uuid));
+    assert!(!default_uuids.contains(&hidden_llm_uuid));
+    assert!(!default_uuids.contains(&hidden_mark_uuid));
+
+    let diagnostic_events = collect_events_for_atif(
+        &events,
+        AtifExportOptions {
+            include_non_primary_llm_calls: true,
+        },
+    );
+    assert_eq!(diagnostic_events.len(), events.len());
+    assert_eq!(
+        diagnostic_events
+            .iter()
+            .map(|event| event.uuid())
+            .collect::<Vec<_>>(),
+        events.iter().map(Event::uuid).collect::<Vec<_>>()
+    );
+
+    let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
+    let subscriber = exporter.subscriber();
+    for event in &events {
+        subscriber(event);
+    }
+
+    let default_trajectory = exporter.export().unwrap();
+    assert_eq!(default_trajectory.steps.len(), 2);
+    let default_metrics = default_trajectory.final_metrics.unwrap();
+    assert_eq!(default_metrics.total_prompt_tokens, Some(1));
+    assert_eq!(default_metrics.total_completion_tokens, Some(2));
+
+    let diagnostic_trajectory = exporter
+        .export_with_options(AtifExportOptions {
+            include_non_primary_llm_calls: true,
+        })
+        .unwrap();
+    assert_eq!(diagnostic_trajectory.steps.len(), 4);
+    let diagnostic_metrics = diagnostic_trajectory.final_metrics.unwrap();
+    assert_eq!(diagnostic_metrics.total_prompt_tokens, Some(101));
+    assert_eq!(diagnostic_metrics.total_completion_tokens, Some(202));
+}
+
+#[test]
+fn test_exporter_filters_embedder_subtrees_independent_of_event_order() {
+    let fresh_root_uuid = Uuid::now_v7();
+    let embedder_uuid = Uuid::now_v7();
+    let nested_uuid = Uuid::now_v7();
+    let hidden_mark_uuid = Uuid::now_v7();
+    let nested_start = event_builder(nested_uuid, EventType::Start)
+        .name("embedder-child")
+        .scope_type(ScopeType::Function)
+        .parent_uuid(embedder_uuid)
+        .build();
+    let [hidden_start, hidden_end] = llm_pair_with_role(
+        "embedder-primary",
+        Some(json!(LlmCallRole::Primary)),
+        Some(nested_uuid),
+        100,
+        200,
+    );
+    let hidden_llm_uuid = hidden_start.uuid();
+    let hidden_mark = event_builder(hidden_mark_uuid, EventType::Mark)
+        .name("embedder-mark")
+        .parent_uuid(nested_uuid)
+        .data(json!({"hidden": true}))
+        .build();
+    let nested_end = event_builder(nested_uuid, EventType::End)
+        .name("embedder-child")
+        .scope_type(ScopeType::Function)
+        .parent_uuid(embedder_uuid)
+        .build();
+    let embedder_start = event_builder(embedder_uuid, EventType::Start)
+        .name("embedder")
+        .scope_type(ScopeType::Embedder)
+        .parent_uuid(fresh_root_uuid)
+        .build();
+    let embedder_end = event_builder(embedder_uuid, EventType::End)
+        .name("embedder")
+        .scope_type(ScopeType::Embedder)
+        .parent_uuid(fresh_root_uuid)
+        .build();
+    let [sibling_start, sibling_end] = llm_pair_with_role(
+        "primary-sibling",
+        Some(json!(LlmCallRole::Primary)),
+        Some(fresh_root_uuid),
+        1,
+        2,
+    );
+    let sibling_llm_uuid = sibling_start.uuid();
+
+    // Descendants arrive before the Embedder lifecycle to prove that exclusion
+    // is based on the complete parent graph rather than stream order.
+    let events = vec![
+        nested_start,
+        hidden_start,
+        hidden_end,
+        hidden_mark,
+        nested_end,
+        embedder_end,
+        sibling_start,
+        sibling_end,
+        embedder_start,
+    ];
+
+    let default_events = collect_events_for_atif(&events, AtifExportOptions::default());
+    let default_uuids = default_events
+        .iter()
+        .map(|event| event.uuid())
+        .collect::<HashSet<_>>();
+    assert_eq!(default_events.len(), 2);
+    assert_eq!(default_uuids, HashSet::from([sibling_llm_uuid]));
+    assert!(!default_uuids.contains(&embedder_uuid));
+    assert!(!default_uuids.contains(&nested_uuid));
+    assert!(!default_uuids.contains(&hidden_llm_uuid));
+    assert!(!default_uuids.contains(&hidden_mark_uuid));
+
+    let diagnostic_events = collect_events_for_atif(
+        &events,
+        AtifExportOptions {
+            include_non_primary_llm_calls: true,
+        },
+    );
+    assert_eq!(diagnostic_events.len(), events.len());
+    assert_eq!(
+        diagnostic_events
+            .iter()
+            .map(|event| event.uuid())
+            .collect::<Vec<_>>(),
+        events.iter().map(Event::uuid).collect::<Vec<_>>()
+    );
+
+    let exporter = AtifExporter::new("session-1".to_string(), make_agent_info());
+    let subscriber = exporter.subscriber();
+    for event in &events {
+        subscriber(event);
+    }
+
+    let default_trajectory = exporter.export().unwrap();
+    assert_eq!(default_trajectory.steps.len(), 2);
+    let default_metrics = default_trajectory.final_metrics.unwrap();
+    assert_eq!(default_metrics.total_prompt_tokens, Some(1));
+    assert_eq!(default_metrics.total_completion_tokens, Some(2));
+
+    let diagnostic_trajectory = exporter
+        .export_with_options(AtifExportOptions {
+            include_non_primary_llm_calls: true,
+        })
+        .unwrap();
+    assert_eq!(diagnostic_trajectory.steps.len(), 4);
+    let diagnostic_metrics = diagnostic_trajectory.final_metrics.unwrap();
+    assert_eq!(diagnostic_metrics.total_prompt_tokens, Some(101));
+    assert_eq!(diagnostic_metrics.total_completion_tokens, Some(202));
 }
 
 #[test]

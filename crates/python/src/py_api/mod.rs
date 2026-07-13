@@ -8,6 +8,7 @@
 //! The Python wrapper modules (`nemo_relay.scope`, `nemo_relay.tools`, etc.)
 //! re-export these under shorter, idiomatic names.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use nemo_relay::api::llm as core_llm_api;
@@ -753,6 +754,138 @@ fn llm_call_execute<'py>(
                     .response_codec_opt(response_codec_arc)
                     .build();
                 let result = core_llm_api::llm_call_execute(params)
+                    .await
+                    .map_err(to_py_err)?;
+                Python::attach(|py| json_to_py(py, &result))
+            })
+            .await
+    })
+}
+
+/// Execute a V2 LLM call with explicit routing context and optional replay.
+///
+/// This is additive to ``llm_call_execute``. The API family, call role, and
+/// sanitized routing metadata are explicit and are copied into one immutable
+/// execution-context snapshot. When supplied, ``replay_factory`` is a
+/// synchronous callable that receives that snapshot and returns a replay
+/// transport descriptor.
+///
+/// Args:
+///     name: Model/provider name.
+///     request: An ``LlmRequest`` with headers and content.
+///     func: A sync or async provider callable ``(LlmRequest) -> object``.
+///     api_family: Closed provider family string.
+///     call_role: One of ``primary``, ``shadow``, or ``judge``.
+///     sanitized_metadata: Non-secret routing metadata mapping.
+///     tenant_id: Optional stable tenant routing identity.
+///     agent_id: Optional stable agent routing identity.
+///     replay_factory: Optional synchronous replay-transport factory.
+///     handle: Optional parent scope handle.
+///     attributes: Optional ``LlmAttributes`` bitflags.
+///     data: Optional JSON-serializable application data.
+///     metadata: Optional JSON-serializable event metadata.
+///     model_name: Optional normalized model name.
+///     codec: Optional annotated request codec.
+///     response_codec: Optional annotated response codec.
+///
+/// Returns:
+///     An awaitable resolving to the managed LLM response.
+#[pyfunction]
+#[pyo3(signature = (
+    name: "str",
+    request: "LlmRequest",
+    func: "object",
+    *,
+    api_family: "str",
+    call_role: "str",
+    sanitized_metadata: "object",
+    tenant_id: "str | None"=None,
+    agent_id: "str | None"=None,
+    replay_factory: "object | None"=None,
+    handle: "ScopeHandle | None"=None,
+    attributes: "LlmAttributes | None"=None,
+    data: "object | None"=None,
+    metadata: "object | None"=None,
+    model_name: "str | None"=None,
+    codec: "object | None"=None,
+    response_codec: "object | None"=None
+) -> "object", text_signature = "(name: str, request: LlmRequest, func: object, *, api_family: str, call_role: str, sanitized_metadata: object, tenant_id: str | None = None, agent_id: str | None = None, replay_factory: object | None = None, handle: ScopeHandle | None = None, attributes: LlmAttributes | None = None, data: object | None = None, metadata: object | None = None, model_name: str | None = None, codec: object | None = None, response_codec: object | None = None) -> object")]
+#[allow(clippy::too_many_arguments)]
+fn llm_call_execute_v2<'py>(
+    py: Python<'py>,
+    name: String,
+    request: PyLLMRequest,
+    func: Py<PyAny>,
+    api_family: String,
+    call_role: String,
+    sanitized_metadata: &Bound<'py, PyAny>,
+    tenant_id: Option<String>,
+    agent_id: Option<String>,
+    replay_factory: Option<&Bound<'py, PyAny>>,
+    handle: Option<PyScopeHandle>,
+    attributes: Option<PyLLMAttributes>,
+    data: Option<&Bound<'py, PyAny>>,
+    metadata: Option<&Bound<'py, PyAny>>,
+    model_name: Option<String>,
+    codec: Option<&Bound<'py, PyAny>>,
+    response_codec: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let api_family =
+        serde_json::from_value::<core_llm_api::LlmApiFamily>(serde_json::Value::String(api_family))
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("unsupported api_family"))?;
+    let call_role =
+        serde_json::from_value::<core_llm_api::LlmCallRole>(serde_json::Value::String(call_role))
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("unsupported call_role"))?;
+    let sanitized_metadata = match py_to_json(sanitized_metadata)? {
+        serde_json::Value::Object(metadata) => metadata.into_iter().collect::<BTreeMap<_, _>>(),
+        _ => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "sanitized_metadata must be a mapping",
+            ));
+        }
+    };
+
+    let attrs = attributes
+        .map(|attributes| attributes.inner)
+        .unwrap_or(LlmAttributes::empty());
+    let data_json = opt_py_to_json(data)?;
+    let metadata_json = opt_py_to_json(metadata)?;
+    let exec_fn = py_callable::wrap_py_llm_exec_fn(func);
+    let default_fn: LlmExecutionNextFn = Arc::new(move |request| exec_fn(request));
+    let parent_handle = handle
+        .map(|handle| handle.inner)
+        .unwrap_or_else(task_scope_top);
+    let codec_arc: Option<Arc<dyn LlmCodec>> = codec.map(|codec| {
+        Arc::new(py_callable::PyLlmCodecWrapper {
+            py_codec: codec.clone().unbind(),
+        }) as Arc<dyn LlmCodec>
+    });
+    let response_codec_arc = py_llm_response_codec(response_codec);
+    let replay_factory = crate::py_replay::wrap_py_replay_factory(py, replay_factory)?;
+
+    let scope_stack = current_scope_stack_handle();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        TASK_SCOPE_STACK
+            .scope(scope_stack, async move {
+                let params = core_llm_api::LlmCallExecuteV2Params::builder()
+                    .name(name)
+                    .request(request.inner)
+                    .func(default_fn)
+                    .api_family(api_family)
+                    .call_role(call_role)
+                    .sanitized_metadata(sanitized_metadata)
+                    .parent(parent_handle)
+                    .attributes(attrs)
+                    .data_opt(data_json)
+                    .metadata_opt(metadata_json)
+                    .model_name_opt(model_name)
+                    .codec_opt(codec_arc)
+                    .response_codec_opt(response_codec_arc)
+                    .tenant_id_opt(tenant_id)
+                    .agent_id_opt(agent_id)
+                    .replay_factory_opt(replay_factory)
+                    .build();
+                let result = core_llm_api::llm_call_execute_v2(params)
                     .await
                     .map_err(to_py_err)?;
                 Python::attach(|py| json_to_py(py, &result))
@@ -1707,6 +1840,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(llm_call, m)?)?;
     m.add_function(wrap_pyfunction!(llm_call_end, m)?)?;
     m.add_function(wrap_pyfunction!(llm_call_execute, m)?)?;
+    m.add_function(wrap_pyfunction!(llm_call_execute_v2, m)?)?;
     m.add_function(wrap_pyfunction!(llm_stream_call_execute, m)?)?;
 
     // Tool guardrails

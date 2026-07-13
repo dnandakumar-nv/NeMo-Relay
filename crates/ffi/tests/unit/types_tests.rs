@@ -567,6 +567,7 @@ fn test_annotated_event_accessors_and_codec_handles() {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

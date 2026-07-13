@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use opentelemetry::KeyValue;
+use opentelemetry::{KeyValue, trace::SpanKind};
 use opentelemetry_sdk::trace::{InMemorySpanExporterBuilder, SdkTracerProvider, SpanData};
 use serde_json::json;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ use crate::api::event::{
     BaseEvent, CategoryProfile, Event, EventCategory, EventNormalizationExt, ScopeCategory,
     ScopeEvent,
 };
+use crate::api::scope::ScopeType;
 use crate::codec::model_pricing::pricing_test_mutex;
 use crate::codec::response::{
     PricingCatalog, PricingResolver, reset_active_pricing_resolver, set_active_pricing_resolver,
@@ -266,6 +267,79 @@ fn run_llm_scenario(request_content: Json, output: Json) -> ParityExports {
         llm_start(uuid, "model-call", request_content),
         llm_end(uuid, "model-call", output),
     ])
+}
+
+#[test]
+fn test_embedder_scope_remains_visible_in_trace_exporters() {
+    let uuid = Uuid::now_v7();
+    let metadata = json!({
+        "profile_id": "embedding-main",
+        "vector_space_id": "space-1",
+        "canonical_query_hashes": ["query-hash"],
+        "embedding_job_ids": ["job-1"],
+    });
+    let event = |scope_category| {
+        Event::Scope(ScopeEvent::new(
+            BaseEvent::builder()
+                .uuid(uuid)
+                .name("nemo_relay.router.embedder")
+                .metadata(metadata.clone())
+                .build(),
+            scope_category,
+            Vec::new(),
+            EventCategory::embedder(),
+            None,
+        ))
+    };
+    let exports =
+        export_through_all_exporters(&[event(ScopeCategory::Start), event(ScopeCategory::End)]);
+
+    assert!(exports.trajectory.steps.is_empty());
+    assert_eq!(exports.otel_spans.len(), 1);
+    assert_eq!(exports.openinference_spans.len(), 1);
+
+    let otel_span = &exports.otel_spans[0];
+    assert_eq!(otel_span.name.as_ref(), "nemo_relay.router.embedder");
+    assert_eq!(otel_span.span_kind, SpanKind::Client);
+    let otel = attr_map(&otel_span.attributes);
+    assert_eq!(
+        otel.get("nemo_relay.scope_type"),
+        Some(&ScopeType::Embedder.as_str().to_string())
+    );
+    assert_eq!(
+        serde_json::from_str::<Json>(otel.get("nemo_relay.start.metadata_json").unwrap()).unwrap(),
+        metadata
+    );
+
+    let openinference_span = &exports.openinference_spans[0];
+    assert_eq!(
+        openinference_span.name.as_ref(),
+        "nemo_relay.router.embedder"
+    );
+    assert_eq!(openinference_span.span_kind, SpanKind::Client);
+    assert_eq!(
+        openinference_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "nemo_relay.scope_type")
+            .map(|attribute| attribute.value.to_string()),
+        Some(ScopeType::Embedder.as_str().to_string())
+    );
+    assert_eq!(
+        openinference_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "openinference.span.kind")
+            .map(|attribute| attribute.value.to_string()),
+        Some("EMBEDDING".to_string())
+    );
+    let openinference_metadata = openinference_span
+        .attributes
+        .iter()
+        .filter(|attribute| attribute.key.as_str() == "metadata")
+        .map(|attribute| serde_json::from_str::<Json>(&attribute.value.to_string()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(openinference_metadata, vec![metadata.clone(), metadata]);
 }
 
 // Shared provider-shaped payloads: the same logical call (one user message,

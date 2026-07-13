@@ -78,6 +78,7 @@ fn make_annotated_llm_event(name: &str) -> Event {
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

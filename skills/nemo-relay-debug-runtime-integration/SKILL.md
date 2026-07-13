@@ -60,6 +60,33 @@ working.
 - **Plugin validation failure**: validate config independently from runtime
   registration and check required fields, value types, defaults, and config
   source.
+- **Replay transport missing in a V2 intercept**: inspect the
+  `nemo_relay.replay_ineligible` mark reason. If there is no mark, confirm that
+  the call supplied a replay factory. Check the `Primary` role, ensure the call
+  is not marked `STREAMING` or `STATEFUL`, and check contract version `1`, the
+  exact API family, and the non-secret transport identity. Factory failures
+  intentionally do not expose their error text or fail the anchor call.
+- **Shadow or Judge context rejected**: create the internal managed call under
+  an immediate `Evaluator` parent and put a valid string `anchor_uuid` in
+  sanitized metadata. Do not attach another replay factory.
+- **Plugin clear returns a conflict**: do not clear or replace configuration
+  from a subscriber callback. If a synchronous clear races another transition,
+  retry from the host lifecycle path after that transition completes.
+- **Background work starts after clear**: verify that the component closes
+  intake before queue submission and checks again immediately before each
+  internal managed call or replay start.
+- **Router CLI cannot open inspection**: run `nemo-relay router status --json`
+  first. Confirm the merged plugin config contains exactly one enabled Router,
+  then inspect the reported database state. Do not migrate or repair the
+  private ledger with direct SQL.
+- **Router mutation returns conflict or busy**: inspect current status and the
+  durable operator history before issuing another mutation. The CLI does not
+  retry generation conflicts, and only one standalone mutation process is
+  admitted per database.
+- **Router neighborhood request cannot call an embedder**: the CLI is
+  provider-free. Use a Rust inspection service whose host explicitly enabled
+  request embedding and whose Router config permits the endpoint, or use an
+  evidence/query-hash lookup.
 - **Adaptive behavior unchanged**: confirm instrumentation emits events, the
   adaptive component is enabled, policy allows the behavior, and the call path
   reaches the configured component.
@@ -76,3 +103,4 @@ working.
 - `nemo-relay-use-context-isolation`
 - `nemo-relay-tune-adaptive-config`
 - `nemo-relay-build-plugin`
+- `nemo-relay-operate-router`

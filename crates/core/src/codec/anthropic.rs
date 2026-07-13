@@ -23,8 +23,9 @@ use crate::error::{FlowError, Result};
 use crate::json::Json;
 
 use super::request::{
-    AnnotatedLlmRequest, FunctionDefinition, GenerationParams, Message, MessageContent, ToolChoice,
-    ToolChoiceFunction, ToolChoiceFunctionName, ToolDefinition,
+    AnnotatedLlmRequest, FunctionDefinition, GenerationParams, Message, MessageContent,
+    StructuredResponseFormat, StructuredResponseFormatKind, ToolChoice, ToolChoiceFunction,
+    ToolChoiceFunctionName, ToolDefinition,
 };
 use super::resolve::{ProviderSurface, ProviderSurfaceDescriptor};
 use super::response::{
@@ -126,9 +127,146 @@ const MODELED_REQUEST_KEYS: &[&str] = &[
     "stop_sequences",
     "tools",
     "tool_choice",
+    "output_config",
     "metadata",
     "service_tier",
 ];
+
+const NATIVE_WRAPPER_KEY: &str = "native_wrapper";
+const NATIVE_FORMAT_KEY: &str = "native_format";
+const UNSUPPORTED_SYSTEM_KEY: &str = "_anthropic_messages_unsupported_system";
+
+fn response_format_error(message: impl Into<String>) -> FlowError {
+    FlowError::Internal(format!(
+        "Anthropic Messages output_config.format decode: {}",
+        message.into()
+    ))
+}
+
+fn structured_extra(
+    native_wrapper: serde_json::Map<String, Json>,
+    native_format: serde_json::Map<String, Json>,
+) -> serde_json::Map<String, Json> {
+    let mut extra = serde_json::Map::new();
+    if !native_wrapper.is_empty() {
+        extra.insert(NATIVE_WRAPPER_KEY.into(), Json::Object(native_wrapper));
+    }
+    if !native_format.is_empty() {
+        extra.insert(NATIVE_FORMAT_KEY.into(), Json::Object(native_format));
+    }
+    extra
+}
+
+fn decode_anthropic_response_format(
+    output_config: Option<&Json>,
+) -> Result<Option<StructuredResponseFormat>> {
+    let Some(output_config) = output_config.and_then(Json::as_object) else {
+        return Ok(None);
+    };
+    let Some(format) = output_config.get("format").and_then(Json::as_object) else {
+        return Ok(None);
+    };
+    let Some(kind) = format.get("type").and_then(Json::as_str) else {
+        return Ok(None);
+    };
+    if kind != "json_schema" {
+        return Ok(None);
+    }
+
+    let schema = format
+        .get("schema")
+        .filter(|schema| !schema.is_null())
+        .cloned()
+        .ok_or_else(|| response_format_error("schema is required"))?;
+    let native_wrapper = output_config
+        .iter()
+        .filter(|(key, _)| key.as_str() != "format")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let native_format = format
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "type" | "schema"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    Ok(Some(StructuredResponseFormat {
+        kind: StructuredResponseFormatKind::JsonSchema,
+        name: None,
+        schema: Some(schema),
+        strict: None,
+        extra: structured_extra(native_wrapper, native_format),
+    }))
+}
+
+fn native_extra_map(
+    format: &StructuredResponseFormat,
+    key: &str,
+) -> Result<serde_json::Map<String, Json>> {
+    match format.extra.get(key) {
+        Some(Json::Object(extra)) => Ok(extra.clone()),
+        Some(_) => Err(FlowError::Internal(format!(
+            "Anthropic Messages output_config.format encode: {key} must be an object"
+        ))),
+        None => Ok(serde_json::Map::new()),
+    }
+}
+
+fn validate_native_extra_keys(format: &StructuredResponseFormat) -> Result<()> {
+    if let Some(key) = format
+        .extra
+        .keys()
+        .find(|key| !matches!(key.as_str(), NATIVE_WRAPPER_KEY | NATIVE_FORMAT_KEY))
+    {
+        return Err(FlowError::Internal(format!(
+            "Anthropic Messages output_config.format encode: unsupported extra key {key}"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_format_field(
+    obj: &mut serde_json::Map<String, Json>,
+    key: &str,
+    value: Json,
+) -> Result<()> {
+    if obj.contains_key(key) {
+        return Err(FlowError::Internal(format!(
+            "Anthropic Messages output_config.format encode: native extra conflicts with {key}"
+        )));
+    }
+    obj.insert(key.into(), value);
+    Ok(())
+}
+
+fn encode_anthropic_response_format(format: &StructuredResponseFormat) -> Result<Json> {
+    validate_native_extra_keys(format)?;
+    if format.kind != StructuredResponseFormatKind::JsonSchema {
+        return Err(FlowError::Internal(
+            "Anthropic Messages output_config.format encode: json_object is unsupported".into(),
+        ));
+    }
+    if format.name.is_some() || format.strict.is_some() {
+        return Err(FlowError::Internal(
+            "Anthropic Messages output_config.format encode: name and strict are unsupported"
+                .into(),
+        ));
+    }
+    let schema = format
+        .schema
+        .as_ref()
+        .filter(|schema| !schema.is_null())
+        .ok_or_else(|| {
+            FlowError::Internal(
+                "Anthropic Messages output_config.format encode: schema is required".into(),
+            )
+        })?;
+
+    let mut output_config = native_extra_map(format, NATIVE_WRAPPER_KEY)?;
+    let mut descriptor = native_extra_map(format, NATIVE_FORMAT_KEY)?;
+    insert_format_field(&mut descriptor, "type", Json::String("json_schema".into()))?;
+    insert_format_field(&mut descriptor, "schema", schema.clone())?;
+    insert_format_field(&mut output_config, "format", Json::Object(descriptor))?;
+    Ok(Json::Object(output_config))
+}
 
 /// Decode the Anthropic `tool_choice` JSON value into a normalized [`ToolChoice`].
 ///
@@ -222,6 +360,19 @@ fn extract_system_message(system_val: &Json) -> Option<Message> {
     }
 }
 
+fn is_supported_system_representation(system: &Json) -> bool {
+    match system {
+        Json::String(_) => true,
+        Json::Array(blocks) => matches!(
+            blocks.as_slice(),
+            [block]
+                if block.get("type").and_then(Json::as_str) == Some("text")
+                    && block.get("text").is_some_and(Json::is_string)
+        ),
+        _ => false,
+    }
+}
+
 /// Extract system text from a [`Message::System`] for encoding back to top-level.
 fn extract_system_text(msg: &Message) -> Option<String> {
     match msg {
@@ -250,19 +401,75 @@ fn extract_system_text(msg: &Message) -> Option<String> {
     }
 }
 
-fn split_system_and_messages(messages: &[Message]) -> (Option<String>, Vec<&Message>) {
-    let mut system_text = None;
+fn split_system_and_messages(messages: &[Message]) -> Result<(Option<&Message>, Vec<&Message>)> {
+    let mut system_message = None;
     let mut non_system_messages = Vec::new();
 
-    for msg in messages {
-        if let Some(text) = extract_system_text(msg) {
-            system_text = Some(text);
-        } else {
-            non_system_messages.push(msg);
+    for (index, msg) in messages.iter().enumerate() {
+        match msg {
+            Message::System { .. } if index == 0 && system_message.is_none() => {
+                system_message = Some(msg);
+            }
+            Message::System { .. } => {
+                return Err(FlowError::Internal(
+                    "Anthropic Messages encode: system instructions must be first and unique"
+                        .into(),
+                ));
+            }
+            Message::Developer { .. } => {
+                return Err(FlowError::Internal(
+                    "Anthropic Messages encode: developer messages are unsupported".into(),
+                ));
+            }
+            _ => non_system_messages.push(msg),
         }
     }
 
-    (system_text, non_system_messages)
+    Ok((system_message, non_system_messages))
+}
+
+fn original_messages_match(obj: &serde_json::Map<String, Json>, messages: &[&Message]) -> bool {
+    match obj.get("messages") {
+        Some(original) => {
+            serde_json::from_value::<Vec<Message>>(original.clone()).is_ok_and(|decoded| {
+                decoded.len() == messages.len()
+                    && decoded
+                        .iter()
+                        .zip(messages)
+                        .all(|(decoded, message)| decoded == *message)
+            })
+        }
+        None => messages.is_empty(),
+    }
+}
+
+fn encode_anthropic_system(
+    obj: &mut serde_json::Map<String, Json>,
+    system_message: Option<&Message>,
+) -> Result<()> {
+    let original_system = obj.get("system").cloned();
+    let original_message = original_system.as_ref().and_then(extract_system_message);
+
+    match system_message {
+        Some(message) if original_message.as_ref() == Some(message) => {
+            // Keep the original string or content-block array, including cache controls.
+        }
+        Some(message) => {
+            let text = extract_system_text(message).ok_or_else(|| {
+                FlowError::Internal(
+                    "Anthropic Messages encode: system content must contain only text".into(),
+                )
+            })?;
+            obj.insert("system".into(), Json::String(text));
+        }
+        None if original_system.is_some() && original_message.is_none() => {
+            // Preserve an unrecognized native system value rather than silently dropping it.
+        }
+        None => {
+            obj.remove("system");
+        }
+    }
+    Ok(())
 }
 
 fn insert_serialized<T: serde::Serialize>(
@@ -289,10 +496,15 @@ fn overlay_generation_params(obj: &mut serde_json::Map<String, Json>, params: &G
     }
 }
 
-fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Vec<Json> {
+fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Result<Vec<Json>> {
     tools
         .iter()
         .map(|td| {
+            if td.function.strict.is_some() {
+                return Err(FlowError::Internal(
+                    "Anthropic Messages tools encode: strict is unsupported".into(),
+                ));
+            }
             let mut tool = serde_json::Map::new();
             tool.insert("name".into(), Json::String(td.function.name.clone()));
             if let Some(ref desc) = td.function.description {
@@ -301,9 +513,43 @@ fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Vec<Json> {
             if let Some(ref params) = td.function.parameters {
                 tool.insert("input_schema".into(), params.clone());
             }
-            Json::Object(tool)
+            Ok(Json::Object(tool))
         })
         .collect()
+}
+
+fn decode_anthropic_tools(value: Option<&Json>) -> Result<Option<Vec<ToolDefinition>>> {
+    let Some(tools) = value.and_then(Json::as_array) else {
+        return Ok(None);
+    };
+
+    let mut definitions = Vec::new();
+    for tool in tools {
+        if tool.get("strict").is_some() {
+            return Err(FlowError::Internal(
+                "Anthropic Messages tools decode: strict is unsupported".into(),
+            ));
+        }
+        let Some(name) = tool.get("name").and_then(Json::as_str) else {
+            continue;
+        };
+        let description = tool
+            .get("description")
+            .and_then(Json::as_str)
+            .map(String::from);
+        let parameters = tool.get("input_schema").cloned();
+        definitions.push(ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description,
+                parameters,
+                strict: None,
+            },
+        });
+    }
+
+    Ok((!definitions.is_empty()).then_some(definitions))
 }
 
 fn anthropic_text_message(content_blocks: Option<&[Json]>) -> Option<MessageContent> {
@@ -433,13 +679,29 @@ impl LlmCodec for AnthropicMessagesCodec {
             .ok_or_else(|| FlowError::Internal("request content is not an object".into()))?;
 
         // Extract system from top-level field.
-        let system_msg = obj.get("system").and_then(extract_system_message);
+        let system = obj.get("system");
+        let system_msg = system.and_then(extract_system_message);
+        let unsupported_system =
+            system.is_some_and(|value| !is_supported_system_representation(value));
 
         // Extract messages (default to empty vec if absent).
         let mut messages: Vec<Message> = obj
             .get("messages")
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| {
+                FlowError::Internal(format!("Anthropic Messages messages decode: {error}"))
+            })?
             .unwrap_or_default();
+        if messages
+            .iter()
+            .any(|message| matches!(message, Message::System { .. } | Message::Developer { .. }))
+        {
+            return Err(FlowError::Internal(
+                "Anthropic Messages messages decode: system and developer roles are unsupported"
+                    .into(),
+            ));
+        }
 
         // Prepend system message if present.
         if let Some(sys) = system_msg {
@@ -448,6 +710,8 @@ impl LlmCodec for AnthropicMessagesCodec {
 
         // Extract model.
         let model = obj.get("model").and_then(|v| v.as_str()).map(String::from);
+
+        let response_format = decode_anthropic_response_format(obj.get("output_config"))?;
 
         // Extract generation params.
         let temperature = obj.get("temperature").and_then(|v| v.as_f64());
@@ -472,29 +736,7 @@ impl LlmCodec for AnthropicMessagesCodec {
 
         // Extract tools: Anthropic uses flat structure (name, description, input_schema).
         // Normalize to ToolDefinition { type: "function", function: { name, description, parameters } }.
-        let tools: Option<Vec<ToolDefinition>> = obj.get("tools").and_then(|v| {
-            let arr = v.as_array()?;
-            let defs: Vec<ToolDefinition> = arr
-                .iter()
-                .filter_map(|tool| {
-                    let name = tool.get("name")?.as_str()?.to_string();
-                    let description = tool
-                        .get("description")
-                        .and_then(|d| d.as_str())
-                        .map(String::from);
-                    let parameters = tool.get("input_schema").cloned();
-                    Some(ToolDefinition {
-                        tool_type: "function".into(),
-                        function: FunctionDefinition {
-                            name,
-                            description,
-                            parameters,
-                        },
-                    })
-                })
-                .collect();
-            if defs.is_empty() { None } else { Some(defs) }
-        });
+        let tools = decode_anthropic_tools(obj.get("tools"))?;
 
         // Extract tool_choice: Anthropic format.
         let tool_choice = obj
@@ -503,11 +745,17 @@ impl LlmCodec for AnthropicMessagesCodec {
         let parallel_tool_calls = obj.get("tool_choice").and_then(decode_parallel_tool_calls);
 
         // Collect extra fields (keys not in MODELED_REQUEST_KEYS).
-        let extra: serde_json::Map<String, Json> = obj
+        let mut extra: serde_json::Map<String, Json> = obj
             .iter()
-            .filter(|(k, _)| !MODELED_REQUEST_KEYS.contains(&k.as_str()))
+            .filter(|(k, _)| {
+                !MODELED_REQUEST_KEYS.contains(&k.as_str())
+                    || (k.as_str() == "output_config" && response_format.is_none())
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        if unsupported_system {
+            extra.insert(UNSUPPORTED_SYSTEM_KEY.into(), Json::Bool(true));
+        }
 
         Ok(AnnotatedLlmRequest {
             messages,
@@ -515,6 +763,7 @@ impl LlmCodec for AnthropicMessagesCodec {
             params,
             tools,
             tool_choice,
+            response_format,
             store: None,
             previous_response_id: None,
             truncation: None,
@@ -541,14 +790,13 @@ impl LlmCodec for AnthropicMessagesCodec {
             .as_object_mut()
             .ok_or_else(|| FlowError::Internal("original content is not an object".into()))?;
 
-        let (system_text, non_system_messages) = split_system_and_messages(&annotated.messages);
+        let (system_message, non_system_messages) = split_system_and_messages(&annotated.messages)?;
+        encode_anthropic_system(obj, system_message)?;
 
-        if let Some(text) = system_text {
-            obj.insert("system".into(), Json::String(text));
+        // Keep native message extensions when only another request field changed.
+        if !original_messages_match(obj, &non_system_messages) {
+            insert_serialized(obj, "messages", &non_system_messages, "messages")?;
         }
-
-        // Overlay messages (non-system only).
-        insert_serialized(obj, "messages", &non_system_messages, "messages")?;
 
         // Overlay model if present.
         if let Some(ref model) = annotated.model {
@@ -567,7 +815,7 @@ impl LlmCodec for AnthropicMessagesCodec {
         // Overlay tools in Anthropic format: { name, description, input_schema }.
         // Denormalize from ToolDefinition (drop type/function wrapper, rename parameters -> input_schema).
         if let Some(ref tools) = annotated.tools {
-            let anthropic_tools = encode_anthropic_tools(tools);
+            let anthropic_tools = encode_anthropic_tools(tools)?;
             insert_serialized(obj, "tools", &anthropic_tools, "tools")?;
         }
 
@@ -586,9 +834,26 @@ impl LlmCodec for AnthropicMessagesCodec {
             obj.insert("service_tier".into(), Json::String(service_tier.clone()));
         }
 
+        if annotated.response_format.is_some() && annotated.extra.contains_key("output_config") {
+            return Err(FlowError::Internal(
+                "Anthropic Messages output_config.format encode: typed and generic representations conflict"
+                    .into(),
+            ));
+        }
+        if let Some(response_format) = &annotated.response_format {
+            obj.insert(
+                "output_config".into(),
+                encode_anthropic_response_format(response_format)?,
+            );
+        } else if !annotated.extra.contains_key("output_config") {
+            obj.remove("output_config");
+        }
+
         // Merge extra fields back.
         for (k, v) in &annotated.extra {
-            obj.insert(k.clone(), v.clone());
+            if k != UNSUPPORTED_SYSTEM_KEY {
+                obj.insert(k.clone(), v.clone());
+            }
         }
 
         Ok(LlmRequest {

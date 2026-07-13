@@ -49,6 +49,60 @@ payload schemas. It removes only hop-by-hop transport headers, forwards
 streaming responses as streams, and emits NeMo Relay LLM start and end events
 under the active session scope.
 
+Buffered requests to Responses, Chat Completions, and Anthropic Messages use
+the V2 managed-call path. The gateway supplies an explicit provider family,
+`primary` call role, and a delayed replay transport whose resolved endpoint,
+authentication, TLS, proxy, and protected-header policy is frozen for the
+call. Each replay invocation is independent and non-streaming. Streaming
+requests remain on the streaming managed path, and model-list and token-count
+routes do not expose replay capability.
+
+For a buffered route, every non-2xx response is presented to managed
+middleware as an error. The external client still receives the upstream status,
+allowed headers, and body when they fit `max_passthrough_body_bytes`, 256
+headers, and 64 KiB of header names and values. Redirects are not followed. A
+body or header overflow returns `502` with `upstream_response_too_large` and no
+partial upstream body.
+
+The bundled CLI registers Router before plugin validation and initialization.
+An enabled `router` component can therefore use these buffered V2 routes for
+Shadow evaluation, recommendations, or bounded Active canaries. Streaming,
+model-list, and token-count routes remain Router-ineligible. Gateway shutdown
+uses bounded asynchronous plugin clear so Router can drain owned work.
+
+## Router Inspection and Control
+
+Inspect an enabled Router component without starting the gateway:
+
+```bash
+nemo-relay router status --json
+nemo-relay router pools --limit 100 --json
+nemo-relay router evidence list --pool support --json
+nemo-relay router decisions tail --follow --json
+```
+
+Export verified redacted evidence as JSON Lines or CSV:
+
+```bash
+nemo-relay router evidence export - --format jsonl
+nemo-relay router evidence export evidence.csv --format csv
+```
+
+Use generation-checked operator commands with an explicit audit reason:
+
+```bash
+nemo-relay router pause --reason "maintenance"
+nemo-relay router resume --reason "maintenance complete"
+nemo-relay router force-anchor set --pool support --reason "provider incident"
+nemo-relay router reset --pool support --confirm my-project --reason "new corpus"
+nemo-relay router cohort rotate --confirm my-project --reason "new cohort"
+```
+
+The CLI derives the actor from the OS principal unless `--actor` is present.
+It submits one mutation and never retries a conflict. Refer to [Use Router CLI
+and HTTP](/router/cli-and-http) for exact syntax, filters, JSON output, export
+behavior, exit codes, and the optional authenticated HTTP adapter.
+
 ## Transparent Run
 
 Use the agent shortcuts for no-install local observability. The wrapper starts
@@ -141,6 +195,14 @@ Select **No** to finish after saving `config.toml`. Canceling the prompt or
 leaving the plugin editor does not remove the saved base configuration. You can
 open the plugin editor again later with `nemo-relay plugins edit`, or use
 `nemo-relay plugins edit --project` for project configuration.
+
+Router is also a built-in entry in `nemo-relay plugins edit`. Run
+`nemo-relay doctor` to check Router registration, SQLite and sqlite-vec native
+capability, V2 route support, configured mode and queue capacity, database
+directory and schema readiness, embedding egress, and Active control and
+outcome-policy readiness. Doctor reads the same plugin configuration layers as
+gateway startup, does not call a model provider, and does not migrate or create
+the Router database.
 
 ## Add Model Pricing for Cost Estimates
 

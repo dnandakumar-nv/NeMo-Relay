@@ -143,6 +143,7 @@ fn acg_module_surface_policy_and_ir_builder_symbols_compile_from_canonical_names
         params: None,
         tools: None,
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,
@@ -198,9 +199,11 @@ fn acg_module_surface_build_prompt_ir_inserts_tool_schema_before_first_non_syste
                         "location": {"type": "string"}
                     }
                 })),
+                strict: None,
             },
         }]),
         tool_choice: None,
+        response_format: None,
         store: None,
         previous_response_id: None,
         truncation: None,

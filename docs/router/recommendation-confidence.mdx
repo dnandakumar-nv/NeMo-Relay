@@ -1,0 +1,342 @@
+---
+title: "Router Recommendation Confidence"
+sidebar-title: "Recommendation Confidence"
+description: "Understand Router warm-up, strict neighbor confidence, immutable decision audits, and anchor-only Recommend execution."
+position: 6
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 */}
+
+`recommend` is an observational Router mode. It computes and records a bounded
+decision about whether a model satisfies the configured confidence policy.
+Every completed, noncancelled intercept invokes the Primary continuation
+exactly once with the original anchor request and returns the anchor value or
+error unchanged.
+
+> [!IMPORTANT]
+> `recommend` does not rewrite the production request, serve a candidate,
+> execute the replay transport, or schedule Shadow work. A recorded candidate
+> is a recommendation for inspection and later rollout stages, not the model
+> that handled the current call.
+
+## Warm Up Evidence in Shadow Mode
+
+A pool has one of four version-1 learning shapes:
+
+- No `learning` table, which disables vector evidence for the pool.
+- A minimal association with only `version` and `embedder`, which enables the
+  embedding and vector-materialization pipeline.
+- A complete confidence policy, which adds all 11 statistical fields described
+  in the next section.
+- A complete Active policy, which adds `retention_lower_bound`,
+  `holdout_probability`, and `active_canary_fraction` to the confidence policy.
+
+Supplying some, but not all, statistical fields is invalid in every mode.
+`shadow` accepts any learning shape and is the mode that creates new
+counterfactual evidence. `recommend` requires a complete policy for every
+pool. `active` requires the complete Active shape and a complete outcome
+policy.
+
+Warm up a complete policy in `shadow` mode before changing only `mode` to
+`recommend`. Mode is excluded from the pool policy identity, so this mode-only
+transition preserves the pool policy version, learning generation, and strict
+evidence partition. Changing a statistical field, candidate fact, fixed
+algorithm identifier, or Beta implementation rotates the policy identity.
+
+Recommend mode does not replenish evidence. Continue collecting evidence in a
+Shadow deployment when the retained neighborhood is too sparse, has too few
+independent roots, or has insufficient coverage.
+
+Active reruns this same query-local recommendation calculation before every
+randomized admission, then applies additional outcome, authorization, cap, and
+control gates. Refer to [Active Canary and
+Outcomes](/router/active-canary-and-outcomes) for that contract.
+
+## Configure the Complete Policy
+
+The following fragment shows every required statistical field:
+
+```toml
+[components.config.pools.learning]
+version = 1
+embedder = "local-embedding-v1"
+top_k = 32
+radius = 0.35
+min_points = 12
+min_independent_roots = 8
+min_effective_samples = 6.0
+min_coverage = 0.8
+time_decay_half_life_seconds = 604800.0
+prior_success = 1.0
+prior_failure = 1.0
+familywise_credible_level = 0.95
+promotion_lower_bound = 0.9
+```
+
+The fields have the following version-1 bounds:
+
+| Field | Rule |
+|---|---|
+| `top_k` | Integer in `[1, 4095]`. |
+| `radius` | Finite distance in `(0, 2]`. |
+| `min_points` | Integer in `[1, top_k]`. |
+| `min_independent_roots` | Integer in `[1, top_k]`. |
+| `min_effective_samples` | Finite value in `(0, top_k]`. |
+| `min_coverage` | Finite value in `[0, 1]`. |
+| `time_decay_half_life_seconds` | Positive finite value. |
+| `prior_success` | Positive finite Beta success shape. |
+| `prior_failure` | Positive finite Beta failure shape. |
+| `familywise_credible_level` | Finite value in `(0.5, 1)`. |
+| `promotion_lower_bound` | Finite value in `[0, 1]`. |
+
+A complete policy supports at most 64 configured candidates, and the checked
+product `candidate_count * top_k` must not exceed `4095`. One decision command,
+including its prepared canonical query, candidate summaries, and neighbors,
+must not exceed 32 MiB. Router rejects overflow or an oversized decision
+instead of truncating the candidate set or audit.
+
+Refer to [Router Configuration](/router/configuration) for the complete pool
+and embedder configuration.
+
+## Bound One Recommend Call
+
+Recommend preflight applies the same Primary, non-streaming, stateless, API
+family, replay-capability, request-bound, codec, capability, and context checks
+as Shadow preflight. It retains the complete capability-eligible candidate set
+for confidence. The Shadow-only `max_candidates_per_sample` prefix does not
+reduce the live candidate count, candidate-set hash, or candidate correction.
+
+Router reserves one of four process-wide recommendation and audit-delivery
+slots before expensive work. Saturation, shutdown, invalid input, provider
+failure, search uncertainty, numeric uncertainty, or delivery failure cannot
+change the anchor path.
+
+One absolute monotonic deadline begins at admission. The selected embedder
+profile's `timeout_ms` covers preflight, canonical query preparation,
+embedding, strict searches, CPU-stage checks, audit construction, and the first
+decision-write acknowledgement. A later stage does not reset the deadline.
+Exact retry of a frozen pending audit can continue after the foreground
+deadline under bounded writer slices and the shared shutdown deadline; Router
+does not rerun embedding, search, or confidence computation.
+
+Preflight can inspect immutable replay capability facts because API family and
+transport identity are part of the strict partition. Router drops executable
+replay authority immediately after preflight and before it builds the query.
+It never calls `replay.start` in Recommend mode.
+
+## Search One Exact Local Neighborhood
+
+Router prepares one authoritative canonical query and uses its exact frozen
+mapping and vector-space identity for embedding and search. Each candidate has
+one full `RoutingPartitionV1` containing tenant and agent policy hashes, pool
+policy, learning generation, API family, transport identity, anchor and
+candidate identities, decoding fingerprint, evaluator version, and vector
+space.
+
+Each search resolves the expected partition hash and complete canonical
+partition document in the same read transaction as generation resolution, KNN,
+and relational neighbor projection. Router does not query a broader partition,
+run global KNN and filter afterward, or fall back to a different vector space.
+A missing exact partition produces the candidate reason `no_partition`.
+Corrupt, unhealthy, stale-generation, or version-inconsistent search authority
+stops the decision and falls back to the anchor.
+
+The method is not DBSCAN and does not persist clusters. For each candidate,
+Router retrieves deterministic top-K rows, applies the configured inclusive
+distance radius, collapses eligible observations by independent trajectory
+root, and computes one local weighted Beta lower bound. A recommendation is
+therefore query-local and policy-local rather than cluster membership.
+
+Refer to [Router Embeddings and Vector Store](/router/embeddings-and-vector-store)
+for canonical query and partition fields, cache behavior, and index recovery.
+
+## Count Points, Roots, and Coverage
+
+Every returned top-K row remains in the immutable audit, including a row
+outside the radius or excluded from the numeric calculation. Within the radius:
+
+- `within_radius_count` counts every terminal evidence link, including
+  completed, deterministic-failure, operational-failure, cool-off, shutdown,
+  and orphaned outcomes.
+- `attempted_root_count` counts the distinct trajectory roots represented by
+  those terminal links.
+- The labeled subset requires a promotion-eligible `Pass` or `Fail` from the
+  exact evaluator policy. A Judge result must also have
+  `judge_confidence >= judge_confidence_floor`. A deterministic validator can
+  contribute only its deterministic `Fail` label and has no Judge confidence.
+- `labeled_root_count` counts distinct roots in that labeled subset.
+- `coverage` is `labeled_root_count / attempted_root_count`, or `0` when there
+  is no attempted root.
+
+At most one labeled observation from each root enters the weighted math.
+Router chooses the lowest distance, then the newest evaluation time, then the
+lexicographically smallest evaluation UUID. The selector does not inspect the
+`Pass` or `Fail` value. Other labeled observations from that root remain in the
+audit with `duplicate_root`.
+
+This distinction prevents repeated attempts from one trajectory root from
+masquerading as independent support. The points, roots, and coverage gates run
+before weighted confidence.
+
+## Compute Weighted Confidence
+
+For each selected root observation with distance `d`, radius `r`, age `a` in
+seconds, and configured half-life `h`, Router computes the following values:
+
+```text
+similarity_weight = max(0, 1 - d / r)
+time_weight       = 2^(-a / h)
+weight            = similarity_weight * time_weight
+p_hat             = sum(weight * binary_label) / sum(weight)
+n_eff             = sum(weight)^2 / sum(weight^2)
+beta_alpha        = prior_success + p_hat * n_eff
+beta_beta         = prior_failure + (1 - p_hat) * n_eff
+candidate_alpha   = (1 - familywise_credible_level) / live_candidate_count
+lower_bound       = BetaInverseCDF(candidate_alpha, beta_alpha, beta_beta)
+```
+
+`binary_label` is `1` for `Pass` and `0` for `Fail`. A selected labeled
+observation up to five minutes in the future receives age zero; a larger future
+skew stops the whole decision as `invalid_evidence_time`.
+
+Router orders numeric accumulation by evaluation UUID and uses Neumaier `f64`
+summation without fused multiply-add. Kish effective sample size is the
+approximation shown above. The Beta shapes use weighted `p_hat` and `n_eff`,
+not an unweighted event count. The Bonferroni tail probability uses the exact
+live candidate count, including candidates that later lack a partition.
+
+Version 1 pins `statrs` 0.18.0 without default features for the Beta inverse
+CDF. Both Beta shapes must be finite, positive, and no greater than 1,048,576.
+A nonfinite, uncertified, panicking, or out-of-range quantile becomes
+`numeric_error`; Router does not authorize a recommendation from uncertain
+math.
+
+A candidate passes only when all gates pass in this order: exact partition,
+minimum labeled points, minimum independent roots, minimum coverage, valid
+weight math, minimum effective samples, certified Beta quantile, and minimum
+lower bound.
+
+## Select the Cheapest Passing Candidate
+
+Router evaluates the complete eligible candidate set by `(cost_rank,
+candidate_id)`. The first candidate whose lower bound meets
+`promotion_lower_bound` is the recorded recommendation. Later summaries use
+`not_evaluated_after_winner` and contain no invented search or numeric result.
+
+Candidate summaries use the following terminal reasons:
+
+| Reason | Meaning |
+|---|---|
+| `no_partition` | The exact candidate partition does not exist. |
+| `sparse_points` | Too few eligible labeled points are inside the radius. |
+| `insufficient_roots` | Too few independent labeled roots are present. |
+| `low_coverage` | Labeled-root coverage is below policy. |
+| `insufficient_effective_samples` | Kish effective sample size is below policy. |
+| `lower_bound_below_threshold` | The certified lower bound does not pass. |
+| `invalid_evidence_time` | Evidence time exceeds the allowed future-skew contract. |
+| `numeric_error` | Weight or Beta math is invalid or uncertified. |
+| `passed` | The candidate passes every gate. |
+| `not_evaluated_after_winner` | A cheaper candidate already passed. |
+| `not_evaluated_after_fallback` | Global embedding, vector, version, time, or numeric uncertainty stopped later evaluation. |
+
+If no candidate passes, Router records `no_candidate_passed`. A passing
+decision records `recommend_observe_only`. In both cases, `served_model` and
+`served_model_revision` remain the anchor. Embedding, vector-health, and
+version failures have their own decision reasons and also serve the anchor.
+
+## Verify and Deliver the Decision Audit
+
+Every decision is one immutable aggregate containing:
+
+- A parent with process, policy, learning, query, vector-space, candidate-set,
+  recommended-model, served-model, timing, and final-reason identity.
+- Exactly one summary for every live eligible candidate, including every gate,
+  count, policy value, weighted statistic, Beta shape, lower bound, and
+  terminal reason that was evaluated.
+- Every returned neighbor with source identities, exact `f32` distance bits,
+  optional label and weight values, root-group ordinal, selection flag, and
+  exclusion reason.
+
+Finite floating-point values retain their authoritative IEEE-754 bits, and
+canonical parent, summary, neighbor, and aggregate hashes cover the complete
+graph. Loading the stored graph verifies counts, ordering, hashes, candidate
+membership, root selection, weight math, gates, reasons, and final winner. The
+stored evidence is sufficient to replay the same recommendation without
+calling a provider.
+
+The sole-writer transaction revalidates the live originating process, exact
+policy and learning generation, frozen mapping, canonical query, full
+partitions, candidate membership, and every referenced evidence fact before it
+inserts the aggregate all-or-none. Only `Applied` or a fully verified exact
+`AlreadyApplied` acknowledgement authorizes successful completion or recovery.
+The same decision or Primary call with different bytes is an integrity
+conflict.
+
+## Recover Delivery Health
+
+A transient writer, queue, deadline, unknown, lost-ack, or decision-capacity
+failure retains the exact bounded aggregate in memory for idempotent retry.
+While any aggregate is pending, Router rejects later recommendation admission
+and still serves each anchor. One writer attempt per audit can be active.
+Retry delay begins at 10 milliseconds, doubles to a one-second cap, and uses
+transaction-start slices of at most 250 milliseconds.
+
+Decision capacity pressure signals the existing retention worker. Health
+returns to normal only after every pending aggregate receives `Applied` or
+verified `AlreadyApplied`. A successful unrelated write or writer ping cannot
+clear the gate. Corruption, collision, nonidentical idempotency, invalid audit,
+or a contained writer panic creates a permanent recommendation fault until
+operator recovery. A source-retention race can discard the provisional audit;
+a later call performs a fresh search that excludes the retiring source.
+
+Graceful shutdown closes recommendation admission first, lets admitted work
+reach the shared deadline, drains exact pending audit delivery, and then drains
+live embedding, background work, retention and heartbeat, process stop, readers,
+and writer ownership. Abort fences writer acceptance before it cancels
+delivery, so no later decision attempt can start.
+
+## Retain Whole Decision Graphs
+
+Decision retention uses `retention_days` and `max_evidence_records` as an
+independent age and count policy ordered by `(created_at_unix_ms, decision_id)`.
+It deletes only a completely loaded and verified decision aggregate. The
+neighbor-to-evidence foreign key is restrictive, so deleting source evidence
+cannot leave a retained decision with a missing neighbor.
+
+One retention pass has cumulative limits of 1,000 decision parents, 4,159
+summary-plus-neighbor rows, and 32 MiB of verified aggregate accounting. It
+stops before the next whole aggregate would exceed a limit and records an
+immutable receipt with selection hashes, progress, blocked anchors, and
+`more_cleanup`.
+
+When source retention selects an anchor referenced by a decision, the writer
+first removes its vectors from the searchable ready set and adds a durable
+retiring-source marker. Search cannot return the source, and a new decision
+write cannot reference it. Later passes prioritize dependent decisions, then
+delete the anchor after its last decision reference is gone.
+
+Refer to [Router Ledger Migrations and Recovery](/router/ledger-migrations-and-recovery)
+for migration `0005`, whole-aggregate retention, receipts, and restart
+boundaries.
+
+## Protect Query and Audit Data
+
+Recommend mode keeps the same sanitization boundary as Shadow mode. It does
+not persist request headers, credentials, replay state, provider error text,
+the lossless request envelope, or raw tenant and agent identities. The decision
+parent references the canonical query by hash. Decision, summary, neighbor,
+health, and event rows do not duplicate canonical application text.
+
+The canonical query catalog still contains normalized instructions, the
+current task, and bounded context while referenced by embedding, evidence, or
+decision state. The embedding endpoint receives that document, including when
+the endpoint is loopback. Sanitization does not discover secrets written into
+ordinary free-form application text. Treat the owner-only ledger and every
+authorized embedding endpoint as recipients of sensitive application data.
+
+The CLI, Python, and Node.js packages register Router automatically; a custom
+Rust host must link `nemo-relay-router` and call
+`register_router_component()`. Recommendation and decision inspection are
+public through the Rust service, CLI, and optional Rust HTTP adapter. Operator
+controls are available through the same three surfaces. Python and Node.js
+provide typed configuration helpers but no inspection or operator methods.

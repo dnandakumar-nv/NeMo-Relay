@@ -986,6 +986,10 @@ async fn install_registrations_covers_registry_error_edges() {
             registration(surface, "duplicate"),
         ])
         .await;
+        let _registry_guard = crate::shared_runtime::runtime_owner_test_mutex()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::shared_runtime::reset_runtime_owner_for_tests();
         let mut ctx = PluginRegistrationContext::new();
         let error = instance
             .install_registrations(&mut ctx)

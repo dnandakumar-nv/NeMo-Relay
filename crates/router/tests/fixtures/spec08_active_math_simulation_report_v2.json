@@ -1,0 +1,355 @@
+{
+  "active_math_algorithm_id_sha256": "cb4915056f4b70a76c2d5f0b9db9f9ba029afbc4e4bdf81ba7fe073f68cd4203",
+  "active_math_build_id": "bf8f561a1382a5859d9ddd9e4dcf9f155c42fd79897e278455c1d04f53582fee",
+  "all_acceptance_bounds_passed": true,
+  "corpus_sha256": "593049e9a96f53e8f112e00838d5684404a1bc87245fa85b7c318bfa64bd354a",
+  "deterministic_cases": [
+    {
+      "accepted": true,
+      "derived_state": "collecting",
+      "id": "effective_weight_floor"
+    },
+    {
+      "accepted": true,
+      "control_failure_weight_bits": "4040000000000000",
+      "control_success_weight_bits": "4050000000000000",
+      "derived_state": "rollback",
+      "id": "nonzero_dyadic_decay_drift",
+      "treatment_failure_weight_bits": "4050000000000000",
+      "treatment_success_weight_bits": "4040000000000000"
+    },
+    {
+      "accepted": true,
+      "derived_state": "expired",
+      "id": "authorization_expiry_exact_boundary"
+    },
+    {
+      "accepted": true,
+      "derived_state": "exhausted",
+      "id": "final_cap_without_current_pass"
+    },
+    {
+      "accepted": true,
+      "derived_state": "closed_passed",
+      "id": "final_cap_with_current_pass"
+    },
+    {
+      "accepted": true,
+      "derived_age_ms": 0,
+      "id": "future_skew_inclusive"
+    },
+    {
+      "accepted": true,
+      "derived_error": "future_skew",
+      "id": "future_skew_exceeded"
+    },
+    {
+      "accepted": true,
+      "derived_state": "rollback",
+      "id": "rollback_precedes_pass"
+    },
+    {
+      "accepted": true,
+      "derived_state": "collecting",
+      "id": "expired_claim_recovery",
+      "ownership_commit_fence_validation": "deferred_to_task_8_runtime_claim_integration",
+      "recomputed_audit_matches_fresh": true,
+      "recomputed_cdf_call_count": 1785428
+    }
+  ],
+  "distinct_sufficient_statistic_key_count": 3778,
+  "generator_sha256": "dd5e62c614d652cfb0d95fff8e2bca3d36dfba539e1e7a4ad3aa2567a8dfbd09",
+  "manifest_sha256": "9677f8c777546b67ebf848d6877f79a31b38df9fcd32d0af45bf193c90a6bada",
+  "operational_cdf_queries": 3358309022,
+  "phase_one_transition_shard_sha256": [
+    "6d028d66535717b294ce5c4fa6822ec08c82e4c4cef700872f32c89348010fb8",
+    "6e284168aa5eb6944645d17e44b7a1192e2ac57dc3f906ef825be2e4f049ab0f",
+    "cf1591715e5715663950e66091e0645ef7550122c07604c0aec0e40ca2b1d233",
+    "65193aed901c1cd8c1627d6d8e58f81df4fb5bd71061b81c9172615f2dda6fdd",
+    "ec2204f1859e3da7a675731c54612002ddb7974d069537c8958c48c30080382f",
+    "ac5c0e6ae81bf0e2bb2b2c5783fb5584291c57a5a497642f79344fc73b0d195d",
+    "ad3367c687ae5a3a7c4e9c1dab3d62603e5bb85635fde42c1e621cd217a3c29a",
+    "5af9c2785d18bc7e16e5843a1b01e38f2818633b20080c41e9d98ab4931cd74f",
+    "35b689820fd85439f5f9f0e972762cf45c5e3727cb0f84ac5743285cd2eb6f63",
+    "8f3c52ec6763135bdee167cd7cefaaf143c473b145f437e3aa9642ef3ac32943",
+    "8ec5e419f7c13c7ce59df49782f888e92cff93deb0f7d4b31665297dbba0176d",
+    "b1987a59ad4cb28f10fa5b504948589d8e7c61aec48c3bf8a9869e0e99105233",
+    "ea76283ac29d1dc67464e746934d3a9067e5e06d5a9168a5ab5d92879b49ff4f",
+    "c65313de325eb54fd6c75d0b347aba2998f50bd31d4cb72eee2dde0518769e1a",
+    "aaa562f059579dbc14f7aaf45fa4a14fd52b6a7697c4d9195fb97805436c8fdc",
+    "28e7c479302870d9a18b69772f1a4155b2d42db548a3b2c0fab8988bdd87ca53",
+    "5cbe85d1fec0d34126e962ef7eef0484d2305f5d9d2bcfe542a8beb9cb33d0e3",
+    "700796b26e2a37d101f722ba3bf546f269262c114c093b22f20b1135a46eaade",
+    "95e1ea9d2b23d3667324a42ced46ccd195ab7ea78a1e7f4075e76dd33eacd2cd",
+    "0baf2e9b19816b99bef1bef9737ccb9987c8167af855ea89d7ff9734bcbb1803",
+    "8e24be949ea2dda3f443785818b093f34690def9640cfefdd5ecf31b3a563e00",
+    "729df906453cec53a16c5e2a7647d4201a8b221c0f97e3a387d664005873432e",
+    "f59e5cc77651fe68461db7406f2e3f7311ae36a6c1b0bb1b164756ed723f067e",
+    "c096e38397dca619791dbe3237d3a191fc228b6012de1279cdb01d24e98f9704",
+    "f684fe667420d4083ae95cb8d21a7c224a5aface8e701041d0db1c46adc7dc05",
+    "426dfa040f2baef1d66c7c705619e6d1e13cf662000064abfdccae25f0083b85",
+    "d0624490c27015d71b8c4bb6b7a71ed133fabd2514b75d5a9260ecc5ceb130eb",
+    "09d6a4773188d703b16e61c9956f06adc3709d238c10fe7a1418facdda54efcc",
+    "83398f4942fb98f76639f95037fc19c6d6d63ff08459667299c85c5e60664d14",
+    "9939f619ffbad0673e8e28bcd145901d2699e268d558b080b33b5e3c73c35ae3",
+    "2c0a619eaa4746edfaf1f479e00c7c6d675167aa30fe3b950bb9c8accd742210",
+    "d3503620d93ca544cd659d4418a5b0bf37f1922722205d6fadbd3345b640958e"
+  ],
+  "production_audit_sha256": "a80d32b335d35b5171f7f941a9d22287c02ec77e15cf12aedc2c7aedf18705c7",
+  "profile": "release",
+  "raw_beta_cdf_calls": 6715609080,
+  "reference_sha256": "dbfef17a0866068ace6bf43434baa610f45831f6ae183483c0eb96d25d1d82b1",
+  "scenarios": {
+    "arm_latency": {
+      "acceptance": {
+        "accepted": true
+      },
+      "collecting_at_cap": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "final_attribution_gate_pass": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "rollback_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "trial_count": 10000
+    },
+    "assignment_calibration": {
+      "accepted": true,
+      "arms": {
+        "control": {
+          "clopper_pearson_lower_bits": "3fe660c9893a5048",
+          "clopper_pearson_upper_bits": "3fe66ce086d75ba6",
+          "count": 1792136,
+          "expected_discrete_fraction_bits": "3fe6666666666667",
+          "observed_fraction_bits": "3fe666d5cfaacd9f"
+        },
+        "holdout": {
+          "clopper_pearson_lower_bits": "3fb981024fa9d6f0",
+          "clopper_pearson_upper_bits": "3fb9c05e507d8808",
+          "count": 256275,
+          "expected_discrete_fraction_bits": "3fb999999999999a",
+          "observed_fraction_bits": "3fb9a0a3d70a3d71"
+        },
+        "treatment": {
+          "clopper_pearson_lower_bits": "3fc97f4199ef57ab",
+          "clopper_pearson_upper_bits": "3fc9a9756e0dca0c",
+          "count": 511589,
+          "expected_discrete_fraction_bits": "3fc999999999999a",
+          "observed_fraction_bits": "3fc99456d5cfaace"
+        }
+      },
+      "root_count": 2560000,
+      "trial_count": 10000
+    },
+    "degraded": {
+      "acceptance": {
+        "accepted": true,
+        "minimum_bits": "3fee666666666666",
+        "rollback_fraction_bits": "3fefdfc733bf0298"
+      },
+      "collecting_at_cap": {
+        "count": 59,
+        "fraction_bits": "3f701c66207eb3f3"
+      },
+      "final_attribution_gate_pass": {
+        "count": 15000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "rollback_by_cap": {
+        "count": 14941,
+        "fraction_bits": "3fefdfc733bf0298"
+      },
+      "trial_count": 15000
+    },
+    "differential_attrition": {
+      "acceptance": {
+        "accepted": true,
+        "gate_rejection_fraction_bits": "3ff0000000000000",
+        "minimum_bits": "3fef5c28f5c28f5c"
+      },
+      "collecting_at_cap": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "final_attribution_gate_pass": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "rollback_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "trial_count": 10000
+    },
+    "drift": {
+      "acceptance": {
+        "accepted": true,
+        "minimum_bits": "3fee666666666666",
+        "rollback_fraction_bits": "3ff0000000000000"
+      },
+      "collecting_at_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "final_attribution_gate_pass": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "rollback_by_cap": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "trial_count": 10000
+    },
+    "equal": {
+      "acceptance": {
+        "accepted": true,
+        "pass_fraction_bits": "3fc78a0902de00d2",
+        "pass_maximum_bits": "3fe3333333333333",
+        "pass_minimum_bits": "3fb999999999999a",
+        "rollback_fraction_bits": "3f6205bc01a36e2f",
+        "rollback_maximum_bits": "3fa999999999999a"
+      },
+      "collecting_at_cap": {
+        "count": 8139,
+        "fraction_bits": "3fea0b780346dc5d"
+      },
+      "final_attribution_gate_pass": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 1839,
+        "fraction_bits": "3fc78a0902de00d2"
+      },
+      "rollback_by_cap": {
+        "count": 22,
+        "fraction_bits": "3f6205bc01a36e2f"
+      },
+      "trial_count": 10000
+    },
+    "equal_attrition": {
+      "acceptance": {
+        "accepted": true,
+        "gate_pass_fraction_bits": "3ff0000000000000",
+        "minimum_bits": "3fee666666666666"
+      },
+      "collecting_at_cap": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "final_attribution_gate_pass": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "rollback_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "trial_count": 10000
+    },
+    "improved": {
+      "acceptance": {
+        "accepted": true,
+        "pass_fraction_bits": "3fee9ad42c3c9eed",
+        "pass_minimum_bits": "3fee666666666666",
+        "rollback_fraction_bits": "0000000000000000",
+        "rollback_maximum_bits": "3f50624dd2f1a9fc"
+      },
+      "collecting_at_cap": {
+        "count": 436,
+        "fraction_bits": "3fa652bd3c361134"
+      },
+      "final_attribution_gate_pass": {
+        "count": 10000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 9564,
+        "fraction_bits": "3fee9ad42c3c9eed"
+      },
+      "rollback_by_cap": {
+        "count": 0,
+        "fraction_bits": "0000000000000000"
+      },
+      "trial_count": 10000
+    },
+    "null_boundary": {
+      "acceptance": {
+        "accepted": true,
+        "false_pass_clopper_pearson_upper_bits": "3f79a5a3f754ae00",
+        "maximum_bits": "3f889374bc6a7efa"
+      },
+      "collecting_at_cap": {
+        "count": 36816,
+        "fraction_bits": "3fed73eab367a0f9"
+      },
+      "final_attribution_gate_pass": {
+        "count": 40000,
+        "fraction_bits": "3ff0000000000000"
+      },
+      "paired_state_mismatch_count": 0,
+      "paired_sufficient_statistic_mismatch_count": 0,
+      "pass_with_failed_attribution_gate_count": 0,
+      "passed_by_cap": {
+        "count": 214,
+        "fraction_bits": "3f75e9e1b089a027"
+      },
+      "rollback_by_cap": {
+        "count": 2970,
+        "fraction_bits": "3fb3020c49ba5e35"
+      },
+      "trial_count": 40000
+    }
+  },
+  "schema": "nemo.relay.router.active-math-simulation-report@2",
+  "seed_shard_count": 32,
+  "trial_count": 125000,
+  "worker_process_count": 16
+}

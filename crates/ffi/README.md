@@ -76,6 +76,18 @@ platform:
 Use the FFI surface only when you need a native ABI. Rust, Python, and Node.js
 applications should prefer the supported packages for those languages.
 
+## Router Boundary
+
+The FFI library links and registers Router before the existing generic plugin
+list, validation, and initialization operations. A JSON plugin document can
+therefore recognize and activate a `router` component without a new C API.
+
+This boundary is intentionally generic. The header exports no
+`nemo_relay_router_*` symbols, typed Router configuration, or V2 replay factory.
+Calls made through the native ABI are consequently not eligible Router Primary
+calls. Use the CLI, Python, Node.js, or a custom Rust host when Router must
+evaluate or substitute model calls.
+
 ## Documentation
 
 NeMo Relay Documentation: https://docs.nvidia.com/nemo/relay

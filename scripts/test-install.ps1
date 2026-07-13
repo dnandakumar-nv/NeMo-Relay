@@ -172,6 +172,16 @@ try {
     Assert-True (-not [string]::IsNullOrWhiteSpace($processPath)) 'installer did not report its updated process PATH'
     Assert-PathContains $processPath $InstallDir
     Assert-NoTemporaryFiles $InstallDir
+    $installedBinary = Join-Path $InstallDir 'nemo-relay.exe'
+    & $installedBinary router-package-probe --help *> $null
+    if ($LASTEXITCODE -eq 0) {
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if ($null -eq $python) {
+            $python = Get-Command python3 -ErrorAction Stop
+        }
+        & $python.Source (Join-Path $RepoRoot 'scripts/test-support/router_cli_package_smoke.py') $installedBinary
+        Assert-True ($LASTEXITCODE -eq 0) 'installed Router package probe failed'
+    }
 
     $TestsRun++
     $env:NEMO_RELAY_VERSION = '0.3.0'

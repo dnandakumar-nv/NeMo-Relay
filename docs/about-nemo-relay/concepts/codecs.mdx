@@ -107,6 +107,14 @@ and replayable request or response JSON when the source payload contains enough
 information. Provider codecs should preserve unknown fields and treat request
 encoding as a merge over the original provider payload.
 
+Normalized request messages preserve `system` and `developer` as distinct
+instruction roles. Structured output uses an optional typed
+`response_format` with `json_object` or `json_schema` semantics. Provider
+codecs retain unmodeled containing-object fields in `native_wrapper` and
+unmodeled format-descriptor fields in `native_format`. Unknown native format
+kinds remain in generic request data instead of being guessed into a typed
+contract.
+
 The response-extraction interface is the existing response codec contract:
 `LlmResponseCodec::decode_response` returns `AnnotatedLlmResponse`. Built-in
 codecs populate that normalized response with model, finish reason, tool-call,

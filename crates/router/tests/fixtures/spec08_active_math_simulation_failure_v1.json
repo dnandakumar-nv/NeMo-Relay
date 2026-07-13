@@ -1,0 +1,14 @@
+{
+  "schema": "nemo.relay.router.active-math-simulation-failure@1",
+  "manifest_sha256": "9e1abd267485858e134d7b710c06e9ced4821a927723ba9c6ca4a4b4830a430a",
+  "active_math_algorithm_id_sha256": "cb4915056f4b70a76c2d5f0b9db9f9ba029afbc4e4bdf81ba7fe073f68cd4203",
+  "status": "failed_acceptance",
+  "scenario": "drift",
+  "trial_count": 10000,
+  "rollback_count": 9062,
+  "rollback_fraction_bits": "3fecff972474538f",
+  "required_minimum_bits": "3fee666666666666",
+  "all_other_scenarios_passed": true,
+  "bound_changed_after_result": false,
+  "resolution": "superseded by a new pre-results v2 manifest with a stronger drift input"
+}
