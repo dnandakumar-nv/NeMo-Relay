@@ -689,11 +689,15 @@ impl DecisionAuditV1 {
             let candidate_id = candidate.summary.candidate_id.clone();
             let mut candidate_neighbors = Vec::with_capacity(candidate.neighbors.len());
             for neighbor in candidate.neighbors {
+                let expected_neighbor_ordinal = neighbors
+                    .len()
+                    .checked_add(candidate_neighbors.len())
+                    .ok_or(DecisionAuditError::SizeOverflow)?;
                 candidate_neighbors.push(build_neighbor(
                     parent.decision_id,
                     &parent.learning_generation_id,
                     &candidate_id,
-                    neighbors.len(),
+                    expected_neighbor_ordinal,
                     neighbor,
                 )?);
             }
@@ -2840,6 +2844,10 @@ mod tests {
     }
 
     fn valid_audit() -> DecisionAuditV1 {
+        valid_audit_with_duplicate_neighbor(false)
+    }
+
+    fn valid_audit_with_duplicate_neighbor(include_duplicate: bool) -> DecisionAuditV1 {
         let learning_generation_id = uuid(4);
         let base = RoutingPartitionBaseV1 {
             tenant_policy_hash: hash('a'),
@@ -2901,6 +2909,7 @@ mod tests {
             final_reason: DecisionFinalReasonV1::RecommendObserveOnly,
             created_at_unix_ms: 1_002,
         };
+        let neighbor_count = if include_duplicate { 2 } else { 1 };
         let summary = DecisionCandidateSummaryInputV1 {
             candidate_id: "candidate-a".to_string(),
             rank_ordinal: 0,
@@ -2911,7 +2920,7 @@ mod tests {
             vector_space_id: hash('6'),
             partition_id: Some(1),
             decoding_fingerprint,
-            top_k: 1,
+            top_k: neighbor_count,
             radius: AuditF64V1::new(1.0).unwrap(),
             min_points: 1,
             min_independent_roots: 1,
@@ -2923,9 +2932,9 @@ mod tests {
             familywise_credible_level: AuditF64V1::new(familywise).unwrap(),
             candidate_alpha: AuditF64V1::new(candidate_alpha).unwrap(),
             promotion_lower_bound: AuditF64V1::new(0.2).unwrap(),
-            returned_neighbor_count: 1,
-            within_radius_count: 1,
-            labeled_point_count: 1,
+            returned_neighbor_count: neighbor_count,
+            within_radius_count: neighbor_count,
+            labeled_point_count: neighbor_count,
             attempted_root_count: 1,
             labeled_root_count: 1,
             selected_root_count: 1,
@@ -2967,16 +2976,53 @@ mod tests {
             root_group_ordinal: 0,
             exclusion_reason: DecisionNeighborExclusionReasonV1::Included,
         };
+        let mut neighbors = vec![neighbor];
+        if include_duplicate {
+            neighbors.push(DecisionNeighborInputV1 {
+                neighbor_ordinal: 1,
+                candidate_id: "candidate-a".to_string(),
+                candidate_neighbor_ordinal: 1,
+                evidence_vector_link_id: uuid(10),
+                shadow_attempt_id: uuid(11),
+                anchor_id: uuid(12),
+                evaluation_id: Some(uuid(13)),
+                learning_generation_id,
+                distance: AuditF32V1::new(0.0).unwrap(),
+                age_millis: None,
+                similarity_weight: None,
+                time_weight: None,
+                final_weight: None,
+                binary_label: Some(DecisionBinaryLabelV1::Pass),
+                selected_for_root: false,
+                root_group_ordinal: 0,
+                exclusion_reason: DecisionNeighborExclusionReasonV1::DuplicateRoot,
+            });
+        }
         DecisionAuditV1::new(
             parent,
             vec![DecisionCandidateInputV1 {
                 summary,
                 partition_artifact: partition,
-                neighbors: vec![neighbor],
+                neighbors,
             }],
             prepared_query,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn constructor_accepts_multiple_neighbors_for_one_candidate() {
+        let audit = valid_audit_with_duplicate_neighbor(true);
+        assert_eq!(audit.parent.neighbor_count, 2);
+        assert_eq!(
+            audit
+                .neighbors
+                .iter()
+                .map(|neighbor| neighbor.neighbor_ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        audit.validate_frozen().unwrap();
     }
 
     #[test]

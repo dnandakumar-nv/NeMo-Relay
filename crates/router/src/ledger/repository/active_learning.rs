@@ -715,13 +715,11 @@ fn experiment_authority_matches(
                 FROM outcome_policy_versions AS outcome
                 JOIN pool_vector_space_mappings AS mapping
                   ON mapping.project_uuid = outcome.project_uuid
-                 AND mapping.config_generation_id = outcome.config_generation_id
                  AND mapping.pool_id = outcome.pool_id
-                 AND mapping.policy_version_id = outcome.policy_version_id
                 WHERE outcome.project_uuid = ?1 AND outcome.pool_id = ?2
                   AND outcome.outcome_policy_hash = ?3
-                  AND outcome.config_generation_id = ?4
-                  AND outcome.policy_version_id = ?5
+                  AND mapping.config_generation_id = ?4
+                  AND mapping.policy_version_id = ?5
                   AND mapping.vector_space_id = ?6
              )",
             params![

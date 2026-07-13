@@ -71,8 +71,7 @@ pub(super) fn ensure_outcome_policy_versions(
         }
         let stored = transaction
             .query_row(
-                "SELECT project_uuid, pool_id, config_generation_id,
-                        policy_version_id, canonical_policy_json,
+                "SELECT project_uuid, pool_id, canonical_policy_json,
                         matcher_algorithm_id, reducer_algorithm_id,
                         decay_algorithm_id, active_math_algorithm_id_sha256,
                         canonical_payload_hash
@@ -88,8 +87,6 @@ pub(super) fn ensure_outcome_policy_versions(
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
-                        row.get::<_, String>(8)?,
-                        row.get::<_, String>(9)?,
                     ))
                 },
             )
@@ -100,8 +97,6 @@ pub(super) fn ensure_outcome_policy_versions(
             != (
                 project_uuid.to_string(),
                 pool.id.clone(),
-                config_generation_id.to_string(),
-                policy_version_id.clone(),
                 policy.canonical_policy_json,
                 OUTCOME_MATCHER_ALGORITHM_ID_V1.to_string(),
                 OUTCOME_REDUCER_ID_V1.to_string(),
@@ -3601,7 +3596,7 @@ pub(crate) mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::config::RouterConfig;
+    use crate::config::{RouterConfig, RouterMode};
     use crate::diagnostics::validate_router_config;
     use crate::ledger::cohort::NonLearningCohort;
     use crate::ledger::command::WriterFailureClass;
@@ -3686,6 +3681,69 @@ pub(crate) mod tests {
         let report = validate_router_config(value.as_object().unwrap());
         assert!(!report.has_errors(), "{:?}", report.diagnostics);
         report.config.unwrap()
+    }
+
+    #[test]
+    fn unchanged_outcome_policy_survives_mode_only_config_generations() {
+        let directory = tempdir().unwrap();
+        let path = crate::ledger::repository::tests::database_path(&directory);
+        let mut config = active_config(&path, "mode-transition-outcome-policy");
+
+        config.mode = RouterMode::Shadow;
+        let shadow = LedgerRepository::activate(&config).unwrap();
+        let shadow_config_generation_id = shadow.identity.config_generation_id.clone();
+        let policy_version_id = shadow.identity.pools["pool-a"].policy_version_id.clone();
+        drop(shadow);
+
+        config.mode = RouterMode::Recommend;
+        let recommend = LedgerRepository::activate(&config).unwrap();
+        assert_ne!(
+            recommend.identity.config_generation_id,
+            shadow_config_generation_id
+        );
+        assert_eq!(
+            recommend.identity.pools["pool-a"].policy_version_id,
+            policy_version_id
+        );
+        drop(recommend);
+
+        config.mode = RouterMode::Active;
+        let mut active = LedgerRepository::activate(&config).unwrap();
+        let outcome_policy_hash = active
+            .repository
+            .connection
+            .query_row(
+                "SELECT outcome_policy_hash FROM outcome_policy_versions
+                 WHERE pool_id = 'pool-a'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let create = ActiveExperimentCreate::from_config(
+            &config,
+            &active.identity,
+            "pool-a",
+            "candidate-a",
+            "11".repeat(32),
+            outcome_policy_hash,
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            active.repository.create_active_experiment(&create).unwrap(),
+            ActiveExperimentCreateAck::Applied(_)
+        ));
+        assert_eq!(
+            active
+                .repository
+                .connection
+                .query_row("SELECT count(*) FROM outcome_policy_versions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
     }
 
     pub(crate) fn fixture() -> Fixture {
